@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Configure the Ubuntu Searx package for malim_chat's local search service."""
+"""Configure SearXNG for malim_chat's local search service."""
 
 import secrets
-import shutil
 import sys
 from pathlib import Path
 
@@ -17,8 +16,6 @@ def main() -> None:
     settings["server"]["port"] = 8888
     settings["server"]["secret_key"] = secrets.token_urlsafe(48)
     settings["search"]["default_lang"] = "zh-CN"
-    for engine in settings["engines"]:
-        engine["disabled"] = engine.get("name") != "bing"
     target.write_text(yaml.safe_dump(settings, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
 
