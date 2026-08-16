@@ -2,8 +2,40 @@ import type { Conversation, DictionaryResponse, Message, Page, Provider, SearchR
 
 const apiBase = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:3100";
 let session: Session | null = null;
-export function setSession(value: Session | null) { session = value; }
+let refreshInFlight: Promise<Session | null> | null = null;
+let sessionListener: ((value: Session | null) => void) | null = null;
+
+export function setSession(value: Session | null) {
+  session = value;
+  if (typeof window !== "undefined") {
+    if (value) localStorage.setItem("malim-session", JSON.stringify(value));
+    else localStorage.removeItem("malim-session");
+  }
+  sessionListener?.(value);
+}
+export function subscribeSession(listener: (value: Session | null) => void) {
+  sessionListener = listener;
+  return () => { if (sessionListener === listener) sessionListener = null; };
+}
 export function getSession() { return session; }
+
+async function refreshSession() {
+  if (!session) return null;
+  if (!refreshInFlight) {
+    const refreshToken = session.refresh_token;
+    refreshInFlight = fetch(`${apiBase}/v1/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refreshToken })
+    }).then(async (response) => {
+      if (!response.ok) { setSession(null); return null; }
+      const updated = await response.json() as Session;
+      setSession(updated);
+      return updated;
+    }).catch(() => { setSession(null); return null; }).finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
+}
 
 async function request<T>(path: string, init: RequestInit = {}, retry = true): Promise<T> {
   const headers = new Headers(init.headers);
@@ -11,10 +43,14 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
   const response = await fetch(`${apiBase}${path}`, { ...init, headers });
   if (response.status === 401 && session && retry) {
-    const refreshed = await fetch(`${apiBase}/v1/auth/refresh`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ refresh_token: session.refresh_token }) });
-    if (refreshed.ok) { session = await refreshed.json(); return request<T>(path, init, false); }
+    const refreshed = await refreshSession();
+    if (refreshed) return request<T>(path, init, false);
   }
-  if (!response.ok) { const payload = await response.json().catch(() => null); throw new Error(payload?.error?.message ?? `Request failed (${response.status})`); }
+  if (!response.ok) {
+    if (response.status === 401) setSession(null);
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message ?? `Request failed (${response.status})`);
+  }
   return response.status === 204 ? undefined as T : response.json();
 }
 

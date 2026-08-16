@@ -1,6 +1,6 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { Component, FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { Archive, Bot, Check, ChevronsUpDown, CircleAlert, Copy, Edit3, Languages, LoaderCircle, LogOut, Menu, MessageSquare, PanelLeftClose, PanelLeftOpen, Search, Settings2, SquarePen, Trash2, X } from "lucide-react";
-import { api, setSession } from "./api";
+import { api, setSession, subscribeSession } from "./api";
 import { useAppStore } from "./store";
 import type { Conversation, DictionaryResponse, Message, Provider, Session } from "./types";
 
@@ -16,15 +16,23 @@ function uuid() {
 export function App() {
   const { session, setSession: saveSession } = useAppStore();
   useEffect(() => {
+    const unsubscribe = subscribeSession(saveSession);
     const raw = localStorage.getItem("malim-session");
-    if (raw) {
-      const saved = JSON.parse(raw) as Session;
-      setSession(saved);
-      saveSession(saved);
-    }
+    if (raw) try { setSession(JSON.parse(raw) as Session); } catch { setSession(null); }
+    return unsubscribe;
   }, [saveSession]);
-  if (!session) return <Auth onSession={(value) => { localStorage.setItem("malim-session", JSON.stringify(value)); setSession(value); saveSession(value); }} />;
-  return <Chat />;
+  if (!session) return <Auth onSession={setSession} />;
+  return <ChatErrorBoundary><Chat /></ChatErrorBoundary>;
+}
+
+class ChatErrorBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
+  state = { failed: false };
+  static getDerivedStateFromError() { return { failed: true }; }
+  componentDidCatch(error: Error) { console.error("Chat render failure", error); }
+  render() {
+    if (this.state.failed) return <main className="recovery-screen"><div><Bot size={28} /><h1>Unable to render this chat</h1><button className="primary" onClick={() => window.location.reload()}>Reload chat</button></div></main>;
+    return this.props.children;
+  }
 }
 
 function Auth({ onSession }: { onSession: (session: Session) => void }) {
@@ -98,7 +106,7 @@ function Chat() {
     } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to change the model."); }
     finally { setModelChanging(false); }
   }
-  function signOut() { localStorage.removeItem("malim-session"); setSession(null); state.setSession(null); }
+  function signOut() { setSession(null); }
   async function sendMessage(conversationId: string, content: string, search: boolean) {
     const mutationId = uuid();
     const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
@@ -173,7 +181,9 @@ function ModelSelector({ conversation, providers, open, busy, onToggle, onChange
 function ConversationView({ conversation, messages, providers, searchEnabled, busy, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; providers: Provider[]; searchEnabled: boolean; busy: boolean; onToggleSearch: () => void; onSend: (content: string) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string) => void; onCompact: () => Promise<void> }) {
   const [input, setInput] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), [messages.length, busy]);
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages.length, busy]);
   if (!conversation) return <section className="empty-state"><div className="empty-logo"><Bot size={34} /></div><h1>How can I help you today?</h1><p>Start a new conversation to work with your configured AI providers.</p></section>;
   const usage = Math.min(100, Math.round((conversation.context_tokens / conversation.context_window) * 100));
   const hasActiveProvider = providers.some((provider) => provider.id === conversation.model_provider_id);

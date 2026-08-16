@@ -9,3 +9,19 @@ button,input,textarea,select,a{transition:background-color .16s ease,color .16s 
 @media(prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;scroll-behavior:auto!important;transition-duration:.01ms!important}}
 
 .history{overflow-y:auto;scrollbar-width:none}.history::-webkit-scrollbar{width:0}.history:hover{scrollbar-width:thin}.history:hover::-webkit-scrollbar{width:8px}.history::-webkit-scrollbar-thumb{background:transparent;border-radius:8px;border:2px solid transparent;background-clip:padding-box}.history:hover::-webkit-scrollbar-thumb{background-color:#b9c3c0}.history::-webkit-scrollbar-track{background:transparent}.search-chip{border:0;background:transparent;padding:5px 6px;border-radius:5px;cursor:pointer}.search-chip:hover{background:#edf5f3;color:#0f766e}.search-chip.enabled{background:#e8f3f1}
+
+/* The application owns the viewport.  History and messages scroll in their own panes. */
+html,body,#root{height:100%;overflow:hidden}
+.app-shell{height:100dvh;min-height:0;max-width:100%;overflow:hidden}
+.sidebar{height:100dvh;min-height:0;overflow:hidden}
+.chat-shell{height:100dvh;min-height:0;overflow:hidden}
+.message-list{width:100%;min-height:0;overflow-y:auto;overflow-x:hidden;padding:36px max(28px,calc((100% - 820px)/2)) 28px}
+.composer-wrap{position:relative;bottom:auto;flex:none;padding:18px 22px 14px}
+.history{overflow-x:hidden!important;overscroll-behavior:contain}
+.conversation-row{min-width:0}
+.conversation-row:hover{transform:none}
+.conversation-row>button:first-child{overflow:hidden}
+.account-row .row-action{transition:color .16s ease,background-color .16s ease,transform .16s ease}
+.account-row .row-action:hover{color:#0f766e;background:#e8f3f1;transform:translateX(2px)}
+.model-popover{left:auto;right:0;max-width:calc(100vw - 24px)}
+@media(max-width:720px){.message-list{padding:22px 16px 20px}.composer-wrap{padding:14px 11px 10px}}
