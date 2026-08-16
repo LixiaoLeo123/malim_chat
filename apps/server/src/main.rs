@@ -1,4 +1,4 @@
-use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{env, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -46,6 +46,7 @@ struct AppState {
     encryption_key: Arc<[u8; 32]>,
     searxng_url: Option<String>,
     dictionary_dir: Arc<PathBuf>,
+    russian_dictionary: Arc<Mutex<Mdx>>,
 }
 
 struct Config {
@@ -222,13 +223,34 @@ struct RefreshUser {
     created_at: DateTime<Utc>,
     refresh_id: Uuid,
 }
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize)]
 struct Provider {
     id: Uuid,
     name: String,
     kind: String,
     base_url: String,
     default_model: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    models: Vec<ProviderModel>,
+}
+#[derive(Debug, FromRow)]
+struct ProviderRow {
+    id: Uuid,
+    name: String,
+    kind: String,
+    base_url: String,
+    default_model: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+#[derive(Debug, Serialize, FromRow)]
+struct ProviderModel {
+    id: Uuid,
+    provider_id: Uuid,
+    group_name: String,
+    model: String,
+    sort_order: i32,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -293,6 +315,18 @@ struct ProviderRequest {
     base_url: String,
     api_key: String,
     default_model: String,
+}
+#[derive(Deserialize)]
+struct ProviderModelRequest {
+    group_name: String,
+    model: String,
+    sort_order: Option<i32>,
+}
+#[derive(Deserialize)]
+struct UpdateProviderModelRequest {
+    group_name: Option<String>,
+    model: Option<String>,
+    sort_order: Option<i32>,
 }
 #[derive(Deserialize)]
 struct CreateMessage {
@@ -450,6 +484,8 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
     sqlx::migrate!().run(&db).await?;
+    let russian_dictionary = Mdx::new(config.dictionary_dir.join("OpenRussian.mdx"))
+        .map_err(|_| anyhow::anyhow!("Russian dictionary could not be opened"))?;
     let state = AppState {
         db,
         http: Client::builder()
@@ -459,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
         encryption_key: Arc::new(key),
         searxng_url: config.searxng_url,
         dictionary_dir: Arc::new(config.dictionary_dir),
+        russian_dictionary: Arc::new(Mutex::new(russian_dictionary)),
     };
     let cors = CorsLayer::new()
         .allow_origin(config.cors_origins)
@@ -472,6 +509,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/me", get(me))
         .route("/v1/providers", get(list_providers).post(create_provider))
         .route("/v1/providers/{id}", delete(delete_provider))
+        .route("/v1/providers/{id}/models", post(create_provider_model))
+        .route("/v1/providers/{id}/models/{model_id}", patch(update_provider_model).delete(delete_provider_model))
         .route(
             "/v1/conversations",
             get(list_conversations).post(create_conversation),
@@ -616,7 +655,11 @@ async fn list_providers(
     headers: HeaderMap,
 ) -> Result<Json<Vec<Provider>>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
-    Ok(Json(sqlx::query_as("SELECT id,name,kind,base_url,default_model,created_at,updated_at FROM providers WHERE user_id=$1 ORDER BY name").bind(user_id).fetch_all(&state.db).await?))
+    let rows: Vec<ProviderRow> = sqlx::query_as("SELECT id,name,kind,base_url,default_model,created_at,updated_at FROM providers WHERE user_id=$1 ORDER BY name")
+        .bind(user_id).fetch_all(&state.db).await?;
+    let mut providers = Vec::with_capacity(rows.len());
+    for row in rows { providers.push(provider_with_models(&state.db, row).await?); }
+    Ok(Json(providers))
 }
 async fn create_provider(
     State(state): State<AppState>,
@@ -632,10 +675,67 @@ async fn create_provider(
             "Provider type, HTTPS base URL, and API key are required.",
         ));
     }
+    if request.name.trim().is_empty() || request.default_model.trim().is_empty() {
+        return Err(ApiError::bad("Provider name and initial model are required."));
+    }
     let (ciphertext, nonce) = encrypt(&state, request.api_key.trim())?;
-    let provider:Provider=sqlx::query_as("INSERT INTO providers (id,user_id,name,kind,base_url,encrypted_api_key,key_nonce,default_model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,kind,base_url,default_model,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.name.trim()).bind(request.kind).bind(request.base_url.trim_end_matches('/')).bind(ciphertext).bind(nonce).bind(request.default_model.trim()).fetch_one(&state.db).await?;
+    let mut tx = state.db.begin().await?;
+    let row:ProviderRow=sqlx::query_as("INSERT INTO providers (id,user_id,name,kind,base_url,encrypted_api_key,key_nonce,default_model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,kind,base_url,default_model,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.name.trim()).bind(request.kind).bind(request.base_url.trim_end_matches('/')).bind(ciphertext).bind(nonce).bind(request.default_model.trim()).fetch_one(&mut *tx).await?;
+    sqlx::query("INSERT INTO provider_models (id,provider_id,group_name,model) VALUES ($1,$2,'General',$3)").bind(Uuid::new_v4()).bind(row.id).bind(&row.default_model).execute(&mut *tx).await?;
+    tx.commit().await?;
+    let provider = provider_with_models(&state.db, row).await?;
     event(&state.db, user_id, "provider", provider.id, "created", 1).await?;
     Ok(Json(provider))
+}
+
+async fn provider_with_models(pool: &PgPool, row: ProviderRow) -> Result<Provider, ApiError> {
+    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,sort_order,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
+        .bind(row.id).fetch_all(pool).await?;
+    Ok(Provider { id: row.id, name: row.name, kind: row.kind, base_url: row.base_url, default_model: row.default_model, created_at: row.created_at, updated_at: row.updated_at, models })
+}
+
+async fn own_provider(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<ProviderRow, ApiError> {
+    sqlx::query_as("SELECT id,name,kind,base_url,default_model,created_at,updated_at FROM providers WHERE id=$1 AND user_id=$2")
+        .bind(id).bind(user_id).fetch_optional(pool).await?.ok_or_else(ApiError::not_found)
+}
+
+async fn configured_model(pool: &PgPool, provider_id: Uuid, model: &str) -> Result<bool, ApiError> {
+    Ok(sqlx::query_as::<_, (bool,)>("SELECT EXISTS(SELECT 1 FROM provider_models WHERE provider_id=$1 AND model=$2)")
+        .bind(provider_id).bind(model).fetch_one(pool).await?.0)
+}
+
+async fn create_provider_model(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>, Json(request): Json<ProviderModelRequest>) -> Result<Json<ProviderModel>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_provider(&state.db, user_id, id).await?;
+    if request.group_name.trim().is_empty() || request.model.trim().is_empty() { return Err(ApiError::bad("Model group and model name are required.")); }
+    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING id,provider_id,group_name,model,sort_order,created_at,updated_at")
+        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.sort_order.unwrap_or(0)).fetch_one(&state.db).await?;
+    event(&state.db, user_id, "provider", id, "updated", 1).await?;
+    Ok(Json(item))
+}
+
+async fn update_provider_model(State(state): State<AppState>, headers: HeaderMap, Path((id, model_id)): Path<(Uuid, Uuid)>, Json(request): Json<UpdateProviderModelRequest>) -> Result<Json<ProviderModel>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_provider(&state.db, user_id, id).await?;
+    if request.group_name.as_ref().is_some_and(|v| v.trim().is_empty()) || request.model.as_ref().is_some_and(|v| v.trim().is_empty()) { return Err(ApiError::bad("Model group and model name cannot be empty.")); }
+    let previous: (String,) = sqlx::query_as("SELECT model FROM provider_models WHERE id=$1 AND provider_id=$2").bind(model_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),sort_order=COALESCE($5,sort_order) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,sort_order,created_at,updated_at")
+        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.sort_order).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2").bind(id).bind(previous.0).bind(&item.model).execute(&state.db).await?;
+    event(&state.db, user_id, "provider", id, "updated", 1).await?;
+    Ok(Json(item))
+}
+
+async fn delete_provider_model(State(state): State<AppState>, headers: HeaderMap, Path((id, model_id)): Path<(Uuid, Uuid)>) -> Result<StatusCode, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_provider(&state.db, user_id, id).await?;
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM provider_models WHERE provider_id=$1").bind(id).fetch_one(&state.db).await?;
+    if count.0 <= 1 { return Err(ApiError::bad("A provider must keep at least one configured model.")); }
+    let removed: Option<(String,)> = sqlx::query_as("DELETE FROM provider_models WHERE id=$1 AND provider_id=$2 RETURNING model").bind(model_id).bind(id).fetch_optional(&state.db).await?;
+    let removed = removed.ok_or_else(ApiError::not_found)?;
+    sqlx::query("UPDATE providers SET default_model=(SELECT model FROM provider_models WHERE provider_id=$1 ORDER BY sort_order,model LIMIT 1) WHERE id=$1 AND default_model=$2").bind(id).bind(removed.0).execute(&state.db).await?;
+    event(&state.db, user_id, "provider", id, "updated", 1).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 async fn delete_provider(
     State(state): State<AppState>,
@@ -682,20 +782,13 @@ async fn create_conversation(
     Json(request): Json<CreateConversation>,
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
-    if let Some(pid) = request.provider_id {
-        let exists: (bool,) =
-            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM providers WHERE id=$1 AND user_id=$2)")
-                .bind(pid)
-                .bind(user_id)
-                .fetch_one(&state.db)
-                .await?;
-        if !exists.0 {
-            return Err(ApiError::bad(
-                "Selected provider does not belong to this account.",
-            ));
-        }
-    }
-    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(request.model).bind(request.context_window.unwrap_or(128000).clamp(4096,2_000_000)).fetch_one(&state.db).await?;
+    let model = if let Some(pid) = request.provider_id {
+        let provider = own_provider(&state.db, user_id, pid).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
+        let model = request.model.unwrap_or(provider.default_model);
+        if !configured_model(&state.db, pid, &model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
+        Some(model)
+    } else { request.model };
+    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(request.context_window.unwrap_or(128000).clamp(4096,2_000_000)).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -723,24 +816,16 @@ async fn update_conversation(
     Json(request): Json<UpdateConversation>,
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
-    own_conversation(&state.db, user_id, id).await?;
-    if let Some(provider_id) = request.provider_id {
-        let owns_provider: (bool,) = sqlx::query_as(
-            "SELECT EXISTS(SELECT 1 FROM providers WHERE id=$1 AND user_id=$2)",
-        )
-        .bind(provider_id)
-        .bind(user_id)
-        .fetch_one(&state.db)
-        .await?;
-        if !owns_provider.0 {
-            return Err(ApiError::bad(
-                "Selected provider does not belong to this account.",
-            ));
-        }
-    }
+    let existing = own_conversation(&state.db, user_id, id).await?;
     let model = request.model.map(|value| value.trim().to_string());
     if model.as_ref().is_some_and(String::is_empty) {
         return Err(ApiError::bad("Model name cannot be empty."));
+    }
+    let provider_id = request.provider_id.or(existing.model_provider_id);
+    let selected_model = model.as_deref().or(existing.model.as_deref());
+    if let (Some(provider_id), Some(model)) = (provider_id, selected_model) {
+        own_provider(&state.db, user_id, provider_id).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
+        if !configured_model(&state.db, provider_id, model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
     }
     let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).fetch_one(&state.db).await?;
     event(
@@ -879,9 +964,7 @@ async fn respond(
         .map(|(role, content)| json!({"role":role,"content":content}))
         .collect();
     let sources = if request.search.unwrap_or(false) {
-        fetch_search(&state, &input.content)
-            .await
-            .unwrap_or_default()
+        fetch_search(&state, &input.content).await?
     } else {
         vec![]
     };
@@ -889,7 +972,7 @@ async fn respond(
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
     }
     if !sources.is_empty() {
-        transcript.insert(0,json!({"role":"system","content":format!("Use the following web sources when relevant and cite their titles with URLs. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
+        transcript.insert(0,json!({"role":"system","content":format!("Web search is enabled. Answer the latest user question using only relevant sources below. Cite supporting claims with their source URLs. Do not claim that web sources are unavailable when they are listed. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
     }
     let api_key = decrypt(&state, &p.3, &p.4)?;
     let model = conversation.model.clone().unwrap_or(p.2);
@@ -1012,8 +1095,9 @@ async fn dictionary_lookup(
         return Err(ApiError::bad("Unsupported dictionary."));
     }
     let directory = (*state.dictionary_dir).clone();
+    let russian_dictionary = Arc::clone(&state.russian_dictionary);
     let response =
-        tokio::task::spawn_blocking(move || lookup_dictionary(&directory, &dictionary, &word))
+        tokio::task::spawn_blocking(move || lookup_dictionary(&directory, &russian_dictionary, &dictionary, &word))
             .await
             .map_err(|_| ApiError::internal("Dictionary worker did not complete."))??;
     Ok(Json(response))
@@ -1021,6 +1105,7 @@ async fn dictionary_lookup(
 
 fn lookup_dictionary(
     directory: &std::path::Path,
+    russian_dictionary: &Mutex<Mdx>,
     dictionary: &str,
     word: &str,
 ) -> Result<DictionaryResponse, ApiError> {
@@ -1030,7 +1115,7 @@ fn lookup_dictionary(
         ));
     }
     let entries = match dictionary {
-        "russian_en" => lookup_russian_dictionary(directory, word)?,
+        "russian_en" => lookup_russian_dictionary(russian_dictionary, word)?,
         "german_en" => lookup_german_dictionary(directory, word)?,
         "english_zh" => lookup_english_chinese_dictionary(directory, word)?,
         _ => unreachable!(),
@@ -1085,40 +1170,42 @@ fn split_lines(value: &str) -> Vec<String> {
 }
 
 fn lookup_russian_dictionary(
-    directory: &std::path::Path,
+    dictionary: &Mutex<Mdx>,
     word: &str,
 ) -> Result<Vec<DictionaryEntryResponse>, ApiError> {
-    let mut mdx = Mdx::new(directory.join("OpenRussian.mdx"))
-        .map_err(|_| ApiError::internal("Russian dictionary could not be opened."))?;
-    let key = normalize_dictionary_key(word);
-    let alternative = key.replace('ё', "е");
-    let mut entries = Vec::new();
-    let items = mdx
-        .keyword_list()
-        .iter()
-        .filter(|item| {
-            let candidate = normalize_dictionary_key(&item.key_text);
-            candidate == key || candidate == alternative
-        })
-        .take(12)
-        .cloned()
-        .collect::<Vec<_>>();
-    for item in &items {
-        if let Some(lookup) = mdx.fetch(item) {
-            let definition = plain_text(&lookup.definition);
-            entries.push(DictionaryEntryResponse {
-                headword: lookup.key_text.to_string(),
-                pronunciation: String::new(),
-                definitions: split_lines(&definition),
-                translations: Vec::new(),
-                forms: Vec::new(),
-                labels: vec!["OpenRussian".into()],
-                examples: Vec::new(),
-                detail: Value::Null,
-            });
+    let mut mdx = dictionary.lock().map_err(|_| ApiError::internal("Russian dictionary is unavailable."))?;
+    let mut terms = vec![word.trim().to_lowercase()];
+    let alternate = terms[0].replace('ё', "е");
+    if alternate != terms[0] { terms.push(alternate); }
+    for term in terms {
+        if let Some(entry) = russian_entry(&mut mdx, &term, None) { return Ok(vec![entry]); }
+    }
+    Ok(Vec::new())
+}
+
+fn russian_entry(mdx: &mut Mdx, term: &str, linked_from: Option<&str>) -> Option<DictionaryEntryResponse> {
+    let lookup = mdx.lookup(term)?;
+    if let Some(target) = russian_link_target(&lookup.definition) {
+        if target != term && target != lookup.key_text {
+            return russian_entry(mdx, &target, Some(&lookup.key_text));
         }
     }
-    Ok(entries)
+    let mut labels = vec!["OpenRussian".into()];
+    if let Some(source) = linked_from { labels.push(format!("Lemma for {source}")); }
+    Some(DictionaryEntryResponse {
+        headword: lookup.key_text,
+        pronunciation: String::new(),
+        definitions: split_lines(&plain_text(&lookup.definition)),
+        translations: Vec::new(),
+        forms: Vec::new(),
+        labels,
+        examples: Vec::new(),
+        detail: Value::Null,
+    })
+}
+
+fn russian_link_target(definition: &str) -> Option<String> {
+    definition.split("@@@LINK=").nth(1)?.split_whitespace().next().map(str::to_string)
 }
 
 fn german_database_path(directory: &std::path::Path) -> Result<PathBuf, ApiError> {
@@ -1310,16 +1397,35 @@ async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiEr
         .searxng_url
         .as_deref()
         .ok_or_else(|| ApiError::bad("Online search is not configured."))?;
+    let search_query = focused_search_query(query);
+    let language = if search_query.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { "zh-CN" } else { "en-US" };
     let response: Value = state
         .http
         .get(format!("{}/search", base.trim_end_matches('/')))
-        .query(&[("q", query), ("format", "json"), ("language", "zh-CN")])
+        .query(&[("q", search_query.as_str()), ("format", "json"), ("language", language)])
         .send()
         .await?
         .error_for_status()?
         .json()
         .await?;
-    Ok(response.get("results").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().take(8).map(|v|json!({"title":v.get("title").cloned().unwrap_or(Value::Null),"url":v.get("url").cloned().unwrap_or(Value::Null),"content":v.get("content").cloned().unwrap_or(Value::Null),"engine":v.get("engine").cloned().unwrap_or(Value::Null)})).collect())
+    let mut results = response.get("results").and_then(Value::as_array).cloned().unwrap_or_default().into_iter()
+        .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
+        .map(|v| json!({"title":v["title"],"url":v["url"],"content":v["content"],"engine":v["engine"]}))
+        .collect::<Vec<_>>();
+    let terms = search_query.split_whitespace().filter(|term| term.chars().count() > 3).map(str::to_lowercase).collect::<Vec<_>>();
+    results.sort_by_key(|result| std::cmp::Reverse(terms.iter().filter(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term.as_str())).count()));
+    results.truncate(8);
+    Ok(results)
+}
+
+fn focused_search_query(query: &str) -> String {
+    let trimmed = query.trim();
+    let sentences = trimmed.split(['。', '！', '？', '!', '?', '.']).map(str::trim).filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    let candidate = sentences.last().copied().unwrap_or(trimmed);
+    candidate
+        .trim_start_matches(|ch: char| matches!(ch, '"' | '\'' | ':' | ' '))
+        .trim()
+        .to_string()
 }
 async fn sync(
     State(state): State<AppState>,

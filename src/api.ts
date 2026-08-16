@@ -1,4 +1,4 @@
-import type { Conversation, DictionaryResponse, Message, Page, Provider, SearchResult, Session, User } from "./types";
+import type { Conversation, DictionaryResponse, Message, Page, Provider, ProviderModel, SearchResult, Session, User } from "./types";
 
 const apiBase = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:3100";
 let session: Session | null = null;
@@ -61,6 +61,9 @@ export const api = {
   providers: () => request<Provider[]>("/v1/providers"),
   createProvider: (payload: { name: string; kind: string; base_url: string; api_key: string; default_model: string }) => request<Provider>("/v1/providers", { method: "POST", body: JSON.stringify(payload) }),
   deleteProvider: (id: string) => request<void>(`/v1/providers/${id}`, { method: "DELETE" }),
+  createProviderModel: (providerId: string, payload: { group_name: string; model: string; sort_order?: number }) => request<ProviderModel>(`/v1/providers/${providerId}/models`, { method: "POST", body: JSON.stringify(payload) }),
+  updateProviderModel: (providerId: string, modelId: string, payload: { group_name?: string; model?: string; sort_order?: number }) => request<ProviderModel>(`/v1/providers/${providerId}/models/${modelId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  deleteProviderModel: (providerId: string, modelId: string) => request<void>(`/v1/providers/${providerId}/models/${modelId}`, { method: "DELETE" }),
   conversations: (cursor?: string) => request<Page<Conversation>>(`/v1/conversations?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createConversation: (payload: { title?: string; provider_id?: string; model?: string }) => request<Conversation>("/v1/conversations", { method: "POST", body: JSON.stringify(payload) }),
   updateConversation: (id: string, payload: { title?: string; archived?: boolean; provider_id?: string; model?: string }) => request<Conversation>(`/v1/conversations/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
