@@ -13,7 +13,7 @@ import { useAppStore } from "./store";
 import type { Conversation, DictionaryResponse, GenerationSettings, Message, Provider, ProviderKind, ProviderModel, Session } from "./types";
 
 const now = () => new Date().toISOString();
-const defaultGeneration: GenerationSettings = { temperature: 0.7, reasoning_effort: "medium", enable_markdown: true, stream: false };
+const defaultGeneration: GenerationSettings = { temperature: 0.7, reasoning_effort: "medium", enable_markdown: true, stream: true };
 function uuid() {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));
