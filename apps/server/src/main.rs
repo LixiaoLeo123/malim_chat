@@ -987,37 +987,26 @@ async fn respond(
     let search_requested = request.search.unwrap_or(false) || explicit_search;
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
     let sources = if search_requested && should_search_web(&input.content) {
-        // The user's question is always searched first. Planner output only broadens it;
-        // it must never replace the subject of the question with a weak keyword.
-        let fallback = focused_search_query(&input.content);
-        let mut queries = vec![fallback.clone()];
-        match generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await {
+        // Search is deliberately a two-call workflow: plan queries, collect sources,
+        // then make the answering call below with those sources as context.
+        let queries = match generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await {
             Ok(planned) => {
                 info!(conversation_id=%id, planned_queries=planned.len(), "search planner completed");
-                for query in planned {
-                    if !queries.iter().any(|existing| existing.eq_ignore_ascii_case(&query)) {
-                        queries.push(query);
-                    }
-                }
+                planned
             }
-            Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search planner failed; using original question"),
-        }
+            Err(cause) => {
+                warn!(conversation_id=%id, error=%cause.message, "search planner failed; searching the original question");
+                vec![input.content.trim().to_string()]
+            }
+        };
         let mut merged = Vec::new();
         for query in queries.into_iter().take(4) {
-            match fetch_search(&state, &query, &input.content).await {
+            match fetch_search(&state, &query).await {
                 Ok(results) => for mut result in results {
                 result["query"] = json!(query);
                 if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); }
                 },
                 Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search provider request failed"),
-            }
-        }
-        if merged.is_empty() {
-            for query in search_fallback_queries(&input.content) {
-                match fetch_search(&state, &query, &query).await {
-                    Ok(results) => for mut result in results { result["query"] = json!(query); if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); } },
-                    Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search fallback request failed"),
-                }
             }
         }
         merged.truncate(8);
@@ -1027,8 +1016,10 @@ async fn respond(
     if let Some((summary, _)) = prior_summary {
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
     }
-    if !sources.is_empty() {
+    if search_requested && !sources.is_empty() {
         transcript.insert(0,json!({"role":"system","content":format!("Web search is enabled. Answer the latest user question using only relevant sources below. Cite supporting claims with their source URLs. Do not claim that web sources are unavailable when they are listed. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
+    } else if search_requested {
+        transcript.insert(0,json!({"role":"system","content":"Web search was requested and completed, but the search engine returned no usable sources. State that limitation plainly; do not invent sources or claim the search was not attempted."}));
     }
     let enable_markdown = request.enable_markdown.unwrap_or(true);
     transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
@@ -1152,7 +1143,7 @@ async fn search(
     if query.q.trim().is_empty() {
         return Err(ApiError::bad("Search query cannot be empty."));
     };
-    Ok(Json(fetch_search(&state, &query.q, &query.q).await?))
+    Ok(Json(fetch_search(&state, &query.q).await?))
 }
 
 async fn dictionary_lookup(
@@ -1513,30 +1504,14 @@ async fn generate_search_queries(
         let end = candidate.rfind(']').ok_or(())?;
         serde_json::from_str(&candidate[start..=end]).map_err(|_| ())
     }).map_err(|_| ApiError::bad("The provider returned invalid search queries."))?;
-    let question_terms = search_terms(question);
-    let queries = parsed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|query| is_valid_search_query(query, &question_terms)).take(4).map(ToOwned::to_owned).collect::<Vec<_>>();
+    let queries = parsed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|query| is_valid_search_query(query)).take(4).map(ToOwned::to_owned).collect::<Vec<_>>();
     if queries.is_empty() { return Err(ApiError::bad("The provider returned unusable search queries.")); }
     Ok(queries)
 }
 
-fn search_terms(value: &str) -> Vec<String> {
-    let mut terms = value.split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
-        .map(str::trim)
-        .filter(|term| term.chars().count() >= 3)
-        .map(str::to_lowercase)
-        .filter(|term| !matches!(term.as_str(), "what" | "which" | "when" | "where" | "with" | "from" | "that" | "this" | "about" | "latest" | "model" | "models" | "search" | "internet" | "please" | "give" | "have" | "does" | "there" | "现在" | "最新" | "模型" | "搜索"))
-        .collect::<Vec<_>>();
-    // Mixed Chinese/Latin questions have no reliable word boundaries. Preserve the
-    // named Latin entities independently so relevance filtering keeps their sources.
-    terms.extend(value.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_').map(str::trim).filter(|term| term.len() >= 3).map(str::to_lowercase));
-    terms.sort(); terms.dedup(); terms
-}
-
-fn is_valid_search_query(query: &str, question_terms: &[String]) -> bool {
+fn is_valid_search_query(query: &str) -> bool {
     let normalized = query.trim();
-    if normalized.chars().count() < 8 || normalized.chars().count() > 180 { return false; }
-    let lower = normalized.to_lowercase();
-    question_terms.is_empty() || question_terms.iter().any(|term| lower.contains(term))
+    normalized.chars().count() >= 2 && normalized.chars().count() <= 180
 }
 
 fn should_search_web(question: &str) -> bool {
@@ -1555,17 +1530,17 @@ fn content_requests_web_search(question: &str) -> bool {
         .any(|phrase| normalized.contains(phrase))
 }
 
-async fn fetch_search(state: &AppState, query: &str, question: &str) -> Result<Vec<Value>, ApiError> {
+async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiError> {
     let base = state
         .searxng_url
         .as_deref()
         .ok_or_else(|| ApiError::bad("Online search is not configured."))?;
-    let search_query = normalized_search_query(&focused_search_query(query));
+    let search_query = query.trim();
     let language = if search_query.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { "zh-CN" } else { "en-US" };
     let response: Value = state
         .http
         .get(format!("{}/search", base.trim_end_matches('/')))
-        .query(&[("q", search_query.as_str()), ("format", "json"), ("language", language)])
+        .query(&[("q", search_query), ("format", "json"), ("language", language)])
         .send()
         .await?
         .error_for_status()?
@@ -1575,55 +1550,9 @@ async fn fetch_search(state: &AppState, query: &str, question: &str) -> Result<V
         .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
         .map(|v| json!({"title":v["title"],"url":v["url"],"content":v["content"],"engine":v["engine"]}))
         .collect::<Vec<_>>();
-    let terms = search_terms(question);
-    let unfiltered = results.clone();
-    results.retain(|result| terms.is_empty() || terms.iter().any(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term)));
-    // Chinese has no dependable word boundaries. A strict substring filter can erase
-    // every otherwise useful engine result, so keep the ranked engine output instead.
-    if results.is_empty() && question.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) {
-        results = unfiltered;
-    }
-    results.sort_by_key(|result| std::cmp::Reverse(terms.iter().filter(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term.as_str())).count()));
     results.truncate(8);
-    info!(query_length=query.chars().count(), question_terms=terms.len(), result_count=results.len(), "search query completed");
+    info!(query_length=query.chars().count(), result_count=results.len(), "search query completed");
     Ok(results)
-}
-
-fn focused_search_query(query: &str) -> String {
-    let mut trimmed = query.trim().to_string();
-    for instruction in ["你可以上网搜索", "可以上网搜索", "请上网搜索", "帮我上网搜索", "使用网络搜索", "联网搜索", "网络搜索", "上网搜索", "可以上网", "帮我搜索", "搜索一下", "search the internet", "online search", "web search"] {
-        trimmed = trimmed.replace(instruction, " ");
-    }
-    let trimmed = trimmed.trim();
-    let sentences = trimmed.split(['。', '！', '？', '!', '?', '.']).map(str::trim).filter(|part| !part.is_empty()).collect::<Vec<_>>();
-    let candidate = sentences.into_iter().max_by_key(|part| part.chars().count()).unwrap_or(trimmed);
-    candidate
-        .trim_start_matches(|ch: char| matches!(ch, '"' | '\'' | ':' | ' '))
-        .trim()
-        .to_string()
-}
-
-fn normalized_search_query(query: &str) -> String {
-    if !query.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { return query.to_string(); }
-    let latin = query.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_').filter(|term| term.len() >= 3).collect::<Vec<_>>();
-    if latin.is_empty() { return query.to_string(); }
-    let hints = ["最新", "最强", "模型", "发布", "价格", "新闻"].into_iter().filter(|hint| query.contains(hint)).collect::<Vec<_>>();
-    format!("{} {}", latin.join(" "), hints.join(" ")).trim().to_string()
-}
-
-fn search_fallback_queries(question: &str) -> Vec<String> {
-    let lower = question.to_lowercase();
-    if lower.contains("现在的时间") || lower.contains("当前时间") || lower.contains("北京时间") || lower.contains("current time") || lower.contains("what time") {
-        return vec!["current time China".into(), "current time Beijing".into()];
-    }
-    if question.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) {
-        return vec![focused_search_query(question)];
-    }
-    let entities = question.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_').filter(|term| term.len() >= 3).collect::<Vec<_>>();
-    if entities.is_empty() {
-        let focused = focused_search_query(question);
-        if focused.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { vec![focused] } else { vec![] }
-    } else { vec![format!("{} latest information", entities.join(" "))] }
 }
 async fn sync(
     State(state): State<AppState>,
@@ -1788,16 +1717,13 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
 
 #[cfg(test)]
 mod tests {
-    use super::{focused_search_query, normalized_search_query, provider_stream_delta, search_fallback_queries, search_terms, split_thinking, strip_thinking, ThinkingStream};
+    use super::{is_valid_search_query, provider_stream_delta, split_thinking, strip_thinking, ThinkingStream};
 
     #[test]
-    fn strips_explicit_search_instruction_from_query() {
-        assert_eq!(focused_search_query("Anthropic现在最强的模型是什么？联网搜索"), "Anthropic现在最强的模型是什么");
-        assert_eq!(focused_search_query("丁真是谁？你可以上网搜索"), "丁真是谁");
-        assert_eq!(normalized_search_query("Anthropic现在最强的模型是什么"), "Anthropic 最强 模型");
-        assert!(search_terms("Anthropic现在最强的模型是什么").contains(&"anthropic".to_string()));
-        assert_eq!(search_fallback_queries("上网搜索，现在的时间是多少？")[0], "current time China");
-        assert_eq!(search_fallback_queries("现在的北京时间是什么？")[0], "current time China");
+    fn accepts_generic_planner_queries_without_topic_rules() {
+        assert!(is_valid_search_query("ab"));
+        assert!(is_valid_search_query("a specific search query"));
+        assert!(!is_valid_search_query("x"));
     }
 
     #[test]
