@@ -39,3 +39,16 @@
 .dictionary-popover .malim-entry .example, .dictionary-popover .malim-entry .sentence { border-radius: 5px; background: #f6faf9; padding: 8px; margin: 7px 0; }
 .dictionary-popover .malim-entry a { color: #0f766e; text-decoration: none; }
 .dictionary-popover .malim-entry hr { border: 0; border-top: 1px solid #e4e9e7; margin: 13px 0; }
+
+.markdown-content pre { border: 0; background: #f2f5f4; padding: 0 12px; }
+.markdown-content pre code { font-size: 12px; }
+.markdown-content .token.comment { color: #7b8782; }
+.message.summary { grid-template-columns: 31px minmax(0, 1fr); margin: 4px 0 14px; }
+.message.summary .message-avatar { background: #fff2cc; color: #9a6700; }
+.message.summary .message-content { border-left: 2px solid #e6be61; color: #6d5a29; padding: 7px 10px; font-size: 12px; }
+.context-meter button { display: inline-flex; align-items: center; gap: 4px; }
+.right-nav-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1; }
+
+.app-shell.dark { background: #171b1b; color: #e8edeb; }
+.app-shell.dark .sidebar, .app-shell.dark .chat-header, .app-shell.dark .composer, .app-shell.dark .dictionary-popover, .app-shell.dark .modal { background: #1e2423; border-color: #35413e; color: #e8edeb; }
+.app-shell.dark .sidebar { background: #1a201f; }.app-shell.dark .chat-header { border-color: #303a37; }.app-shell.dark .message-content { color: #e8edeb; }.app-shell.dark .message.user .message-avatar { background: #313b39; color: #dce5e2; }.app-shell.dark .message-avatar { background: #173d38; color: #9ae2d6; }.app-shell.dark .new-chat, .app-shell.dark .settings-button, .app-shell.dark .conversation-row > button:first-child, .app-shell.dark .icon-button, .app-shell.dark .model-button, .app-shell.dark .search-chip { color: #d7e0dd; }.app-shell.dark .model-button, .app-shell.dark .model-popover, .app-shell.dark .generation-popover { background: #222a28; border-color: #3b4744; }.app-shell.dark .generation-popover { color: #dbe5e1; }.app-shell.dark .composer textarea, .app-shell.dark input, .app-shell.dark select, .app-shell.dark textarea { background: #202826; color: #e8edeb; border-color: #3b4744; }.app-shell.dark .composer-wrap { background: linear-gradient(to bottom, rgba(23,27,27,0), #171b1b 22%); }.app-shell.dark .markdown-content pre { background: #111716; }.app-shell.dark .markdown-content th { background: #293431; }.app-shell.dark .markdown-content th, .app-shell.dark .markdown-content td { border-color: #42504c; }.app-shell.dark .dictionary-popover .malim-entry { color: #dce5e2; }.app-shell.dark .dictionary-popover .malim-entry h1 { color: #bdebe3; }.app-shell.dark .dictionary-popover .malim-entry th { background: #293431; }.app-shell.dark .dictionary-popover .malim-entry th, .app-shell.dark .dictionary-popover .malim-entry td { border-color: #42504c; }.app-shell.dark .right-navigator { background: linear-gradient(to right, transparent, #171b1b 35%); border-color: #303a37; }.app-shell.dark .right-nav-inner button { color: #c4d1cd; }.app-shell.dark .message.summary .message-content { color: #eadca9; background: #262416; }

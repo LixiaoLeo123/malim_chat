@@ -9,6 +9,7 @@ use argon2::{
     password_hash::{SaltString, rand_core::RngCore},
 };
 use axum::{
+    body::{Body, Bytes},
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
@@ -18,6 +19,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Duration, Utc};
 use flate2::read::GzDecoder;
+use futures_util::StreamExt;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use reqwest::Client;
 use rusqlite::{Connection, params};
@@ -30,7 +32,7 @@ use tower_http::{
     cors::CorsLayer, limit::RequestBodyLimitLayer,
     sensitive_headers::SetSensitiveRequestHeadersLayer, trace::TraceLayer,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 const ACCESS_TOKEN_MINUTES: i64 = 15;
@@ -347,6 +349,7 @@ struct RespondRequest {
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
     enable_markdown: Option<bool>,
+    stream: Option<bool>,
 }
 #[derive(Deserialize)]
 struct CompactRequest {
@@ -962,7 +965,7 @@ async fn respond(
     headers: HeaderMap,
     Path(id): Path<Uuid>,
     Json(request): Json<RespondRequest>,
-) -> Result<Json<Message>, ApiError> {
+) -> Result<Response, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let conversation = own_conversation(&state.db, user_id, id).await?;
     let input:Message=sqlx::query_as("SELECT id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE id=$1 AND conversation_id=$2 AND role='user' AND deleted_at IS NULL").bind(request.message_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
@@ -971,7 +974,7 @@ async fn respond(
         .ok_or_else(|| ApiError::bad("Choose a provider before requesting a response."))?;
     let p:(String,String,String,Vec<u8>,Vec<u8>)=sqlx::query_as("SELECT kind,base_url,default_model,encrypted_api_key,key_nonce FROM providers WHERE id=$1 AND user_id=$2").bind(provider_id).bind(user_id).fetch_optional(&state.db).await?.ok_or_else(||ApiError::bad("The selected provider was removed."))?;
     let prior_summary: Option<(String, i64)> = sqlx::query_as("SELECT content,ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1").bind(id).fetch_optional(&state.db).await?;
-    let messages:Vec<(String,String)>=sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' ORDER BY sequence DESC LIMIT 80").bind(id).bind(prior_summary.as_ref().map(|summary| summary.1).unwrap_or(0)).fetch_all(&state.db).await?;
+    let messages:Vec<(String,String)>=sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80").bind(id).bind(prior_summary.as_ref().map(|summary| summary.1).unwrap_or(0)).fetch_all(&state.db).await?;
     let mut transcript: Vec<Value> = messages
         .into_iter()
         .rev()
@@ -979,26 +982,37 @@ async fn respond(
         .collect();
     let api_key = decrypt(&state, &p.3, &p.4)?;
     let model = conversation.model.clone().unwrap_or_else(|| p.2.clone());
-    let sources = if request.search.unwrap_or(false) && should_search_web(&input.content) {
+    let explicit_search = content_requests_web_search(&input.content);
+    let search_requested = request.search.unwrap_or(false) || explicit_search;
+    info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
+    let sources = if search_requested && should_search_web(&input.content) {
         // The user's question is always searched first. Planner output only broadens it;
         // it must never replace the subject of the question with a weak keyword.
         let fallback = focused_search_query(&input.content);
         let mut queries = vec![fallback.clone()];
-        if let Ok(planned) = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await {
-            for query in planned {
-                if !queries.iter().any(|existing| existing.eq_ignore_ascii_case(&query)) {
-                    queries.push(query);
+        match generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await {
+            Ok(planned) => {
+                info!(conversation_id=%id, planned_queries=planned.len(), "search planner completed");
+                for query in planned {
+                    if !queries.iter().any(|existing| existing.eq_ignore_ascii_case(&query)) {
+                        queries.push(query);
+                    }
                 }
             }
+            Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search planner failed; using original question"),
         }
         let mut merged = Vec::new();
         for query in queries.into_iter().take(4) {
-            for mut result in fetch_search(&state, &query, &input.content).await.unwrap_or_default() {
+            match fetch_search(&state, &query, &input.content).await {
+                Ok(results) => for mut result in results {
                 result["query"] = json!(query);
                 if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); }
+                },
+                Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search provider request failed"),
             }
         }
         merged.truncate(8);
+        info!(conversation_id=%id, source_count=merged.len(), "search collection completed");
         merged
     } else { vec![] };
     if let Some((summary, _)) = prior_summary {
@@ -1009,15 +1023,24 @@ async fn respond(
     }
     let enable_markdown = request.enable_markdown.unwrap_or(true);
     transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
+    if request.stream.unwrap_or(false) {
+        let upstream = call_provider_stream(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
+        return Ok(stream_response(state, upstream, id, user_id, model, sources, enable_markdown));
+    }
     let answer = call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
+    let m = persist_assistant_message(&state, id, user_id, &model, answer, &sources, enable_markdown).await?;
+    Ok(Json(m).into_response())
+}
+
+async fn persist_assistant_message(state: &AppState, conversation_id: Uuid, user_id: Uuid, model: &str, answer: String, sources: &[Value], enable_markdown: bool) -> Result<Message, ApiError> {
     let tokens = estimate_tokens(&answer);
     let mut tx = state.db.begin().await?;
-    let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
-    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(seq.0).bind(answer).bind(if enable_markdown { "markdown" } else { "plain" }).bind(&model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
+    let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(conversation_id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(conversation_id).bind(seq.0).bind(answer).bind(if enable_markdown { "markdown" } else { "plain" }).bind(model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     event(&state.db, user_id, "message", m.id, "created", seq.0).await?;
-    let _ = auto_compact(&state.db, id).await;
-    Ok(Json(m))
+    let _ = auto_compact(&state.db, conversation_id).await;
+    Ok(m)
 }
 
 async fn auto_compact(pool: &PgPool, conversation_id: Uuid) -> Result<(), ApiError> {
@@ -1081,19 +1104,34 @@ async fn compact(
     if rows.is_empty() {
         return Err(ApiError::bad("There are no messages to compact."));
     }
-    let summary = rows
+    let source = rows
         .iter()
         .map(|(role, content)| format!("{role}: {content}"))
         .collect::<Vec<_>>()
         .join("\n");
-    let concise = format!(
-        "Conversation summary through message {end}:\n{}",
-        summary.chars().take(30_000).collect::<String>()
-    );
+    let prior: Option<(String, i64)> = sqlx::query_as("SELECT content,ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1").bind(id).fetch_optional(&state.db).await?;
+    let model_summary = if let Some(provider_id) = c.model_provider_id {
+        let p:(String,String,String,Vec<u8>,Vec<u8>)=sqlx::query_as("SELECT kind,base_url,default_model,encrypted_api_key,key_nonce FROM providers WHERE id=$1 AND user_id=$2").bind(provider_id).bind(user_id).fetch_optional(&state.db).await?.ok_or_else(|| ApiError::bad("The selected provider was removed."))?;
+        let api_key = decrypt(&state, &p.3, &p.4)?;
+        let model = c.model.clone().unwrap_or(p.2);
+        info!(conversation_id=%id, through_sequence=end, source_characters=source.len(), "manual compaction started");
+        call_provider(&state.http, &p.0, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None).await?
+    } else {
+        source.chars().take(30_000).collect()
+    };
+    let concise = format!("Conversation summary through message {end}:\n{model_summary}");
     let summary_id = Uuid::new_v4();
-    sqlx::query("INSERT INTO conversation_summaries (id,conversation_id,starts_at_sequence,ends_at_sequence,content,token_count) VALUES ($1,$2,1,$3,$4,$5) ON CONFLICT (conversation_id,starts_at_sequence,ends_at_sequence) DO UPDATE SET content=EXCLUDED.content,token_count=EXCLUDED.token_count").bind(summary_id).bind(id).bind(end).bind(&concise).bind(estimate_tokens(&concise)).execute(&state.db).await?;
+    let summary_tokens = estimate_tokens(&concise);
+    let mut tx = state.db.begin().await?;
+    sqlx::query("INSERT INTO conversation_summaries (id,conversation_id,starts_at_sequence,ends_at_sequence,content,token_count) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (conversation_id,starts_at_sequence,ends_at_sequence) DO UPDATE SET content=EXCLUDED.content,token_count=EXCLUDED.token_count").bind(summary_id).bind(id).bind(prior.as_ref().map(|item| item.1 + 1).unwrap_or(1)).bind(end).bind(&concise).bind(summary_tokens).execute(&mut *tx).await?;
+    let sequence:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(summary_tokens).fetch_one(&mut *tx).await?;
+    let marker = format!("Context compacted through message {end}. The conversation now uses a durable summary ({summary_tokens} estimated tokens).");
+    let message:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,token_count) VALUES ($1,$2,$3,'summary',$4,'plain',0) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence.0).bind(marker).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    event(&state.db, user_id, "message", message.id, "created", sequence.0).await?;
+    info!(conversation_id=%id, through_sequence=end, summary_tokens, "manual compaction completed");
     Ok(Json(
-        json!({"compacted":true,"summary_id":summary_id,"through_sequence":end,"estimated_tokens":estimate_tokens(&concise)}),
+        json!({"compacted":true,"summary_id":summary_id,"through_sequence":end,"estimated_tokens":summary_tokens,"message":message,"context_tokens":summary_tokens}),
     ))
 }
 async fn search(
@@ -1473,12 +1511,16 @@ async fn generate_search_queries(
 }
 
 fn search_terms(value: &str) -> Vec<String> {
-    value.split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+    let mut terms = value.split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
         .map(str::trim)
         .filter(|term| term.chars().count() >= 3)
         .map(str::to_lowercase)
         .filter(|term| !matches!(term.as_str(), "what" | "which" | "when" | "where" | "with" | "from" | "that" | "this" | "about" | "latest" | "model" | "models" | "search" | "internet" | "please" | "give" | "have" | "does" | "there" | "现在" | "最新" | "模型" | "搜索"))
-        .collect()
+        .collect::<Vec<_>>();
+    // Mixed Chinese/Latin questions have no reliable word boundaries. Preserve the
+    // named Latin entities independently so relevance filtering keeps their sources.
+    terms.extend(value.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_').map(str::trim).filter(|term| term.len() >= 3).map(str::to_lowercase));
+    terms.sort(); terms.dedup(); terms
 }
 
 fn is_valid_search_query(query: &str, question_terms: &[String]) -> bool {
@@ -1497,12 +1539,19 @@ fn should_search_web(question: &str) -> bool {
         && !normalized.starts_with("respond in ")
 }
 
+fn content_requests_web_search(question: &str) -> bool {
+    let normalized = question.to_lowercase();
+    ["web search", "online search", "search the internet", "联网搜索", "网络搜索", "使用网络搜索"]
+        .iter()
+        .any(|phrase| normalized.contains(phrase))
+}
+
 async fn fetch_search(state: &AppState, query: &str, question: &str) -> Result<Vec<Value>, ApiError> {
     let base = state
         .searxng_url
         .as_deref()
         .ok_or_else(|| ApiError::bad("Online search is not configured."))?;
-    let search_query = focused_search_query(query);
+    let search_query = normalized_search_query(&focused_search_query(query));
     let language = if search_query.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { "zh-CN" } else { "en-US" };
     let response: Value = state
         .http
@@ -1521,17 +1570,30 @@ async fn fetch_search(state: &AppState, query: &str, question: &str) -> Result<V
     results.retain(|result| terms.is_empty() || terms.iter().any(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term)));
     results.sort_by_key(|result| std::cmp::Reverse(terms.iter().filter(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term.as_str())).count()));
     results.truncate(8);
+    info!(query_length=query.chars().count(), question_terms=terms.len(), result_count=results.len(), "search query completed");
     Ok(results)
 }
 
 fn focused_search_query(query: &str) -> String {
-    let trimmed = query.trim();
+    let mut trimmed = query.trim().to_string();
+    for instruction in ["使用网络搜索", "联网搜索", "网络搜索", "search the internet", "online search", "web search"] {
+        trimmed = trimmed.replace(instruction, " ");
+    }
+    let trimmed = trimmed.trim();
     let sentences = trimmed.split(['。', '！', '？', '!', '?', '.']).map(str::trim).filter(|part| !part.is_empty()).collect::<Vec<_>>();
     let candidate = sentences.last().copied().unwrap_or(trimmed);
     candidate
         .trim_start_matches(|ch: char| matches!(ch, '"' | '\'' | ':' | ' '))
         .trim()
         .to_string()
+}
+
+fn normalized_search_query(query: &str) -> String {
+    if !query.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { return query.to_string(); }
+    let latin = query.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_').filter(|term| term.len() >= 3).collect::<Vec<_>>();
+    if latin.is_empty() { return query.to_string(); }
+    let hints = ["最新", "最强", "模型", "发布", "价格", "新闻"].into_iter().filter(|hint| query.contains(hint)).collect::<Vec<_>>();
+    format!("{} {}", latin.join(" "), hints.join(" ")).trim().to_string()
 }
 async fn sync(
     State(state): State<AppState>,
@@ -1590,4 +1652,67 @@ async fn call_provider(
         message: "The AI provider returned an unexpected response.".into(),
     })?;
     Ok(answer.to_string())
+}
+
+async fn call_provider_stream(http: &Client, kind: &str, base: &str, key: &str, model: &str, messages: &[Value], temperature: Option<f32>, reasoning_effort: Option<&str>) -> Result<reqwest::Response, ApiError> {
+    let url = match kind { "anthropic" => format!("{}/v1/messages", base.trim_end_matches('/')), _ => format!("{}/v1/chat/completions", base.trim_end_matches('/')) };
+    let response = if kind == "anthropic" {
+        let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
+        let mut body = json!({"model":model,"max_tokens":4096,"stream":true,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
+        if !system.is_empty() { body["system"] = json!(system); }
+        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
+        http.post(url).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body).send().await?
+    } else {
+        let mut body = json!({"model":model,"messages":messages,"stream":true});
+        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
+        if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
+        http.post(url).bearer_auth(key).json(&body).send().await?
+    };
+    response.error_for_status().map_err(ApiError::from)
+}
+
+fn provider_stream_delta(kind: &str, frame: &str) -> Option<String> {
+    let payload = frame.lines().find_map(|line| line.strip_prefix("data:"))?.trim();
+    if payload == "[DONE]" { return None; }
+    let value: Value = serde_json::from_str(payload).ok()?;
+    if kind == "anthropic" { value["delta"]["text"].as_str().map(str::to_string) } else { value["choices"].as_array()?.first()?["delta"]["content"].as_str().map(str::to_string) }
+}
+
+fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id: Uuid, user_id: Uuid, model: String, sources: Vec<Value>, enable_markdown: bool) -> Response {
+    let kind = if upstream.url().path().ends_with("/v1/messages") { "anthropic".to_string() } else { "openai_compatible".to_string() };
+    let output = async_stream::stream! {
+        let mut answer = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream();
+        while let Some(chunk) = upstream.next().await {
+            match chunk {
+                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(delta) = provider_stream_delta(&kind, &frame) { answer.push_str(&delta); let payload = serde_json::to_string(&json!({"type":"delta","delta":delta})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } }
+                Err(error) => { warn!(conversation_id=%conversation_id, %error, "upstream stream interrupted"); let payload = serde_json::to_string(&json!({"type":"error","message":"The provider stream was interrupted."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
+            }
+        }
+        if answer.trim().is_empty() { let payload = serde_json::to_string(&json!({"type":"error","message":"The provider returned an empty streamed response."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
+        match persist_assistant_message(&state, conversation_id, user_id, &model, answer, &sources, enable_markdown).await {
+            Ok(message) => { let payload = serde_json::to_string(&json!({"type":"done","message":message})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); }
+            Err(error) => { error!(conversation_id=%conversation_id, error=%error.message, "could not persist streamed response"); let payload = serde_json::to_string(&json!({"type":"error","message":"The streamed response could not be saved."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); }
+        }
+    };
+    let mut response = Body::from_stream(output).into_response();
+    response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{focused_search_query, normalized_search_query, provider_stream_delta, search_terms};
+
+    #[test]
+    fn strips_explicit_search_instruction_from_query() {
+        assert_eq!(focused_search_query("Anthropic现在最强的模型是什么？联网搜索"), "Anthropic现在最强的模型是什么");
+        assert_eq!(normalized_search_query("Anthropic现在最强的模型是什么"), "Anthropic 最强 模型");
+        assert!(search_terms("Anthropic现在最强的模型是什么").contains(&"anthropic".to_string()));
+    }
+
+    #[test]
+    fn parses_openai_stream_delta() {
+        assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"), Some("hello".into()));
+    }
 }
