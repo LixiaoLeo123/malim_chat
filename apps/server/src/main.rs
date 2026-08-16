@@ -986,19 +986,12 @@ async fn respond(
     let explicit_search = content_requests_web_search(&input.content);
     let search_requested = request.search.unwrap_or(false) || explicit_search;
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
-    let sources = if search_requested && should_search_web(&input.content) {
+    let (sources, planner_returned_no_queries) = if search_requested && should_search_web(&input.content) {
         // Search is deliberately a two-call workflow: plan queries, collect sources,
         // then make the answering call below with those sources as context.
-        let queries = match generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await {
-            Ok(planned) => {
-                info!(conversation_id=%id, planned_queries=planned.len(), "search planner completed");
-                planned
-            }
-            Err(cause) => {
-                warn!(conversation_id=%id, error=%cause.message, "search planner failed; searching the original question");
-                vec![input.content.trim().to_string()]
-            }
-        };
+        let queries = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await?;
+        info!(conversation_id=%id, planned_queries=queries.len(), "search planner completed");
+        let planner_returned_no_queries = queries.is_empty();
         let mut merged = Vec::new();
         for query in queries.into_iter().take(4) {
             match fetch_search(&state, &query).await {
@@ -1011,13 +1004,15 @@ async fn respond(
         }
         merged.truncate(8);
         info!(conversation_id=%id, source_count=merged.len(), "search collection completed");
-        merged
-    } else { vec![] };
+        (merged, planner_returned_no_queries)
+    } else { (vec![], false) };
     if let Some((summary, _)) = prior_summary {
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
     }
     if search_requested && !sources.is_empty() {
         transcript.insert(0,json!({"role":"system","content":format!("Web search is enabled. Answer the latest user question using only relevant sources below. Cite supporting claims with their source URLs. Do not claim that web sources are unavailable when they are listed. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
+    } else if search_requested && planner_returned_no_queries {
+        transcript.insert(0,json!({"role":"system","content":"Web search was enabled. The search planner determined that no external lookup was needed for this request. Do not claim to have searched or cite web sources."}));
     } else if search_requested {
         transcript.insert(0,json!({"role":"system","content":"Web search was requested and completed, but the search engine returned no usable sources. State that limitation plainly; do not invent sources or claim the search was not attempted."}));
     }
@@ -1494,7 +1489,7 @@ async fn generate_search_queries(
     question: &str,
 ) -> Result<Vec<String>, ApiError> {
     let messages = vec![
-        json!({"role":"system","content":"You plan web searches. Return ONLY a JSON array containing 2 to 4 search-engine queries. Every query must contain a specific named entity or key phrase from the question. Include dates or versions when relevant. Never return a one-word generic term. Do not answer the question."}),
+        json!({"role":"system","content":"You plan web searches. Return ONLY a JSON array containing zero to four search-engine queries. Return [] only when an external lookup is not useful. Otherwise, each query must contain a specific named entity or key phrase from the question; include dates or versions when relevant. Do not answer the question."}),
         json!({"role":"user","content":format!("Question: {question}")}),
     ];
     let raw = call_provider(http, kind, base, key, model, &messages, Some(0.0), None).await?;
@@ -1505,7 +1500,6 @@ async fn generate_search_queries(
         serde_json::from_str(&candidate[start..=end]).map_err(|_| ())
     }).map_err(|_| ApiError::bad("The provider returned invalid search queries."))?;
     let queries = parsed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|query| is_valid_search_query(query)).take(4).map(ToOwned::to_owned).collect::<Vec<_>>();
-    if queries.is_empty() { return Err(ApiError::bad("The provider returned unusable search queries.")); }
     Ok(queries)
 }
 
