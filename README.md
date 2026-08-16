@@ -22,4 +22,4 @@
 
 The production compose file is deliberately isolated from existing services. Configure a domain and secrets in `infra/.env`, review `infra/nginx/malim_chat.conf`, then deploy only after the host prerequisites are confirmed. It uses ports internal to the compose network; Nginx is the only public entry point.
 
-For the current IP-only host deployment, the live application is served at `http://your-server.example/malim_chat/`. It intentionally uses HTTP at the owner’s direction; account credentials and provider keys should normally be sent over HTTPS when a domain becomes available.
+For the current IP-only host deployment, the live application is served at `http://your-server.example/malim_chat/`. The native Android release must explicitly permit HTTP while this deployment remains IP-only. It intentionally uses HTTP at the owner's direction; account credentials and provider keys should normally be sent over HTTPS when a domain becomes available.

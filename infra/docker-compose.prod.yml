@@ -31,7 +31,7 @@ services:
       MALIM_BIND: 0.0.0.0:3100
       MALIM_JWT_SECRET: ${MALIM_JWT_SECRET:?set MALIM_JWT_SECRET}
       MALIM_ENCRYPTION_KEY: ${MALIM_ENCRYPTION_KEY:?set MALIM_ENCRYPTION_KEY}
-      MALIM_CORS_ORIGINS: https://${MALIM_DOMAIN:?set MALIM_DOMAIN},tauri://localhost
+      MALIM_CORS_ORIGINS: https://${MALIM_DOMAIN:?set MALIM_DOMAIN},http://tauri.localhost,https://tauri.localhost,tauri://localhost
       SEARXNG_URL: http://searxng:8080
       RUST_LOG: malim_server=info,tower_http=info
     ports:
