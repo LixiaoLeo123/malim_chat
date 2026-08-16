@@ -54,7 +54,8 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   return response.status === 204 ? undefined as T : response.json();
 }
 
-async function requestStream(path: string, payload: unknown, onDelta: (delta: string) => void): Promise<Message> {
+type StreamEvent = { type: string; delta?: string; message?: Message | string };
+async function requestStream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void): Promise<Message> {
   const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
   const response = await fetch(`${apiBase}${path}`, { method: "POST", headers, body: JSON.stringify(payload) });
@@ -67,8 +68,8 @@ async function requestStream(path: string, payload: unknown, onDelta: (delta: st
     while (boundary >= 0) {
       const frame = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2); boundary = buffer.indexOf("\n\n");
       const line = frame.split("\n").find((value) => value.startsWith("data:")); if (!line) continue;
-      const event = JSON.parse(line.slice(5).trim()) as { type: string; delta?: string; message?: Message | string };
-      if (event.type === "delta") onDelta(event.delta ?? "");
+      const event = JSON.parse(line.slice(5).trim()) as StreamEvent;
+      if (event.type === "delta" || event.type === "reasoning") onEvent(event);
       else if (event.type === "done" && event.message && typeof event.message !== "string") return event.message;
       else if (event.type === "error") throw new Error(typeof event.message === "string" ? event.message : "The response stream failed.");
     }
@@ -93,7 +94,7 @@ export const api = {
   messages: (id: string, cursor?: string) => request<Page<Message>>(`/v1/conversations/${id}/messages?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createMessage: (conversationId: string, content: string, mutationId: string, search: boolean) => request<Message>(`/v1/conversations/${conversationId}/messages`, { method: "POST", body: JSON.stringify({ content, client_mutation_id: mutationId, search }) }),
   respond: (conversationId: string, messageId: string, search: boolean, options?: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean; stream?: boolean }) => request<Message>(`/v1/conversations/${conversationId}/respond`, { method: "POST", body: JSON.stringify({ message_id: messageId, search, ...options }) }),
-  respondStream: (conversationId: string, messageId: string, search: boolean, options: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean }, onDelta: (delta: string) => void) => requestStream(`/v1/conversations/${conversationId}/respond`, { message_id: messageId, search, ...options, stream: true }, onDelta),
+  respondStream: (conversationId: string, messageId: string, search: boolean, options: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean }, onEvent: (event: StreamEvent) => void) => requestStream(`/v1/conversations/${conversationId}/respond`, { message_id: messageId, search, ...options, stream: true }, onEvent),
   updateMessage: (conversationId: string, messageId: string, content: string) => request<Message>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "PATCH", body: JSON.stringify({ content }) }),
   deleteMessage: (conversationId: string, messageId: string) => request<void>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "DELETE" }),
   compact: (conversationId: string, force = true) => request<{ compacted: boolean; message: Message; context_tokens: number }>(`/v1/conversations/${conversationId}/compact`, { method: "POST", body: JSON.stringify({ force }) }),
