@@ -522,7 +522,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         db,
         http: Client::builder()
-            .timeout(std::time::Duration::from_secs(90))
+            .timeout(std::time::Duration::from_secs(300))
             .build()?,
         jwt_secret: Arc::new(config.jwt_secret.into_bytes()),
         encryption_key: Arc::new(key),
