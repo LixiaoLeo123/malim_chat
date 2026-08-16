@@ -283,6 +283,8 @@ struct CreateConversation {
 struct UpdateConversation {
     title: Option<String>,
     archived: Option<bool>,
+    provider_id: Option<Uuid>,
+    model: Option<String>,
 }
 #[derive(Deserialize)]
 struct ProviderRequest {
@@ -722,7 +724,25 @@ async fn update_conversation(
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     own_conversation(&state.db, user_id, id).await?;
-    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).fetch_one(&state.db).await?;
+    if let Some(provider_id) = request.provider_id {
+        let owns_provider: (bool,) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM providers WHERE id=$1 AND user_id=$2)",
+        )
+        .bind(provider_id)
+        .bind(user_id)
+        .fetch_one(&state.db)
+        .await?;
+        if !owns_provider.0 {
+            return Err(ApiError::bad(
+                "Selected provider does not belong to this account.",
+            ));
+        }
+    }
+    let model = request.model.map(|value| value.trim().to_string());
+    if model.as_ref().is_some_and(String::is_empty) {
+        return Err(ApiError::bad("Model name cannot be empty."));
+    }
+    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,

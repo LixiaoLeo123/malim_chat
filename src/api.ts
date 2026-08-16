@@ -27,7 +27,7 @@ export const api = {
   deleteProvider: (id: string) => request<void>(`/v1/providers/${id}`, { method: "DELETE" }),
   conversations: (cursor?: string) => request<Page<Conversation>>(`/v1/conversations?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createConversation: (payload: { title?: string; provider_id?: string; model?: string }) => request<Conversation>("/v1/conversations", { method: "POST", body: JSON.stringify(payload) }),
-  updateConversation: (id: string, payload: { title?: string; archived?: boolean }) => request<Conversation>(`/v1/conversations/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  updateConversation: (id: string, payload: { title?: string; archived?: boolean; provider_id?: string; model?: string }) => request<Conversation>(`/v1/conversations/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteConversation: (id: string) => request<void>(`/v1/conversations/${id}`, { method: "DELETE" }),
   messages: (id: string, cursor?: string) => request<Page<Message>>(`/v1/conversations/${id}/messages?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createMessage: (conversationId: string, content: string, mutationId: string, search: boolean) => request<Message>(`/v1/conversations/${conversationId}/messages`, { method: "POST", body: JSON.stringify({ content, client_mutation_id: mutationId, search }) }),
