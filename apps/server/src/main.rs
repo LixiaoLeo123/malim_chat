@@ -1535,13 +1535,10 @@ async fn generate_search_queries(
 ) -> Result<Vec<String>, ApiError> {
     let mut lines: Vec<String> = history
         .iter()
-        .rev()
-        .take(20)
-        .rev()
         .filter_map(|m| {
             let role = m["role"].as_str()?;
             let content = m["content"].as_str()?;
-            Some(format!("{role}: {}", content.chars().take(800).collect::<String>()))
+            Some(format!("{role}: {content}"))
         })
         .collect();
     let question_last = history
