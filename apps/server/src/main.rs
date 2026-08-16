@@ -967,18 +967,23 @@ async fn create_message(
     };
     if let Some(existing)=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND client_mutation_id=$2").bind(id).bind(request.client_mutation_id).fetch_optional(&state.db).await? { return Ok(Json(existing)); }
     let mut tx = state.db.begin().await?;
-    let sequence:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(estimate_tokens(content)).fetch_one(&mut *tx).await?;
-    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence.0).bind(request.client_mutation_id).bind(content).bind(estimate_tokens(content)).bind(if request.search.unwrap_or(false){json!([])}else{json!([])}).fetch_one(&mut *tx).await?;
+    let is_first_user_message: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id=$1 AND role='user' AND deleted_at IS NULL)").bind(id).fetch_one(&mut *tx).await?;
+    let (sequence, mut revision): (i64, i64) = sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1, revision").bind(id).bind(user_id).bind(estimate_tokens(content)).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence).bind(request.client_mutation_id).bind(content).bind(estimate_tokens(content)).bind(if request.search.unwrap_or(false){json!([])}else{json!([])}).fetch_one(&mut *tx).await?;
+    let mut title_changed = false;
+    if is_first_user_message && c.title == "New chat" {
+        let title: String = content.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(40).collect();
+        if !title.is_empty() {
+            let updated: (i64,) = sqlx::query_as("UPDATE conversations SET title=$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING revision").bind(id).bind(user_id).bind(&title).fetch_one(&mut *tx).await?;
+            revision = updated.0;
+            title_changed = true;
+        }
+    }
     tx.commit().await?;
-    event(
-        &state.db,
-        user_id,
-        "message",
-        m.id,
-        "created",
-        c.revision + 1,
-    )
-    .await?;
+    event(&state.db, user_id, "message", m.id, "created", revision).await?;
+    if title_changed {
+        event(&state.db, user_id, "conversation", id, "updated", revision).await?;
+    }
     Ok(Json(m))
 }
 async fn update_message(
