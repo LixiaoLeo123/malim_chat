@@ -252,6 +252,7 @@ struct ProviderModel {
     provider_id: Uuid,
     group_name: String,
     model: String,
+    kind: String,
     sort_order: i32,
     context_window: i32,
     created_at: DateTime<Utc>,
@@ -323,15 +324,16 @@ struct GenerationSettings {
 #[derive(Deserialize)]
 struct ProviderRequest {
     name: String,
-    kind: String,
+    kind: Option<String>,
     base_url: String,
     api_key: String,
-    default_model: String,
+    default_model: Option<String>,
 }
 #[derive(Deserialize)]
 struct ProviderModelRequest {
     group_name: String,
     model: String,
+    kind: String,
     sort_order: Option<i32>,
     context_window: Option<i32>,
 }
@@ -339,6 +341,7 @@ struct ProviderModelRequest {
 struct UpdateProviderModelRequest {
     group_name: Option<String>,
     model: Option<String>,
+    kind: Option<String>,
     sort_order: Option<i32>,
     context_window: Option<i32>,
 }
@@ -697,7 +700,8 @@ async fn create_provider(
     Json(request): Json<ProviderRequest>,
 ) -> Result<Json<Provider>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
-    if !matches!(request.kind.as_str(), "openai_compatible" | "anthropic")
+    let kind = request.kind.unwrap_or_else(|| "openai_compatible".into());
+    if !matches!(kind.as_str(), "openai_compatible" | "anthropic")
         || !request.base_url.starts_with("https://")
         || request.api_key.trim().is_empty()
     {
@@ -705,13 +709,13 @@ async fn create_provider(
             "Provider type, HTTPS base URL, and API key are required.",
         ));
     }
-    if request.name.trim().is_empty() || request.default_model.trim().is_empty() {
-        return Err(ApiError::bad("Provider name and initial model are required."));
+    if request.name.trim().is_empty() {
+        return Err(ApiError::bad("Provider name is required."));
     }
     let (ciphertext, nonce) = encrypt(&state, request.api_key.trim())?;
+    let default_model = request.default_model.as_deref().map(str::trim).unwrap_or("").to_string();
     let mut tx = state.db.begin().await?;
-    let row:ProviderRow=sqlx::query_as("INSERT INTO providers (id,user_id,name,kind,base_url,encrypted_api_key,key_nonce,default_model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,kind,base_url,default_model,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.name.trim()).bind(request.kind).bind(request.base_url.trim_end_matches('/')).bind(ciphertext).bind(nonce).bind(request.default_model.trim()).fetch_one(&mut *tx).await?;
-    sqlx::query("INSERT INTO provider_models (id,provider_id,group_name,model,context_window) VALUES ($1,$2,'General',$3,$4)").bind(Uuid::new_v4()).bind(row.id).bind(&row.default_model).bind(128_000).execute(&mut *tx).await?;
+    let row:ProviderRow=sqlx::query_as("INSERT INTO providers (id,user_id,name,kind,base_url,encrypted_api_key,key_nonce,default_model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,kind,base_url,default_model,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.name.trim()).bind(kind).bind(request.base_url.trim_end_matches('/')).bind(ciphertext).bind(nonce).bind(default_model).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     let provider = provider_with_models(&state.db, row).await?;
     event(&state.db, user_id, "provider", provider.id, "created", 1).await?;
@@ -719,7 +723,7 @@ async fn create_provider(
 }
 
 async fn provider_with_models(pool: &PgPool, row: ProviderRow) -> Result<Provider, ApiError> {
-    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,sort_order,context_window,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
+    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
         .bind(row.id).fetch_all(pool).await?;
     Ok(Provider { id: row.id, name: row.name, kind: row.kind, base_url: row.base_url, default_model: row.default_model, created_at: row.created_at, updated_at: row.updated_at, models })
 }
@@ -734,12 +738,23 @@ async fn configured_model(pool: &PgPool, provider_id: Uuid, model: &str) -> Resu
         .bind(provider_id).bind(model).fetch_one(pool).await?.0)
 }
 
+async fn provider_first_model(pool: &PgPool, provider_id: Uuid) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_as::<_, (String,)>("SELECT model FROM provider_models WHERE provider_id=$1 ORDER BY sort_order,model LIMIT 1")
+        .bind(provider_id).fetch_optional(pool).await?.map(|value| value.0))
+}
+
+async fn provider_model_kind(pool: &PgPool, provider_id: Uuid, model: &str) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_as::<_, (String,)>("SELECT kind FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1")
+        .bind(provider_id).bind(model).fetch_optional(pool).await?.map(|value| value.0))
+}
+
 async fn create_provider_model(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>, Json(request): Json<ProviderModelRequest>) -> Result<Json<ProviderModel>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
     if request.group_name.trim().is_empty() || request.model.trim().is_empty() { return Err(ApiError::bad("Model group and model name are required.")); }
-    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,sort_order,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,provider_id,group_name,model,sort_order,context_window,created_at,updated_at")
-        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).fetch_one(&state.db).await?;
+    if !matches!(request.kind.as_str(), "openai_compatible" | "anthropic") { return Err(ApiError::bad("Model API format must be OpenAI-compatible or Anthropic.")); }
+    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,created_at,updated_at")
+        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).fetch_one(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
 }
@@ -748,9 +763,10 @@ async fn update_provider_model(State(state): State<AppState>, headers: HeaderMap
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
     if request.group_name.as_ref().is_some_and(|v| v.trim().is_empty()) || request.model.as_ref().is_some_and(|v| v.trim().is_empty()) { return Err(ApiError::bad("Model group and model name cannot be empty.")); }
+    if request.kind.as_deref().is_some_and(|v| !matches!(v, "openai_compatible" | "anthropic")) { return Err(ApiError::bad("Model API format must be OpenAI-compatible or Anthropic.")); }
     let previous: (String,) = sqlx::query_as("SELECT model FROM provider_models WHERE id=$1 AND provider_id=$2").bind(model_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
-    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),sort_order=COALESCE($5,sort_order),context_window=COALESCE($6,context_window) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,sort_order,context_window,created_at,updated_at")
-        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,created_at,updated_at")
+        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2").bind(id).bind(previous.0).bind(&item.model).execute(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
@@ -759,8 +775,6 @@ async fn update_provider_model(State(state): State<AppState>, headers: HeaderMap
 async fn delete_provider_model(State(state): State<AppState>, headers: HeaderMap, Path((id, model_id)): Path<(Uuid, Uuid)>) -> Result<StatusCode, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM provider_models WHERE provider_id=$1").bind(id).fetch_one(&state.db).await?;
-    if count.0 <= 1 { return Err(ApiError::bad("A provider must keep at least one configured model.")); }
     let removed: Option<(String,)> = sqlx::query_as("DELETE FROM provider_models WHERE id=$1 AND provider_id=$2 RETURNING model").bind(model_id).bind(id).fetch_optional(&state.db).await?;
     let removed = removed.ok_or_else(ApiError::not_found)?;
     sqlx::query("UPDATE providers SET default_model=(SELECT model FROM provider_models WHERE provider_id=$1 ORDER BY sort_order,model LIMIT 1) WHERE id=$1 AND default_model=$2").bind(id).bind(removed.0).execute(&state.db).await?;
@@ -813,8 +827,11 @@ async fn create_conversation(
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let (model, context_window) = if let Some(pid) = request.provider_id {
-        let provider = own_provider(&state.db, user_id, pid).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
-        let model = request.model.unwrap_or(provider.default_model);
+        own_provider(&state.db, user_id, pid).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
+        let model = match request.model {
+            Some(value) => value,
+            None => provider_first_model(&state.db, pid).await?.ok_or_else(|| ApiError::bad("Add a configured model to this provider before creating a chat."))?,
+        };
         if !configured_model(&state.db, pid, &model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
         let context_window: (i32,) = sqlx::query_as("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(pid).bind(&model).fetch_one(&state.db).await?;
         (Some(model), context_window.0)
@@ -1001,14 +1018,18 @@ async fn respond(
         .map(|(role, content)| json!({"role":role,"content":strip_thinking(&content)}))
         .collect();
     let api_key = decrypt(&state, &p.3, &p.4)?;
-    let model = conversation.model.clone().unwrap_or_else(|| p.2.clone());
+    let model = match conversation.model.as_deref().filter(|value| !value.trim().is_empty()) {
+        Some(value) => value.to_string(),
+        None => provider_first_model(&state.db, provider_id).await?.unwrap_or_else(|| p.2.clone()),
+    };
+    let kind = provider_model_kind(&state.db, provider_id, &model).await?.unwrap_or_else(|| p.0.clone());
     let explicit_search = content_requests_web_search(&input.content);
     let search_requested = request.search.unwrap_or(false) || explicit_search;
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
     let (sources, planner_returned_no_queries) = if search_requested && should_search_web(&input.content) {
         // Search is deliberately a two-call workflow: plan queries, collect sources,
         // then make the answering call below with those sources as context.
-        let queries = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await?;
+        let queries = generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &input.content).await?;
         info!(conversation_id=%id, planned_queries=queries.len(), "search planner completed");
         let planner_returned_no_queries = queries.is_empty();
         let mut merged = Vec::new();
@@ -1038,10 +1059,10 @@ async fn respond(
     let enable_markdown = request.enable_markdown.unwrap_or(true);
     transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
     if request.stream.unwrap_or(false) {
-        let upstream = call_provider_stream(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
+        let upstream = call_provider_stream(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
         return Ok(stream_response(state, upstream, id, user_id, model, sources, enable_markdown));
     }
-    let (answer, reasoning) = split_thinking(&call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?);
+    let (answer, reasoning) = split_thinking(&call_provider(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?);
     let m = persist_assistant_message(&state, id, user_id, &model, answer, reasoning, &sources, enable_markdown).await?;
     Ok(Json(m).into_response())
 }
@@ -1127,9 +1148,13 @@ async fn compact(
     let model_summary = if let Some(provider_id) = c.model_provider_id {
         let p:(String,String,String,Vec<u8>,Vec<u8>)=sqlx::query_as("SELECT kind,base_url,default_model,encrypted_api_key,key_nonce FROM providers WHERE id=$1 AND user_id=$2").bind(provider_id).bind(user_id).fetch_optional(&state.db).await?.ok_or_else(|| ApiError::bad("The selected provider was removed."))?;
         let api_key = decrypt(&state, &p.3, &p.4)?;
-        let model = c.model.clone().unwrap_or(p.2);
+        let model = match c.model.as_deref().filter(|value| !value.trim().is_empty()) {
+            Some(value) => value.to_string(),
+            None => provider_first_model(&state.db, provider_id).await?.unwrap_or_else(|| p.2.clone()),
+        };
+        let kind = provider_model_kind(&state.db, provider_id, &model).await?.unwrap_or_else(|| p.0.clone());
         info!(conversation_id=%id, through_sequence=end, source_characters=source.len(), "manual compaction started");
-        call_provider(&state.http, &p.0, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None).await?
+        call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None).await?
     } else {
         source.chars().take(30_000).collect()
     };

@@ -1,4 +1,4 @@
-import type { Conversation, DictionaryResponse, GenerationSettings, Message, Page, Provider, ProviderModel, SearchResult, Session, User } from "./types";
+import type { Conversation, DictionaryResponse, GenerationSettings, Message, Page, Provider, ProviderKind, ProviderModel, SearchResult, Session, User } from "./types";
 
 const apiBase = import.meta.env.VITE_API_URL ?? "http://your-server.example/malim_chat_api";
 let session: Session | null = null;
@@ -82,10 +82,10 @@ export const api = {
   login: (email: string, password: string) => request<Session>("/v1/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }, false),
   me: () => request<User>("/v1/me"),
   providers: () => request<Provider[]>("/v1/providers"),
-  createProvider: (payload: { name: string; kind: string; base_url: string; api_key: string; default_model: string }) => request<Provider>("/v1/providers", { method: "POST", body: JSON.stringify(payload) }),
+  createProvider: (payload: { name: string; base_url: string; api_key: string }) => request<Provider>("/v1/providers", { method: "POST", body: JSON.stringify(payload) }),
   deleteProvider: (id: string) => request<void>(`/v1/providers/${id}`, { method: "DELETE" }),
-  createProviderModel: (providerId: string, payload: { group_name: string; model: string; sort_order?: number; context_window?: number }) => request<ProviderModel>(`/v1/providers/${providerId}/models`, { method: "POST", body: JSON.stringify(payload) }),
-  updateProviderModel: (providerId: string, modelId: string, payload: { group_name?: string; model?: string; sort_order?: number; context_window?: number }) => request<ProviderModel>(`/v1/providers/${providerId}/models/${modelId}`, { method: "PATCH", body: JSON.stringify(payload) }),
+  createProviderModel: (providerId: string, payload: { group_name: string; model: string; kind: ProviderKind; sort_order?: number; context_window?: number }) => request<ProviderModel>(`/v1/providers/${providerId}/models`, { method: "POST", body: JSON.stringify(payload) }),
+  updateProviderModel: (providerId: string, modelId: string, payload: { group_name?: string; model?: string; kind?: ProviderKind; sort_order?: number; context_window?: number }) => request<ProviderModel>(`/v1/providers/${providerId}/models/${modelId}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteProviderModel: (providerId: string, modelId: string) => request<void>(`/v1/providers/${providerId}/models/${modelId}`, { method: "DELETE" }),
   conversations: (cursor?: string) => request<Page<Conversation>>(`/v1/conversations?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createConversation: (payload: { title?: string; provider_id?: string; model?: string }) => request<Conversation>("/v1/conversations", { method: "POST", body: JSON.stringify(payload) }),

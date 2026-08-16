@@ -1,7 +1,7 @@
 export type ProviderKind = "openai_compatible" | "anthropic";
 export type Role = "user" | "assistant" | "system" | "tool" | "summary";
 export interface User { id: string; email: string; display_name: string; created_at: string }
-export interface ProviderModel { id: string; provider_id: string; group_name: string; model: string; sort_order: number; context_window: number; created_at: string; updated_at: string }
+export interface ProviderModel { id: string; provider_id: string; group_name: string; model: string; kind: ProviderKind; sort_order: number; context_window: number; created_at: string; updated_at: string }
 export interface Provider { id: string; name: string; kind: ProviderKind; base_url: string; default_model: string; models: ProviderModel[]; created_at: string; updated_at: string }
 export interface GenerationSettings { temperature: number; reasoning_effort: "low" | "medium" | "high"; enable_markdown: boolean; stream: boolean }
 export interface Conversation { id: string; title: string; model_provider_id: string | null; model: string | null; context_window: number; context_tokens: number; generation_settings: GenerationSettings; revision: number; created_at: string; updated_at: string }
