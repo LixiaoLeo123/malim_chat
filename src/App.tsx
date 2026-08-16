@@ -3,6 +3,8 @@ import DOMPurify from "dompurify";
 import { Bot, Check, ChevronsUpDown, CircleAlert, Copy, Edit3, LoaderCircle, LogOut, Menu, MessageSquare, Moon, PanelLeftClose, PanelLeftOpen, Search, Settings2, SquarePen, Sun, Trash2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import "./additions.css";
@@ -148,25 +150,27 @@ function Chat() {
     } catch (cause) {
       if (pendingId) state.removeMessage(conversationId, pendingId);
       state.upsertMessage(conversationId, { ...(sent ?? optimistic), status: "error", optimistic: !sent, updated_at: now() });
-      state.upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now() });
+      state.upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true, retry_message_id: (sent ?? optimistic).id });
       state.setError(cause instanceof Error ? cause.message : "Message delivery failed.");
     } finally { state.setBusy(false); }
   }
   async function retryMessage(message: Message) {
     if (!activeId) return;
-    if (message.id.startsWith("local-")) { await sendMessage(activeId, message.content, searchEnabled); return; }
-    const pendingId = `retry-${message.id}`;
-    state.upsertMessage(activeId, { ...message, status: "pending", updated_at: now() });
-    state.upsertMessage(activeId, { ...message, id: pendingId, sequence: message.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
+    const target = message.retry_message_id ? (messages[activeId]?.find((item) => item.id === message.retry_message_id) ?? message) : message;
+    if (message.retry_message_id) state.removeMessage(activeId, message.id);
+    if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled); return; }
+    const pendingId = `retry-${target.id}`;
+    state.upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
+    state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
     state.setBusy(true);
     try {
-      const answer = generation.stream ? await api.respondStream(activeId, message.id, searchEnabled, generation, (event) => { const current = useAppStore.getState().messages[activeId]?.find((item) => item.id === pendingId); if (current) state.upsertMessage(activeId, event.type === "reasoning" ? { ...current, reasoning_content: current.reasoning_content + (event.delta ?? "") } : { ...current, content: current.content + (event.delta ?? "") }); }) : await api.respond(activeId, message.id, searchEnabled, generation);
+      const answer = generation.stream ? await api.respondStream(activeId, target.id, searchEnabled, generation, (event) => { const current = useAppStore.getState().messages[activeId]?.find((item) => item.id === pendingId); if (current) state.upsertMessage(activeId, event.type === "reasoning" ? { ...current, reasoning_content: current.reasoning_content + (event.delta ?? "") } : { ...current, content: current.content + (event.delta ?? "") }); }) : await api.respond(activeId, target.id, searchEnabled, generation);
       state.removeMessage(activeId, pendingId);
-      state.upsertMessage(activeId, { ...message, status: "complete", updated_at: now() });
+      state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() });
       state.upsertMessage(activeId, answer);
     } catch (cause) {
       state.removeMessage(activeId, pendingId);
-      state.upsertMessage(activeId, { ...message, status: "error", updated_at: now() });
+      state.upsertMessage(activeId, { ...target, status: "error", updated_at: now() });
       state.setError(cause instanceof Error ? cause.message : "Retry failed.");
     } finally { state.setBusy(false); }
   }
@@ -181,6 +185,7 @@ function Chat() {
     if (!activeId) return;
     const before = messages[activeId] ?? [];
     state.removeMessage(activeId, message.id);
+    if (message.optimistic || message.id.startsWith("local-") || message.id.startsWith("error-") || message.id.startsWith("assistant-") || message.id.startsWith("retry-")) return;
     try { await api.deleteMessage(activeId, message.id); }
     catch (cause) { state.setMessages(activeId, before); state.setError(cause instanceof Error ? cause.message : "Could not delete message."); }
   }
@@ -250,6 +255,18 @@ function ThinkingBlock({ reasoning }: { reasoning: string }) {
   return <div className="thinking-block"><button type="button" className="thinking-summary" aria-expanded={open} onClick={() => setOpen(!open)}>Thinking</button><div className="thinking-collapse" style={{ maxHeight: open ? contentHeight : 0 }}><div ref={scrollRef} className="thinking-scroll"><div className="plain-content">{reasoning}</div></div></div></div>;
 }
 
+function preprocessLatex(input: string): string {
+  const blocks: string[] = [];
+  const protectedText = input.replace(/```[\s\S]*?```|`[^`\n]*`/g, (match) => {
+    blocks.push(match);
+    return `\u0000${blocks.length - 1}\u0000`;
+  });
+  const converted = protectedText
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_, body) => `$$\n${body}\n$$`)
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_, body) => `$${body}$`);
+  return converted.replace(/\u0000(\d+)\u0000/g, (_, index) => blocks[Number(index)]);
+}
+
 function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDelete, onRetry, onLookup }: { message: Message; markdownEnabled: boolean; theme: "light" | "dark"; isLast: boolean; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
@@ -278,7 +295,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
   const content = message.reasoning_content ? message.content : legacy.content;
   const reasoning = message.reasoning_content || legacy.reasoning;
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
-  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" onMouseUp={captureSelection} onTouchEnd={captureSelection}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : content && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <SyntaxHighlighter language={language} style={theme === "dark" ? oneDark : oneLight} showLineNumbers wrapLongLines customStyle={{ margin: "0", background: "transparent", padding: "12px 0" }}>{source}</SyntaxHighlighter> : <code className={className} {...props}>{children}</code>; } }}>{content}</ReactMarkdown> : content}</div>}</>}{isLast && message.status === "error" && message.role === "user" && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" title="Delete" onClick={() => void onDelete(message)}><Trash2 size={14} /></button></div></div></article>;
+  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" onMouseUp={captureSelection} onTouchEnd={captureSelection}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : content && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <SyntaxHighlighter language={language} style={theme === "dark" ? oneDark : oneLight} showLineNumbers wrapLongLines customStyle={{ margin: "0", background: "transparent", padding: "12px 0" }}>{source}</SyntaxHighlighter> : <code className={className} {...props}>{children}</code>; } }}>{preprocessLatex(content)}</ReactMarkdown> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" title="Delete" onClick={() => void onDelete(message)}><Trash2 size={14} /></button></div></div></article>;
 }
 
 function splitLegacyThinking(value: string) {

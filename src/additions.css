@@ -126,3 +126,14 @@
 .app-shell.dark .kind-toggle button{color:#b0b0b0!important}
 .app-shell.dark .kind-toggle button:not(.selected):hover{background:#2c2c2c!important;color:#e8e8e8!important}
 .app-shell.dark .kind-toggle button.selected{background:#e0e0e0!important;color:#171717!important}
+
+/* KaTeX math: keep long formulas scrollable on narrow screens */
+.markdown-content .katex-display {
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 6px 0;
+  max-width: 100%;
+}
+.markdown-content .katex {
+  color: inherit;
+}
