@@ -21,7 +21,7 @@ use flate2::read::GzDecoder;
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use reqwest::Client;
 use rusqlite::{Connection, params};
-use rust_mdict::Mdx;
+use rust_mdict::{KeyWordItem, Mdx};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -251,6 +251,7 @@ struct ProviderModel {
     group_name: String,
     model: String,
     sort_order: i32,
+    context_window: i32,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -299,7 +300,6 @@ struct CreateConversation {
     title: Option<String>,
     provider_id: Option<Uuid>,
     model: Option<String>,
-    context_window: Option<i32>,
 }
 #[derive(Deserialize)]
 struct UpdateConversation {
@@ -307,7 +307,6 @@ struct UpdateConversation {
     archived: Option<bool>,
     provider_id: Option<Uuid>,
     model: Option<String>,
-    context_window: Option<i32>,
 }
 #[derive(Deserialize)]
 struct ProviderRequest {
@@ -322,12 +321,14 @@ struct ProviderModelRequest {
     group_name: String,
     model: String,
     sort_order: Option<i32>,
+    context_window: Option<i32>,
 }
 #[derive(Deserialize)]
 struct UpdateProviderModelRequest {
     group_name: Option<String>,
     model: Option<String>,
     sort_order: Option<i32>,
+    context_window: Option<i32>,
 }
 #[derive(Deserialize)]
 struct CreateMessage {
@@ -684,7 +685,7 @@ async fn create_provider(
     let (ciphertext, nonce) = encrypt(&state, request.api_key.trim())?;
     let mut tx = state.db.begin().await?;
     let row:ProviderRow=sqlx::query_as("INSERT INTO providers (id,user_id,name,kind,base_url,encrypted_api_key,key_nonce,default_model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,kind,base_url,default_model,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.name.trim()).bind(request.kind).bind(request.base_url.trim_end_matches('/')).bind(ciphertext).bind(nonce).bind(request.default_model.trim()).fetch_one(&mut *tx).await?;
-    sqlx::query("INSERT INTO provider_models (id,provider_id,group_name,model) VALUES ($1,$2,'General',$3)").bind(Uuid::new_v4()).bind(row.id).bind(&row.default_model).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO provider_models (id,provider_id,group_name,model,context_window) VALUES ($1,$2,'General',$3,$4)").bind(Uuid::new_v4()).bind(row.id).bind(&row.default_model).bind(128_000).execute(&mut *tx).await?;
     tx.commit().await?;
     let provider = provider_with_models(&state.db, row).await?;
     event(&state.db, user_id, "provider", provider.id, "created", 1).await?;
@@ -692,7 +693,7 @@ async fn create_provider(
 }
 
 async fn provider_with_models(pool: &PgPool, row: ProviderRow) -> Result<Provider, ApiError> {
-    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,sort_order,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
+    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,sort_order,context_window,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
         .bind(row.id).fetch_all(pool).await?;
     Ok(Provider { id: row.id, name: row.name, kind: row.kind, base_url: row.base_url, default_model: row.default_model, created_at: row.created_at, updated_at: row.updated_at, models })
 }
@@ -711,8 +712,8 @@ async fn create_provider_model(State(state): State<AppState>, headers: HeaderMap
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
     if request.group_name.trim().is_empty() || request.model.trim().is_empty() { return Err(ApiError::bad("Model group and model name are required.")); }
-    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING id,provider_id,group_name,model,sort_order,created_at,updated_at")
-        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.sort_order.unwrap_or(0)).fetch_one(&state.db).await?;
+    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,sort_order,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,provider_id,group_name,model,sort_order,context_window,created_at,updated_at")
+        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).fetch_one(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
 }
@@ -722,8 +723,8 @@ async fn update_provider_model(State(state): State<AppState>, headers: HeaderMap
     own_provider(&state.db, user_id, id).await?;
     if request.group_name.as_ref().is_some_and(|v| v.trim().is_empty()) || request.model.as_ref().is_some_and(|v| v.trim().is_empty()) { return Err(ApiError::bad("Model group and model name cannot be empty.")); }
     let previous: (String,) = sqlx::query_as("SELECT model FROM provider_models WHERE id=$1 AND provider_id=$2").bind(model_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
-    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),sort_order=COALESCE($5,sort_order) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,sort_order,created_at,updated_at")
-        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.sort_order).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),sort_order=COALESCE($5,sort_order),context_window=COALESCE($6,context_window) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,sort_order,context_window,created_at,updated_at")
+        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2").bind(id).bind(previous.0).bind(&item.model).execute(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
@@ -785,13 +786,14 @@ async fn create_conversation(
     Json(request): Json<CreateConversation>,
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
-    let model = if let Some(pid) = request.provider_id {
+    let (model, context_window) = if let Some(pid) = request.provider_id {
         let provider = own_provider(&state.db, user_id, pid).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
         let model = request.model.unwrap_or(provider.default_model);
         if !configured_model(&state.db, pid, &model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
-        Some(model)
-    } else { request.model };
-    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(request.context_window.unwrap_or(128000).clamp(4096,2_000_000)).fetch_one(&state.db).await?;
+        let context_window: (i32,) = sqlx::query_as("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(pid).bind(&model).fetch_one(&state.db).await?;
+        (Some(model), context_window.0)
+    } else { (request.model, 128_000) };
+    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(context_window).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -820,17 +822,22 @@ async fn update_conversation(
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let existing = own_conversation(&state.db, user_id, id).await?;
+    let model_changed = request.model.is_some();
     let model = request.model.map(|value| value.trim().to_string());
     if model.as_ref().is_some_and(String::is_empty) {
         return Err(ApiError::bad("Model name cannot be empty."));
     }
     let provider_id = request.provider_id.or(existing.model_provider_id);
     let selected_model = model.as_deref().or(existing.model.as_deref());
+    let mut selected_context_window = None;
     if let (Some(provider_id), Some(model)) = (provider_id, selected_model) {
         own_provider(&state.db, user_id, provider_id).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
         if !configured_model(&state.db, provider_id, model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
+        if request.provider_id.is_some() || model_changed {
+            selected_context_window = Some(sqlx::query_as::<_, (i32,)>("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(provider_id).bind(model).fetch_one(&state.db).await?.0);
+        }
     }
-    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).fetch_one(&state.db).await?;
+    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -969,11 +976,12 @@ async fn respond(
     let api_key = decrypt(&state, &p.3, &p.4)?;
     let model = conversation.model.clone().unwrap_or_else(|| p.2.clone());
     let sources = if request.search.unwrap_or(false) {
-        let queries = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content, &transcript).await
+        let queries = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await
             .unwrap_or_else(|_| vec![focused_search_query(&input.content)]);
         let mut merged = Vec::new();
         for query in queries.into_iter().take(4) {
-            for result in fetch_search(&state, &query).await.unwrap_or_default() {
+            for mut result in fetch_search(&state, &query).await.unwrap_or_default() {
+                result["query"] = json!(query);
                 if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); }
             }
         }
@@ -1140,6 +1148,7 @@ fn lookup_dictionary(
 fn normalize_dictionary_key(value: &str) -> String {
     value
         .trim()
+        .replace('\u{0301}', "")
         .to_lowercase()
         .chars()
         .filter(|character| character.is_alphanumeric() || *character == 'ё')
@@ -1170,6 +1179,23 @@ fn plain_text(value: &str) -> String {
         .join(" ")
 }
 
+fn structured_plain_text(value: &str) -> String {
+    let with_breaks = value
+        .replace("<br>", "\n")
+        .replace("<br/>", "\n")
+        .replace("<br />", "\n")
+        .replace("</div>", "\n")
+        .replace("</p>", "\n")
+        .replace("</li>", "\n")
+        .replace("<li>", "• ");
+    with_breaks
+        .lines()
+        .map(plain_text)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn split_lines(value: &str) -> Vec<String> {
     value
         .lines()
@@ -1194,18 +1220,44 @@ fn lookup_russian_dictionary(
 }
 
 fn russian_entry(mdx: &mut Mdx, term: &str, linked_from: Option<&str>) -> Option<DictionaryEntryResponse> {
+    let normalized = normalize_dictionary_key(term);
+    let entries = russian_exact_entries(mdx, &normalized);
+    for item in &entries {
+        let lookup = mdx.fetch(item)?;
+        if let Some(target) = russian_link_target(&lookup.definition) {
+            if normalize_dictionary_key(&target) != normalized {
+                return russian_entry(mdx, &target, Some(&lookup.key_text));
+            }
+        }
+        return russian_response(lookup.key_text, &lookup.definition, linked_from);
+    }
     let lookup = mdx.lookup(term)?;
     if let Some(target) = russian_link_target(&lookup.definition) {
-        if target != term && target != lookup.key_text {
-            return russian_entry(mdx, &target, Some(&lookup.key_text));
-        }
+        if normalize_dictionary_key(&target) != normalized { return russian_entry(mdx, &target, Some(&lookup.key_text)); }
     }
+    russian_response(lookup.key_text, &lookup.definition, linked_from)
+}
+
+fn russian_exact_entries(mdx: &Mdx, target: &str) -> Vec<KeyWordItem> {
+    let list = mdx.keyword_list();
+    let mut lo = 0;
+    let mut hi = list.len();
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        if normalize_dictionary_key(&list[mid].key_text).as_str() < target { lo = mid + 1; } else { hi = mid; }
+    }
+    let start = lo;
+    while lo < list.len() && normalize_dictionary_key(&list[lo].key_text) == target { lo += 1; }
+    list[start..lo].to_vec()
+}
+
+fn russian_response(headword: String, definition: &str, linked_from: Option<&str>) -> Option<DictionaryEntryResponse> {
     let mut labels = vec!["OpenRussian".into()];
     if let Some(source) = linked_from { labels.push(format!("Lemma for {source}")); }
     Some(DictionaryEntryResponse {
-        headword: lookup.key_text,
+        headword,
         pronunciation: String::new(),
-        definitions: split_lines(&plain_text(&lookup.definition)),
+        definitions: split_lines(&structured_plain_text(definition)),
         translations: Vec::new(),
         forms: Vec::new(),
         labels,
@@ -1215,7 +1267,14 @@ fn russian_entry(mdx: &mut Mdx, term: &str, linked_from: Option<&str>) -> Option
 }
 
 fn russian_link_target(definition: &str) -> Option<String> {
-    definition.split("@@@LINK=").nth(1)?.split_whitespace().next().map(str::to_string)
+    definition
+        .split("@@@LINK=")
+        .nth(1)?
+        .split("@@@")
+        .next()?
+        .split_whitespace()
+        .next()
+        .map(|value| value.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '<' | '>')).to_lowercase())
 }
 
 fn german_database_path(directory: &std::path::Path) -> Result<PathBuf, ApiError> {
@@ -1259,7 +1318,7 @@ fn lookup_german_dictionary(
             |(headword, lemma, forms, definition)| DictionaryEntryResponse {
                 headword,
                 pronunciation: String::new(),
-                definitions: split_lines(&plain_text(&definition)),
+                definitions: split_lines(&structured_plain_text(&definition)),
                 translations: Vec::new(),
                 forms: serde_json::from_str::<Vec<String>>(&forms).unwrap_or_else(|_| vec![lemma]),
                 labels: vec!["Kaikki German".into()],
@@ -1286,7 +1345,7 @@ fn lookup_german_dictionary(
                 |(headword, lemma, forms, definition)| DictionaryEntryResponse {
                     headword,
                     pronunciation: String::new(),
-                    definitions: split_lines(&plain_text(&definition)),
+                    definitions: split_lines(&structured_plain_text(&definition)),
                     translations: Vec::new(),
                     forms: serde_json::from_str(&forms).unwrap_or_else(|_| vec![lemma]),
                     labels: vec!["Kaikki German".into()],
@@ -1409,11 +1468,11 @@ async fn generate_search_queries(
     key: &str,
     model: &str,
     question: &str,
-    context: &[Value],
 ) -> Result<Vec<String>, ApiError> {
-    let mut messages = vec![json!({"role":"system","content":"You are a search query planner. Return ONLY a JSON array of up to four concise web search queries. Preserve names, versions, dates, and technical terms. Do not answer the question."})];
-    messages.extend(context.iter().rev().take(8).cloned());
-    messages.push(json!({"role":"user","content":question}));
+    let messages = vec![
+        json!({"role":"system","content":"You plan web searches. Return ONLY a JSON array containing 2 to 4 search-engine queries. Every query must contain a specific named entity or key phrase from the question. Include dates or versions when relevant. Never return a one-word generic term. Do not answer the question."}),
+        json!({"role":"user","content":format!("Question: {question}")}),
+    ];
     let raw = call_provider(http, kind, base, key, model, &messages, Some(0.0), None).await?;
     let candidate = raw.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
     let parsed: Value = serde_json::from_str(candidate).or_else(|_| {
@@ -1421,7 +1480,26 @@ async fn generate_search_queries(
         let end = candidate.rfind(']').ok_or(())?;
         serde_json::from_str(&candidate[start..=end]).map_err(|_| ())
     }).map_err(|_| ApiError::bad("The provider returned invalid search queries."))?;
-    Ok(parsed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|q| !q.is_empty()).take(4).map(ToOwned::to_owned).collect())
+    let question_terms = search_terms(question);
+    let queries = parsed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|query| is_valid_search_query(query, &question_terms)).take(4).map(ToOwned::to_owned).collect::<Vec<_>>();
+    if queries.is_empty() { return Err(ApiError::bad("The provider returned unusable search queries.")); }
+    Ok(queries)
+}
+
+fn search_terms(value: &str) -> Vec<String> {
+    value.split(|ch: char| !ch.is_alphanumeric() && ch != '-' && ch != '_')
+        .map(str::trim)
+        .filter(|term| term.chars().count() >= 3)
+        .map(str::to_lowercase)
+        .filter(|term| !matches!(term.as_str(), "what" | "which" | "when" | "where" | "with" | "from" | "that" | "this" | "about" | "latest" | "model" | "models" | "search" | "internet" | "please" | "give" | "have" | "does" | "there" | "现在" | "最新" | "模型" | "搜索"))
+        .collect()
+}
+
+fn is_valid_search_query(query: &str, question_terms: &[String]) -> bool {
+    let normalized = query.trim();
+    if normalized.chars().count() < 8 || normalized.chars().count() > 180 { return false; }
+    let lower = normalized.to_lowercase();
+    question_terms.is_empty() || question_terms.iter().any(|term| lower.contains(term))
 }
 
 async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiError> {
@@ -1444,7 +1522,8 @@ async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiEr
         .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
         .map(|v| json!({"title":v["title"],"url":v["url"],"content":v["content"],"engine":v["engine"]}))
         .collect::<Vec<_>>();
-    let terms = search_query.split_whitespace().filter(|term| term.chars().count() > 3).map(str::to_lowercase).collect::<Vec<_>>();
+    let terms = search_terms(&search_query);
+    results.retain(|result| terms.is_empty() || terms.iter().any(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term)));
     results.sort_by_key(|result| std::cmp::Reverse(terms.iter().filter(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term.as_str())).count()));
     results.truncate(8);
     Ok(results)

@@ -1,0 +1,3 @@
+ALTER TABLE provider_models
+    ADD COLUMN context_window INTEGER NOT NULL DEFAULT 128000
+    CHECK (context_window BETWEEN 4096 AND 2000000);
