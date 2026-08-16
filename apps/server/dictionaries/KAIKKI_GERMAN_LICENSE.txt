@@ -1,0 +1,12 @@
+German dictionary data
+
+Source: Kaikki.org German Wiktionary JSONL dump
+https://kaikki.org/dictionary/German/
+
+The source data is extracted from Wiktionary and is made available under the
+Creative Commons Attribution-ShareAlike 3.0 Unported license (CC BY-SA 3.0).
+Attribution: Wiktionary contributors and Kaikki.org.
+
+Source data and rebuild command:
+python3 scripts/build_german_dictionary.py \
+  kaikki.org-dictionary-German.jsonl src-tauri/german_en.txt.gz

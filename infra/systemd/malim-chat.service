@@ -1,0 +1,23 @@
+[Unit]
+Description=malim_chat authoritative API
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=malim_chat
+Group=malim_chat
+WorkingDirectory=/opt/malim_chat
+EnvironmentFile=/etc/malim_chat.env
+ExecStart=/opt/malim_chat/bin/malim-server
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/malim_chat
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

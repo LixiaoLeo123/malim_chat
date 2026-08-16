@@ -1,0 +1,8 @@
+[workspace]
+members = ["apps/server", "apps/client/src-tauri"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "AGPL-3.0-or-later"
+repository = "https://example.invalid/malim_chat"

@@ -1,0 +1,12 @@
+node_modules/
+dist/
+target/
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+!apps/server/dictionaries/ecdict_en_zh.sqlite
+apps/client/src-tauri/gen/
+apps/client/src-tauri/target/

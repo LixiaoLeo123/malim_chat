@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-malim_chat}
+      POSTGRES_USER: ${POSTGRES_USER:-malim}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    volumes:
+      - malim_postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+  searxng:
+    image: searxng/searxng:2025.2.16-345c5e5
+    restart: unless-stopped
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+  api:
+    build:
+      context: ..
+      dockerfile: infra/server.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-malim}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-malim_chat}
+      MALIM_BIND: 0.0.0.0:3100
+      MALIM_JWT_SECRET: ${MALIM_JWT_SECRET:?set MALIM_JWT_SECRET}
+      MALIM_ENCRYPTION_KEY: ${MALIM_ENCRYPTION_KEY:?set MALIM_ENCRYPTION_KEY}
+      MALIM_CORS_ORIGINS: https://${MALIM_DOMAIN:?set MALIM_DOMAIN},tauri://localhost
+      SEARXNG_URL: http://searxng:8080
+      RUST_LOG: malim_server=info,tower_http=info
+    ports:
+      - "127.0.0.1:3100:3100"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:3100/healthz >/dev/null"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+  web:
+    build:
+      context: ..
+      dockerfile: infra/web.Dockerfile
+      args:
+        VITE_API_URL: https://${MALIM_DOMAIN:?set MALIM_DOMAIN}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3180:80"
+volumes:
+  malim_postgres:

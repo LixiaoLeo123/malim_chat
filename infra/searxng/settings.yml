@@ -1,0 +1,22 @@
+use_default_settings: true
+general:
+  instance_name: "malim_chat search"
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
+server:
+  secret_key: "change-this-in-production"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: true
+engines:
+  - name: baidu
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: sogou
+    disabled: false
+  - name: 360search
+    disabled: false

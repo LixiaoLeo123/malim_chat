@@ -1,0 +1,1354 @@
+use std::{env, net::SocketAddr, path::PathBuf, sync::Arc};
+
+use aes_gcm::{
+    Aes256Gcm, Nonce,
+    aead::{Aead, KeyInit, OsRng},
+};
+use argon2::{
+    Argon2, PasswordHash, PasswordHasher, PasswordVerifier,
+    password_hash::{SaltString, rand_core::RngCore},
+};
+use axum::{
+    Json, Router,
+    extract::{Path, Query, State},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post},
+};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+use chrono::{DateTime, Duration, Utc};
+use flate2::read::GzDecoder;
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use reqwest::Client;
+use rusqlite::{Connection, params};
+use rust_mdict::Mdx;
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+use sqlx::{FromRow, PgPool, postgres::PgPoolOptions};
+use tower_http::{
+    cors::CorsLayer, limit::RequestBodyLimitLayer,
+    sensitive_headers::SetSensitiveRequestHeadersLayer, trace::TraceLayer,
+};
+use tracing::{error, info};
+use uuid::Uuid;
+
+const ACCESS_TOKEN_MINUTES: i64 = 15;
+const REFRESH_TOKEN_DAYS: i64 = 30;
+const DEFAULT_PAGE_SIZE: i64 = 50;
+const MAX_PAGE_SIZE: i64 = 100;
+
+#[derive(Clone)]
+struct AppState {
+    db: PgPool,
+    http: Client,
+    jwt_secret: Arc<Vec<u8>>,
+    encryption_key: Arc<[u8; 32]>,
+    searxng_url: Option<String>,
+    dictionary_dir: Arc<PathBuf>,
+}
+
+struct Config {
+    database_url: String,
+    bind: SocketAddr,
+    jwt_secret: String,
+    encryption_key: String,
+    searxng_url: Option<String>,
+    cors_origins: Vec<HeaderValue>,
+    dictionary_dir: PathBuf,
+}
+
+impl Config {
+    fn from_env() -> Result<Self, ApiError> {
+        dotenvy::dotenv().ok();
+        let get =
+            |name: &str| env::var(name).map_err(|_| ApiError::internal(format!("missing {name}")));
+        let raw_key = BASE64
+            .decode(get("MALIM_ENCRYPTION_KEY")?.as_bytes())
+            .map_err(|_| ApiError::internal("MALIM_ENCRYPTION_KEY must be base64"))?;
+        if raw_key.len() != 32 {
+            return Err(ApiError::internal(
+                "MALIM_ENCRYPTION_KEY must decode to 32 bytes",
+            ));
+        }
+        let cors_origins = env::var("MALIM_CORS_ORIGINS")
+            .unwrap_or_else(|_| "http://localhost:1420,tauri://localhost".into())
+            .split(',')
+            .map(|v| {
+                v.trim()
+                    .parse()
+                    .map_err(|_| ApiError::internal("invalid CORS origin"))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            database_url: get("DATABASE_URL")?,
+            bind: env::var("MALIM_BIND")
+                .unwrap_or_else(|_| "127.0.0.1:3100".into())
+                .parse()
+                .map_err(|_| ApiError::internal("invalid MALIM_BIND"))?,
+            jwt_secret: get("MALIM_JWT_SECRET")?,
+            encryption_key: BASE64.encode(raw_key),
+            searxng_url: env::var("SEARXNG_URL").ok().filter(|v| !v.is_empty()),
+            cors_origins,
+            dictionary_dir: env::var("MALIM_DICTIONARY_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|_| PathBuf::from("apps/server/dictionaries")),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+impl ApiError {
+    fn bad(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_request",
+            message: message.into(),
+        }
+    }
+    fn unauthorized() -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code: "unauthorized",
+            message: "Authentication is required.".into(),
+        }
+    }
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: "The requested resource was not found.".into(),
+        }
+    }
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: message.into(),
+        }
+    }
+}
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({"error": {"code": self.code, "message": self.message}})),
+        )
+            .into_response()
+    }
+}
+impl From<sqlx::Error> for ApiError {
+    fn from(error: sqlx::Error) -> Self {
+        error!(%error, "database failure");
+        Self::internal("The server could not complete this request.")
+    }
+}
+impl From<reqwest::Error> for ApiError {
+    fn from(error: reqwest::Error) -> Self {
+        error!(%error, "upstream provider failure");
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "provider_unavailable",
+            message: "The AI provider could not be reached.".into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: Uuid,
+    exp: usize,
+    iat: usize,
+    typ: String,
+}
+#[derive(Serialize)]
+struct AuthResponse {
+    access_token: String,
+    refresh_token: String,
+    user: User,
+}
+#[derive(Deserialize)]
+struct SignupRequest {
+    email: String,
+    password: String,
+    display_name: Option<String>,
+}
+#[derive(Deserialize)]
+struct LoginRequest {
+    email: String,
+    password: String,
+}
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Debug, Serialize, FromRow)]
+struct User {
+    id: Uuid,
+    email: String,
+    display_name: String,
+    created_at: DateTime<Utc>,
+}
+#[derive(FromRow)]
+struct AuthUser {
+    id: Uuid,
+    email: String,
+    display_name: String,
+    created_at: DateTime<Utc>,
+    password_hash: String,
+    disabled_at: Option<DateTime<Utc>>,
+}
+impl From<AuthUser> for User {
+    fn from(value: AuthUser) -> Self {
+        Self {
+            id: value.id,
+            email: value.email,
+            display_name: value.display_name,
+            created_at: value.created_at,
+        }
+    }
+}
+#[derive(FromRow)]
+struct RefreshUser {
+    id: Uuid,
+    email: String,
+    display_name: String,
+    created_at: DateTime<Utc>,
+    refresh_id: Uuid,
+}
+#[derive(Debug, Serialize, FromRow)]
+struct Provider {
+    id: Uuid,
+    name: String,
+    kind: String,
+    base_url: String,
+    default_model: String,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+#[derive(Debug, Serialize, FromRow)]
+struct Conversation {
+    id: Uuid,
+    title: String,
+    model_provider_id: Option<Uuid>,
+    model: Option<String>,
+    context_window: i32,
+    context_tokens: i32,
+    revision: i64,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+#[derive(Debug, Serialize, FromRow)]
+struct Message {
+    id: Uuid,
+    conversation_id: Uuid,
+    sequence: i64,
+    client_mutation_id: Option<Uuid>,
+    role: String,
+    content: String,
+    content_format: String,
+    status: String,
+    model: Option<String>,
+    token_count: i32,
+    search_sources: Value,
+    edited_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct PageQuery {
+    cursor: Option<String>,
+    limit: Option<i64>,
+}
+#[derive(Serialize)]
+struct Page<T> {
+    items: Vec<T>,
+    next_cursor: Option<String>,
+}
+#[derive(Deserialize)]
+struct CreateConversation {
+    title: Option<String>,
+    provider_id: Option<Uuid>,
+    model: Option<String>,
+    context_window: Option<i32>,
+}
+#[derive(Deserialize)]
+struct UpdateConversation {
+    title: Option<String>,
+    archived: Option<bool>,
+}
+#[derive(Deserialize)]
+struct ProviderRequest {
+    name: String,
+    kind: String,
+    base_url: String,
+    api_key: String,
+    default_model: String,
+}
+#[derive(Deserialize)]
+struct CreateMessage {
+    content: String,
+    client_mutation_id: Uuid,
+    search: Option<bool>,
+}
+#[derive(Deserialize)]
+struct UpdateMessage {
+    content: String,
+}
+#[derive(Deserialize)]
+struct RespondRequest {
+    message_id: Uuid,
+    search: Option<bool>,
+}
+#[derive(Deserialize)]
+struct CompactRequest {
+    through_sequence: Option<i64>,
+    force: Option<bool>,
+}
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+}
+#[derive(Deserialize)]
+struct SyncQuery {
+    cursor: Option<i64>,
+    limit: Option<i64>,
+}
+#[derive(Serialize, FromRow)]
+struct SyncEvent {
+    cursor: i64,
+    entity_type: String,
+    entity_id: Uuid,
+    operation: String,
+    revision: i64,
+    occurred_at: DateTime<Utc>,
+}
+#[derive(Deserialize)]
+struct DictionaryQuery {
+    word: String,
+    dictionary: String,
+}
+#[derive(Serialize)]
+struct DictionaryEntryResponse {
+    headword: String,
+    pronunciation: String,
+    definitions: Vec<String>,
+    translations: Vec<String>,
+    forms: Vec<String>,
+    labels: Vec<String>,
+    examples: Vec<String>,
+    detail: Value,
+}
+#[derive(Serialize)]
+struct DictionaryResponse {
+    word: String,
+    dictionary: String,
+    entries: Vec<DictionaryEntryResponse>,
+}
+
+fn token_for(state: &AppState, user_id: Uuid) -> Result<String, ApiError> {
+    let now = Utc::now();
+    encode(
+        &Header::default(),
+        &Claims {
+            sub: user_id,
+            iat: now.timestamp() as usize,
+            exp: (now + Duration::minutes(ACCESS_TOKEN_MINUTES)).timestamp() as usize,
+            typ: "access".into(),
+        },
+        &EncodingKey::from_secret(&state.jwt_secret),
+    )
+    .map_err(|_| ApiError::internal("could not issue access token"))
+}
+fn user_from_headers(state: &AppState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    let raw = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .ok_or_else(ApiError::unauthorized)?;
+    let token = decode::<Claims>(
+        raw,
+        &DecodingKey::from_secret(&state.jwt_secret),
+        &Validation::default(),
+    )
+    .map_err(|_| ApiError::unauthorized())?;
+    if token.claims.typ != "access" {
+        return Err(ApiError::unauthorized());
+    }
+    Ok(token.claims.sub)
+}
+fn digest(input: &str) -> String {
+    format!("{:x}", Sha256::digest(input.as_bytes()))
+}
+fn random_token() -> String {
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    BASE64.encode(bytes)
+}
+fn encrypt(state: &AppState, plaintext: &str) -> Result<(Vec<u8>, Vec<u8>), ApiError> {
+    let cipher = Aes256Gcm::new_from_slice(state.encryption_key.as_ref())
+        .map_err(|_| ApiError::internal("encryption setup failed"))?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext.as_bytes())
+        .map_err(|_| ApiError::internal("credential encryption failed"))?;
+    Ok((encrypted, nonce.to_vec()))
+}
+fn decrypt(state: &AppState, encrypted: &[u8], nonce: &[u8]) -> Result<String, ApiError> {
+    let cipher = Aes256Gcm::new_from_slice(state.encryption_key.as_ref())
+        .map_err(|_| ApiError::internal("encryption setup failed"))?;
+    let plain = cipher
+        .decrypt(Nonce::from_slice(nonce), encrypted)
+        .map_err(|_| ApiError::internal("stored credential could not be decrypted"))?;
+    String::from_utf8(plain).map_err(|_| ApiError::internal("stored credential is invalid"))
+}
+fn estimate_tokens(content: &str) -> i32 {
+    ((content.chars().count() as f64 / 3.5).ceil() as i32).max(1)
+}
+async fn own_conversation(
+    pool: &PgPool,
+    user_id: Uuid,
+    id: Uuid,
+) -> Result<Conversation, ApiError> {
+    sqlx::query_as::<_, Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at FROM conversations WHERE id=$1 AND user_id=$2 AND archived_at IS NULL").bind(id).bind(user_id).fetch_optional(pool).await?.ok_or_else(ApiError::not_found)
+}
+async fn event(
+    pool: &PgPool,
+    user_id: Uuid,
+    entity_type: &str,
+    entity_id: Uuid,
+    operation: &str,
+    revision: i64,
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO sync_events (user_id,entity_type,entity_id,operation,revision) VALUES ($1,$2,$3,$4,$5)").bind(user_id).bind(entity_type).bind(entity_id).bind(operation).bind(revision).execute(pool).await?;
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .json()
+        .init();
+    let config = Config::from_env().map_err(|e| anyhow::anyhow!(e.message))?;
+    let decoded = BASE64.decode(config.encryption_key.as_bytes())?;
+    let key: [u8; 32] = decoded
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("invalid encryption key length"))?;
+    let db = PgPoolOptions::new()
+        .max_connections(20)
+        .connect(&config.database_url)
+        .await?;
+    sqlx::migrate!().run(&db).await?;
+    let state = AppState {
+        db,
+        http: Client::builder()
+            .timeout(std::time::Duration::from_secs(90))
+            .build()?,
+        jwt_secret: Arc::new(config.jwt_secret.into_bytes()),
+        encryption_key: Arc::new(key),
+        searxng_url: config.searxng_url,
+        dictionary_dir: Arc::new(config.dictionary_dir),
+    };
+    let cors = CorsLayer::new()
+        .allow_origin(config.cors_origins)
+        .allow_methods([Method::GET, Method::POST, Method::PATCH, Method::DELETE])
+        .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE]);
+    let app = Router::new()
+        .route("/healthz", get(|| async { Json(json!({"status":"ok"})) }))
+        .route("/v1/auth/signup", post(signup))
+        .route("/v1/auth/login", post(login))
+        .route("/v1/auth/refresh", post(refresh))
+        .route("/v1/me", get(me))
+        .route("/v1/providers", get(list_providers).post(create_provider))
+        .route("/v1/providers/{id}", delete(delete_provider))
+        .route(
+            "/v1/conversations",
+            get(list_conversations).post(create_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}",
+            get(get_conversation)
+                .patch(update_conversation)
+                .delete(delete_conversation),
+        )
+        .route(
+            "/v1/conversations/{id}/messages",
+            get(list_messages).post(create_message),
+        )
+        .route(
+            "/v1/conversations/{id}/messages/{message_id}",
+            patch(update_message).delete(delete_message),
+        )
+        .route("/v1/conversations/{id}/respond", post(respond))
+        .route("/v1/conversations/{id}/compact", post(compact))
+        .route("/v1/search", get(search))
+        .route("/v1/dictionary", get(dictionary_lookup))
+        .route("/v1/sync", get(sync))
+        .layer(RequestBodyLimitLayer::new(1_048_576))
+        .layer(SetSensitiveRequestHeadersLayer::new(std::iter::once(
+            http::header::AUTHORIZATION,
+        )))
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state);
+    info!(bind=%config.bind, "malim_chat server started");
+    let listener = tokio::net::TcpListener::bind(config.bind).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    Ok(())
+}
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+async fn signup(
+    State(state): State<AppState>,
+    Json(request): Json<SignupRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let email = request.email.trim().to_lowercase();
+    if !email.contains('@') || request.password.len() < 12 {
+        return Err(ApiError::bad(
+            "Use a valid email and a password of at least 12 characters.",
+        ));
+    }
+    let name = request
+        .display_name
+        .unwrap_or_else(|| email.split('@').next().unwrap_or("User").to_string())
+        .trim()
+        .to_string();
+    if name.is_empty() || name.len() > 80 {
+        return Err(ApiError::bad(
+            "Display name must contain 1 to 80 characters.",
+        ));
+    }
+    let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
+    let password_hash = Argon2::default()
+        .hash_password(request.password.as_bytes(), &salt)
+        .map_err(|_| ApiError::internal("could not protect password"))?
+        .to_string();
+    let user = User {
+        id: Uuid::new_v4(),
+        email,
+        display_name: name,
+        created_at: Utc::now(),
+    };
+    let inserted = sqlx::query("INSERT INTO users (id,email,password_hash,display_name,created_at) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (email) DO NOTHING").bind(user.id).bind(&user.email).bind(password_hash).bind(&user.display_name).bind(user.created_at).execute(&state.db).await?;
+    if inserted.rows_affected() == 0 {
+        return Err(ApiError::bad("An account with that email already exists."));
+    }
+    issue_session(&state, user).await.map(Json)
+}
+async fn login(
+    State(state): State<AppState>,
+    Json(request): Json<LoginRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let row: AuthUser = sqlx::query_as("SELECT id,email,display_name,created_at,password_hash,disabled_at FROM users WHERE email=$1").bind(request.email.trim().to_lowercase()).fetch_optional(&state.db).await?.ok_or_else(ApiError::unauthorized)?;
+    if row.disabled_at.is_some()
+        || Argon2::default()
+            .verify_password(
+                request.password.as_bytes(),
+                &PasswordHash::new(&row.password_hash).map_err(|_| ApiError::unauthorized())?,
+            )
+            .is_err()
+    {
+        return Err(ApiError::unauthorized());
+    }
+    issue_session(&state, row.into()).await.map(Json)
+}
+async fn refresh(
+    State(state): State<AppState>,
+    Json(request): Json<RefreshRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    let raw_hash = digest(&request.refresh_token);
+    let row: RefreshUser = sqlx::query_as("SELECT u.id,u.email,u.display_name,u.created_at,rt.id AS refresh_id FROM refresh_tokens rt JOIN users u ON u.id=rt.user_id WHERE rt.token_hash=$1 AND rt.revoked_at IS NULL AND rt.expires_at > now() AND u.disabled_at IS NULL").bind(raw_hash).fetch_optional(&state.db).await?.ok_or_else(ApiError::unauthorized)?;
+    sqlx::query("UPDATE refresh_tokens SET revoked_at=now() WHERE id=$1")
+        .bind(row.refresh_id)
+        .execute(&state.db)
+        .await?;
+    issue_session(
+        &state,
+        User {
+            id: row.id,
+            email: row.email,
+            display_name: row.display_name,
+            created_at: row.created_at,
+        },
+    )
+    .await
+    .map(Json)
+}
+async fn issue_session(state: &AppState, user: User) -> Result<AuthResponse, ApiError> {
+    let refresh_token = random_token();
+    sqlx::query(
+        "INSERT INTO refresh_tokens (id,user_id,token_hash,expires_at) VALUES ($1,$2,$3,$4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(user.id)
+    .bind(digest(&refresh_token))
+    .bind(Utc::now() + Duration::days(REFRESH_TOKEN_DAYS))
+    .execute(&state.db)
+    .await?;
+    Ok(AuthResponse {
+        access_token: token_for(state, user.id)?,
+        refresh_token,
+        user,
+    })
+}
+async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<User>, ApiError> {
+    let id = user_from_headers(&state, &headers)?;
+    Ok(Json(sqlx::query_as("SELECT id,email,display_name,created_at FROM users WHERE id=$1 AND disabled_at IS NULL").bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::unauthorized)?))
+}
+
+async fn list_providers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Provider>>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    Ok(Json(sqlx::query_as("SELECT id,name,kind,base_url,default_model,created_at,updated_at FROM providers WHERE user_id=$1 ORDER BY name").bind(user_id).fetch_all(&state.db).await?))
+}
+async fn create_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<ProviderRequest>,
+) -> Result<Json<Provider>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    if !matches!(request.kind.as_str(), "openai_compatible" | "anthropic")
+        || !request.base_url.starts_with("https://")
+        || request.api_key.trim().is_empty()
+    {
+        return Err(ApiError::bad(
+            "Provider type, HTTPS base URL, and API key are required.",
+        ));
+    }
+    let (ciphertext, nonce) = encrypt(&state, request.api_key.trim())?;
+    let provider:Provider=sqlx::query_as("INSERT INTO providers (id,user_id,name,kind,base_url,encrypted_api_key,key_nonce,default_model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,kind,base_url,default_model,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.name.trim()).bind(request.kind).bind(request.base_url.trim_end_matches('/')).bind(ciphertext).bind(nonce).bind(request.default_model.trim()).fetch_one(&state.db).await?;
+    event(&state.db, user_id, "provider", provider.id, "created", 1).await?;
+    Ok(Json(provider))
+}
+async fn delete_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let result = sqlx::query("DELETE FROM providers WHERE id=$1 AND user_id=$2")
+        .bind(id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    };
+    event(&state.db, user_id, "provider", id, "deleted", 1).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_conversations(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(page): Query<PageQuery>,
+) -> Result<Json<Page<Conversation>>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let limit = page
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let cursor = page
+        .cursor
+        .as_deref()
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok());
+    let rows=sqlx::query_as::<_,Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at FROM conversations WHERE user_id=$1 AND archived_at IS NULL AND ($2::timestamptz IS NULL OR updated_at < $2) ORDER BY updated_at DESC,id DESC LIMIT $3").bind(user_id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
+    let next = rows.get(limit as usize).map(|c| c.updated_at.to_rfc3339());
+    Ok(Json(Page {
+        items: rows.into_iter().take(limit as usize).collect(),
+        next_cursor: next,
+    }))
+}
+async fn create_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateConversation>,
+) -> Result<Json<Conversation>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    if let Some(pid) = request.provider_id {
+        let exists: (bool,) =
+            sqlx::query_as("SELECT EXISTS(SELECT 1 FROM providers WHERE id=$1 AND user_id=$2)")
+                .bind(pid)
+                .bind(user_id)
+                .fetch_one(&state.db)
+                .await?;
+        if !exists.0 {
+            return Err(ApiError::bad(
+                "Selected provider does not belong to this account.",
+            ));
+        }
+    }
+    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(request.model).bind(request.context_window.unwrap_or(128000).clamp(4096,2_000_000)).fetch_one(&state.db).await?;
+    event(
+        &state.db,
+        user_id,
+        "conversation",
+        conversation.id,
+        "created",
+        conversation.revision,
+    )
+    .await?;
+    Ok(Json(conversation))
+}
+async fn get_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Conversation>, ApiError> {
+    Ok(Json(
+        own_conversation(&state.db, user_from_headers(&state, &headers)?, id).await?,
+    ))
+}
+async fn update_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpdateConversation>,
+) -> Result<Json<Conversation>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_conversation(&state.db, user_id, id).await?;
+    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).fetch_one(&state.db).await?;
+    event(
+        &state.db,
+        user_id,
+        "conversation",
+        id,
+        "updated",
+        c.revision,
+    )
+    .await?;
+    Ok(Json(c))
+}
+async fn delete_conversation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let r = sqlx::query("DELETE FROM conversations WHERE id=$1 AND user_id=$2")
+        .bind(id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    };
+    event(&state.db, user_id, "conversation", id, "deleted", 0).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn list_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Query(page): Query<PageQuery>,
+) -> Result<Json<Page<Message>>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_conversation(&state.db, user_id, id).await?;
+    let limit = page
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let cursor = page.cursor.as_deref().and_then(|s| s.parse::<i64>().ok());
+    let mut rows=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR sequence < $2) ORDER BY sequence DESC LIMIT $3").bind(id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
+    let next = rows.get(limit as usize).map(|m| m.sequence.to_string());
+    rows.truncate(limit as usize);
+    rows.reverse();
+    Ok(Json(Page {
+        items: rows,
+        next_cursor: next,
+    }))
+}
+async fn create_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CreateMessage>,
+) -> Result<Json<Message>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let c = own_conversation(&state.db, user_id, id).await?;
+    let content = request.content.trim();
+    if content.is_empty() || content.len() > 200_000 {
+        return Err(ApiError::bad(
+            "Message must contain 1 to 200,000 characters.",
+        ));
+    };
+    if let Some(existing)=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND client_mutation_id=$2").bind(id).bind(request.client_mutation_id).fetch_optional(&state.db).await? { return Ok(Json(existing)); }
+    let mut tx = state.db.begin().await?;
+    let sequence:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(estimate_tokens(content)).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence.0).bind(request.client_mutation_id).bind(content).bind(estimate_tokens(content)).bind(if request.search.unwrap_or(false){json!([])}else{json!([])}).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    event(
+        &state.db,
+        user_id,
+        "message",
+        m.id,
+        "created",
+        c.revision + 1,
+    )
+    .await?;
+    Ok(Json(m))
+}
+async fn update_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, message_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateMessage>,
+) -> Result<Json<Message>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_conversation(&state.db, user_id, id).await?;
+    let content = request.content.trim();
+    if content.is_empty() {
+        return Err(ApiError::bad("Message cannot be empty."));
+    }
+    let m:Message=sqlx::query_as("UPDATE messages SET content=$3,token_count=$4,edited_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(message_id).bind(id).bind(content).bind(estimate_tokens(content)).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    event(
+        &state.db, user_id, "message", message_id, "updated", m.sequence,
+    )
+    .await?;
+    Ok(Json(m))
+}
+async fn delete_message(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_conversation(&state.db, user_id, id).await?;
+    let r=sqlx::query("UPDATE messages SET deleted_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL").bind(message_id).bind(id).execute(&state.db).await?;
+    if r.rows_affected() == 0 {
+        return Err(ApiError::not_found());
+    };
+    event(&state.db, user_id, "message", message_id, "deleted", 0).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn respond(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<RespondRequest>,
+) -> Result<Json<Message>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let conversation = own_conversation(&state.db, user_id, id).await?;
+    let input:Message=sqlx::query_as("SELECT id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE id=$1 AND conversation_id=$2 AND role='user' AND deleted_at IS NULL").bind(request.message_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let provider_id = conversation
+        .model_provider_id
+        .ok_or_else(|| ApiError::bad("Choose a provider before requesting a response."))?;
+    let p:(String,String,String,Vec<u8>,Vec<u8>)=sqlx::query_as("SELECT kind,base_url,default_model,encrypted_api_key,key_nonce FROM providers WHERE id=$1 AND user_id=$2").bind(provider_id).bind(user_id).fetch_optional(&state.db).await?.ok_or_else(||ApiError::bad("The selected provider was removed."))?;
+    let prior_summary: Option<(String, i64)> = sqlx::query_as("SELECT content,ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1").bind(id).fetch_optional(&state.db).await?;
+    let messages:Vec<(String,String)>=sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' ORDER BY sequence DESC LIMIT 80").bind(id).bind(prior_summary.as_ref().map(|summary| summary.1).unwrap_or(0)).fetch_all(&state.db).await?;
+    let mut transcript: Vec<Value> = messages
+        .into_iter()
+        .rev()
+        .map(|(role, content)| json!({"role":role,"content":content}))
+        .collect();
+    let sources = if request.search.unwrap_or(false) {
+        fetch_search(&state, &input.content)
+            .await
+            .unwrap_or_default()
+    } else {
+        vec![]
+    };
+    if let Some((summary, _)) = prior_summary {
+        transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
+    }
+    if !sources.is_empty() {
+        transcript.insert(0,json!({"role":"system","content":format!("Use the following web sources when relevant and cite their titles with URLs. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
+    }
+    let api_key = decrypt(&state, &p.3, &p.4)?;
+    let model = conversation.model.clone().unwrap_or(p.2);
+    let answer = call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript).await?;
+    let tokens = estimate_tokens(&answer);
+    let mut tx = state.db.begin().await?;
+    let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(seq.0).bind(answer).bind(&model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
+    tx.commit().await?;
+    event(&state.db, user_id, "message", m.id, "created", seq.0).await?;
+    let _ = auto_compact(&state.db, id).await;
+    Ok(Json(m))
+}
+
+async fn auto_compact(pool: &PgPool, conversation_id: Uuid) -> Result<(), ApiError> {
+    let values: (i32, i32, i64) = sqlx::query_as(
+        "SELECT context_tokens,context_window,next_sequence FROM conversations WHERE id=$1",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await?;
+    if values.0 < (values.1 as f32 * 0.70) as i32 {
+        return Ok(());
+    }
+    let previous: Option<(String, i64)> = sqlx::query_as("SELECT content,ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1").bind(conversation_id).fetch_optional(pool).await?;
+    let existing_end = previous.as_ref().map(|summary| summary.1).unwrap_or(0);
+    let end = values.2 - 1;
+    if end <= existing_end {
+        return Ok(());
+    }
+    let rows: Vec<(String, String)> = sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence > $2 AND sequence <= $3 AND deleted_at IS NULL ORDER BY sequence").bind(conversation_id).bind(existing_end).bind(end).fetch_all(pool).await?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let compacted = rows
+        .iter()
+        .map(|(role, content)| format!("{role}: {content}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let content = format!(
+        "Conversation summary through message {end}:\n{}\n{}",
+        previous.map(|summary| summary.0).unwrap_or_default(),
+        compacted
+    )
+    .chars()
+    .take(30_000)
+    .collect::<String>();
+    sqlx::query("INSERT INTO conversation_summaries (id,conversation_id,starts_at_sequence,ends_at_sequence,content,token_count) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (conversation_id,starts_at_sequence,ends_at_sequence) DO UPDATE SET content=EXCLUDED.content,token_count=EXCLUDED.token_count").bind(Uuid::new_v4()).bind(conversation_id).bind(existing_end + 1).bind(end).bind(&content).bind(estimate_tokens(&content)).execute(pool).await?;
+    sqlx::query("UPDATE conversations SET context_tokens=$2 WHERE id=$1")
+        .bind(conversation_id)
+        .bind(estimate_tokens(&content))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+async fn compact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<CompactRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let c = own_conversation(&state.db, user_id, id).await?;
+    if !request.force.unwrap_or(false) && c.context_tokens < (c.context_window as f32 * 0.70) as i32
+    {
+        return Ok(Json(
+            json!({"compacted":false,"reason":"below_threshold","context_tokens":c.context_tokens,"context_window":c.context_window}),
+        ));
+    }
+    let last:(i64,)=sqlx::query_as("SELECT COALESCE(MAX(sequence),0) FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL").bind(id).fetch_one(&state.db).await?;
+    let end = request.through_sequence.unwrap_or(last.0);
+    let rows:Vec<(String,String)>=sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence <= $2 AND deleted_at IS NULL ORDER BY sequence").bind(id).bind(end).fetch_all(&state.db).await?;
+    if rows.is_empty() {
+        return Err(ApiError::bad("There are no messages to compact."));
+    }
+    let summary = rows
+        .iter()
+        .map(|(role, content)| format!("{role}: {content}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let concise = format!(
+        "Conversation summary through message {end}:\n{}",
+        summary.chars().take(30_000).collect::<String>()
+    );
+    let summary_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO conversation_summaries (id,conversation_id,starts_at_sequence,ends_at_sequence,content,token_count) VALUES ($1,$2,1,$3,$4,$5) ON CONFLICT (conversation_id,starts_at_sequence,ends_at_sequence) DO UPDATE SET content=EXCLUDED.content,token_count=EXCLUDED.token_count").bind(summary_id).bind(id).bind(end).bind(&concise).bind(estimate_tokens(&concise)).execute(&state.db).await?;
+    Ok(Json(
+        json!({"compacted":true,"summary_id":summary_id,"through_sequence":end,"estimated_tokens":estimate_tokens(&concise)}),
+    ))
+}
+async fn search(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Vec<Value>>, ApiError> {
+    user_from_headers(&state, &headers)?;
+    if query.q.trim().is_empty() {
+        return Err(ApiError::bad("Search query cannot be empty."));
+    };
+    Ok(Json(fetch_search(&state, &query.q).await?))
+}
+
+async fn dictionary_lookup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DictionaryQuery>,
+) -> Result<Json<DictionaryResponse>, ApiError> {
+    user_from_headers(&state, &headers)?;
+    let word = query.word.trim().to_string();
+    if word.is_empty() || word.chars().count() > 120 {
+        return Err(ApiError::bad(
+            "Select a word or short phrase of up to 120 characters.",
+        ));
+    }
+    let dictionary = query.dictionary;
+    if !matches!(
+        dictionary.as_str(),
+        "russian_en" | "german_en" | "english_zh"
+    ) {
+        return Err(ApiError::bad("Unsupported dictionary."));
+    }
+    let directory = (*state.dictionary_dir).clone();
+    let response =
+        tokio::task::spawn_blocking(move || lookup_dictionary(&directory, &dictionary, &word))
+            .await
+            .map_err(|_| ApiError::internal("Dictionary worker did not complete."))??;
+    Ok(Json(response))
+}
+
+fn lookup_dictionary(
+    directory: &std::path::Path,
+    dictionary: &str,
+    word: &str,
+) -> Result<DictionaryResponse, ApiError> {
+    if !directory.is_dir() {
+        return Err(ApiError::internal(
+            "Local dictionaries are not installed on this server.",
+        ));
+    }
+    let entries = match dictionary {
+        "russian_en" => lookup_russian_dictionary(directory, word)?,
+        "german_en" => lookup_german_dictionary(directory, word)?,
+        "english_zh" => lookup_english_chinese_dictionary(directory, word)?,
+        _ => unreachable!(),
+    };
+    Ok(DictionaryResponse {
+        word: word.to_string(),
+        dictionary: dictionary.to_string(),
+        entries,
+    })
+}
+
+fn normalize_dictionary_key(value: &str) -> String {
+    value
+        .trim()
+        .to_lowercase()
+        .chars()
+        .filter(|character| character.is_alphanumeric() || *character == 'ё')
+        .collect()
+}
+
+fn plain_text(value: &str) -> String {
+    let mut output = String::new();
+    let mut in_tag = false;
+    for character in value.chars() {
+        match character {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                output.push(' ');
+            }
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+    output
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn split_lines(value: &str) -> Vec<String> {
+    value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn lookup_russian_dictionary(
+    directory: &std::path::Path,
+    word: &str,
+) -> Result<Vec<DictionaryEntryResponse>, ApiError> {
+    let mut mdx = Mdx::new(directory.join("OpenRussian.mdx"))
+        .map_err(|_| ApiError::internal("Russian dictionary could not be opened."))?;
+    let key = normalize_dictionary_key(word);
+    let alternative = key.replace('ё', "е");
+    let mut entries = Vec::new();
+    let items = mdx
+        .keyword_list()
+        .iter()
+        .filter(|item| {
+            let candidate = normalize_dictionary_key(&item.key_text);
+            candidate == key || candidate == alternative
+        })
+        .take(12)
+        .cloned()
+        .collect::<Vec<_>>();
+    for item in &items {
+        if let Some(lookup) = mdx.fetch(item) {
+            let definition = plain_text(&lookup.definition);
+            entries.push(DictionaryEntryResponse {
+                headword: lookup.key_text.to_string(),
+                pronunciation: String::new(),
+                definitions: split_lines(&definition),
+                translations: Vec::new(),
+                forms: Vec::new(),
+                labels: vec!["OpenRussian".into()],
+                examples: Vec::new(),
+                detail: Value::Null,
+            });
+        }
+    }
+    Ok(entries)
+}
+
+fn german_database_path(directory: &std::path::Path) -> Result<PathBuf, ApiError> {
+    let source = directory.join("german_en.sqlite.gz");
+    let target = std::env::temp_dir().join("malim_chat_german_en.sqlite");
+    if !target.exists() {
+        let source_file = std::fs::File::open(source)
+            .map_err(|_| ApiError::internal("German dictionary is not installed."))?;
+        let mut decoder = GzDecoder::new(source_file);
+        let mut output = std::fs::File::create(&target)
+            .map_err(|_| ApiError::internal("German dictionary cache could not be created."))?;
+        std::io::copy(&mut decoder, &mut output)
+            .map_err(|_| ApiError::internal("German dictionary could not be unpacked."))?;
+    }
+    Ok(target)
+}
+
+fn lookup_german_dictionary(
+    directory: &std::path::Path,
+    word: &str,
+) -> Result<Vec<DictionaryEntryResponse>, ApiError> {
+    let connection = Connection::open(german_database_path(directory)?)
+        .map_err(|_| ApiError::internal("German dictionary could not be opened."))?;
+    let key = normalize_dictionary_key(word).replace('ß', "ss");
+    let mut statement = connection.prepare("SELECT e.headword,e.lemma,e.forms_json,e.definition_html FROM german_lookup l JOIN german_entries e ON e.id=l.entry_id WHERE l.form_key=?1 LIMIT 12")
+        .map_err(|_| ApiError::internal("German dictionary schema is invalid."))?;
+    let rows = statement
+        .query_map([key.clone()], |row| {
+            let forms: String = row.get(2)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                forms,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|_| ApiError::internal("German dictionary query failed."))?;
+    let mut entries = rows
+        .filter_map(Result::ok)
+        .map(
+            |(headword, lemma, forms, definition)| DictionaryEntryResponse {
+                headword,
+                pronunciation: String::new(),
+                definitions: split_lines(&plain_text(&definition)),
+                translations: Vec::new(),
+                forms: serde_json::from_str::<Vec<String>>(&forms).unwrap_or_else(|_| vec![lemma]),
+                labels: vec!["Kaikki German".into()],
+                examples: Vec::new(),
+                detail: Value::Null,
+            },
+        )
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        let mut fallback = connection.prepare("SELECT headword,lemma,forms_json,definition_html FROM german_entries WHERE headword_key LIKE ?1 LIMIT 12").map_err(|_| ApiError::internal("German dictionary query failed."))?;
+        let rows = fallback
+            .query_map([format!("{key}%")], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|_| ApiError::internal("German dictionary query failed."))?;
+        entries = rows
+            .filter_map(Result::ok)
+            .map(
+                |(headword, lemma, forms, definition)| DictionaryEntryResponse {
+                    headword,
+                    pronunciation: String::new(),
+                    definitions: split_lines(&plain_text(&definition)),
+                    translations: Vec::new(),
+                    forms: serde_json::from_str(&forms).unwrap_or_else(|_| vec![lemma]),
+                    labels: vec!["Kaikki German".into()],
+                    examples: Vec::new(),
+                    detail: Value::Null,
+                },
+            )
+            .collect();
+    }
+    Ok(entries)
+}
+
+fn lookup_english_chinese_dictionary(
+    directory: &std::path::Path,
+    word: &str,
+) -> Result<Vec<DictionaryEntryResponse>, ApiError> {
+    let connection = Connection::open(directory.join("ecdict_en_zh.sqlite"))
+        .map_err(|_| ApiError::internal("English-Chinese dictionary could not be opened."))?;
+    let normalized = word.trim().to_lowercase();
+    let mut statement = connection.prepare("SELECT word,phonetic,definition,translation,pos,collins,oxford,tags,bnc,frequency,exchange,detail FROM entries WHERE word = ?1 COLLATE NOCASE UNION ALL SELECT word,phonetic,definition,translation,pos,collins,oxford,tags,bnc,frequency,exchange,detail FROM entries WHERE word LIKE ?2 COLLATE NOCASE LIMIT 12")
+        .map_err(|_| ApiError::internal("English-Chinese dictionary schema is invalid."))?;
+    let rows = statement
+        .query_map(params![normalized, format!("{normalized}%")], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i32>(5)?,
+                row.get::<_, i32>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, i32>(8)?,
+                row.get::<_, i32>(9)?,
+                row.get::<_, String>(10)?,
+                row.get::<_, String>(11)?,
+            ))
+        })
+        .map_err(|_| ApiError::internal("English-Chinese dictionary query failed."))?;
+    Ok(rows
+        .filter_map(Result::ok)
+        .map(
+            |(
+                headword,
+                pronunciation,
+                definition,
+                translation,
+                pos,
+                collins,
+                oxford,
+                tags,
+                bnc,
+                frequency,
+                exchange,
+                detail,
+            )| {
+                let mut labels = split_lines(&tags);
+                if !pos.is_empty() {
+                    labels.push(format!("POS: {pos}"));
+                }
+                if collins > 0 {
+                    labels.push(format!("Collins {collins}"));
+                }
+                if oxford > 0 {
+                    labels.push("Oxford 3000".into());
+                }
+                if bnc > 0 {
+                    labels.push(format!("BNC #{bnc}"));
+                }
+                if frequency > 0 {
+                    labels.push(format!("Modern frequency #{frequency}"));
+                }
+                let forms = exchange
+                    .split('/')
+                    .filter_map(|item| item.split_once(':'))
+                    .map(|(kind, value)| {
+                        format!(
+                            "{}: {}",
+                            match kind {
+                                "p" => "past",
+                                "d" => "past participle",
+                                "i" => "present participle",
+                                "3" => "third-person singular",
+                                "r" => "comparative",
+                                "t" => "superlative",
+                                "s" => "plural",
+                                "0" => "lemma",
+                                _ => kind,
+                            },
+                            value
+                        )
+                    })
+                    .collect();
+                let detail_value = serde_json::from_str(&detail).unwrap_or_else(|_| {
+                    if detail.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(detail)
+                    }
+                });
+                DictionaryEntryResponse {
+                    headword,
+                    pronunciation,
+                    definitions: split_lines(&definition),
+                    translations: split_lines(&translation),
+                    forms,
+                    labels,
+                    examples: Vec::new(),
+                    detail: detail_value,
+                }
+            },
+        )
+        .collect())
+}
+
+async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiError> {
+    let base = state
+        .searxng_url
+        .as_deref()
+        .ok_or_else(|| ApiError::bad("Online search is not configured."))?;
+    let response: Value = state
+        .http
+        .get(format!("{}/search", base.trim_end_matches('/')))
+        .query(&[("q", query), ("format", "json"), ("language", "zh-CN")])
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(response.get("results").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().take(8).map(|v|json!({"title":v.get("title").cloned().unwrap_or(Value::Null),"url":v.get("url").cloned().unwrap_or(Value::Null),"content":v.get("content").cloned().unwrap_or(Value::Null),"engine":v.get("engine").cloned().unwrap_or(Value::Null)})).collect())
+}
+async fn sync(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SyncQuery>,
+) -> Result<Json<Page<SyncEvent>>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .clamp(1, MAX_PAGE_SIZE);
+    let rows=sqlx::query_as::<_,SyncEvent>("SELECT cursor,entity_type,entity_id,operation,revision,occurred_at FROM sync_events WHERE user_id=$1 AND cursor > $2 ORDER BY cursor LIMIT $3").bind(user_id).bind(query.cursor.unwrap_or(0)).bind(limit+1).fetch_all(&state.db).await?;
+    let next = rows.get(limit as usize).map(|e| e.cursor.to_string());
+    Ok(Json(Page {
+        items: rows.into_iter().take(limit as usize).collect(),
+        next_cursor: next,
+    }))
+}
+async fn call_provider(
+    http: &Client,
+    kind: &str,
+    base: &str,
+    key: &str,
+    model: &str,
+    messages: &[Value],
+) -> Result<String, ApiError> {
+    let url = match kind {
+        "anthropic" => format!("{}/v1/messages", base.trim_end_matches('/')),
+        _ => format!("{}/v1/chat/completions", base.trim_end_matches('/')),
+    };
+    let response = if kind == "anthropic" {
+        http.post(url).header("x-api-key",key).header("anthropic-version","2023-06-01").json(&json!({"model":model,"max_tokens":4096,"messages":messages.iter().filter(|m|m["role"]!="system").collect::<Vec<_>>() })).send().await?
+    } else {
+        http.post(url)
+            .bearer_auth(key)
+            .json(&json!({"model":model,"messages":messages,"stream":false}))
+            .send()
+            .await?
+    };
+    let body: Value = response.error_for_status()?.json().await?;
+    let answer = if kind == "anthropic" {
+        body["content"][0]["text"].as_str()
+    } else {
+        body["choices"][0]["message"]["content"].as_str()
+    }
+    .ok_or_else(|| ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        code: "invalid_provider_response",
+        message: "The AI provider returned an unexpected response.".into(),
+    })?;
+    Ok(answer.to_string())
+}
