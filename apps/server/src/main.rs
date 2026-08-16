@@ -49,6 +49,7 @@ struct AppState {
     searxng_url: Option<String>,
     dictionary_dir: Arc<PathBuf>,
     russian_dictionary: Arc<Mutex<Mdx>>,
+    allow_signup: bool,
 }
 
 struct Config {
@@ -59,6 +60,7 @@ struct Config {
     searxng_url: Option<String>,
     cors_origins: Vec<HeaderValue>,
     dictionary_dir: PathBuf,
+    allow_signup: bool,
 }
 
 impl Config {
@@ -96,6 +98,9 @@ impl Config {
             dictionary_dir: env::var("MALIM_DICTIONARY_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|_| PathBuf::from("apps/server/dictionaries")),
+            allow_signup: env::var("MALIM_ALLOW_SIGNUP")
+                .map(|value| !matches!(value.trim().to_lowercase().as_str(), "0" | "false" | "no"))
+                .unwrap_or(true),
         })
     }
 }
@@ -126,6 +131,13 @@ impl ApiError {
             status: StatusCode::NOT_FOUND,
             code: "not_found",
             message: "The requested resource was not found.".into(),
+        }
+    }
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "forbidden",
+            message: message.into(),
         }
     }
     fn internal(message: impl Into<String>) -> Self {
@@ -529,6 +541,7 @@ async fn main() -> anyhow::Result<()> {
         searxng_url: config.searxng_url,
         dictionary_dir: Arc::new(config.dictionary_dir),
         russian_dictionary: Arc::new(Mutex::new(russian_dictionary)),
+        allow_signup: config.allow_signup,
     };
     let cors = CorsLayer::new()
         .allow_origin(config.cors_origins)
@@ -589,6 +602,11 @@ async fn signup(
     State(state): State<AppState>,
     Json(request): Json<SignupRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    if !state.allow_signup {
+        return Err(ApiError::forbidden(
+            "New user registration is temporarily disabled.",
+        ));
+    }
     let email = request.email.trim().to_lowercase();
     if !email.contains('@') || request.password.len() < 12 {
         return Err(ApiError::bad(
