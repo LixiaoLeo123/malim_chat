@@ -307,6 +307,7 @@ struct UpdateConversation {
     archived: Option<bool>,
     provider_id: Option<Uuid>,
     model: Option<String>,
+    context_window: Option<i32>,
 }
 #[derive(Deserialize)]
 struct ProviderRequest {
@@ -342,6 +343,8 @@ struct UpdateMessage {
 struct RespondRequest {
     message_id: Uuid,
     search: Option<bool>,
+    temperature: Option<f32>,
+    reasoning_effort: Option<String>,
 }
 #[derive(Deserialize)]
 struct CompactRequest {
@@ -827,7 +830,7 @@ async fn update_conversation(
         own_provider(&state.db, user_id, provider_id).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
         if !configured_model(&state.db, provider_id, model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
     }
-    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).fetch_one(&state.db).await?;
+    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -963,20 +966,27 @@ async fn respond(
         .rev()
         .map(|(role, content)| json!({"role":role,"content":content}))
         .collect();
+    let api_key = decrypt(&state, &p.3, &p.4)?;
+    let model = conversation.model.clone().unwrap_or_else(|| p.2.clone());
     let sources = if request.search.unwrap_or(false) {
-        fetch_search(&state, &input.content).await?
-    } else {
-        vec![]
-    };
+        let queries = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content, &transcript).await
+            .unwrap_or_else(|_| vec![focused_search_query(&input.content)]);
+        let mut merged = Vec::new();
+        for query in queries.into_iter().take(4) {
+            for result in fetch_search(&state, &query).await.unwrap_or_default() {
+                if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); }
+            }
+        }
+        merged.truncate(8);
+        merged
+    } else { vec![] };
     if let Some((summary, _)) = prior_summary {
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
     }
     if !sources.is_empty() {
         transcript.insert(0,json!({"role":"system","content":format!("Web search is enabled. Answer the latest user question using only relevant sources below. Cite supporting claims with their source URLs. Do not claim that web sources are unavailable when they are listed. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
     }
-    let api_key = decrypt(&state, &p.3, &p.4)?;
-    let model = conversation.model.clone().unwrap_or(p.2);
-    let answer = call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript).await?;
+    let answer = call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
     let tokens = estimate_tokens(&answer);
     let mut tx = state.db.begin().await?;
     let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
@@ -1392,6 +1402,28 @@ fn lookup_english_chinese_dictionary(
         .collect())
 }
 
+async fn generate_search_queries(
+    http: &Client,
+    kind: &str,
+    base: &str,
+    key: &str,
+    model: &str,
+    question: &str,
+    context: &[Value],
+) -> Result<Vec<String>, ApiError> {
+    let mut messages = vec![json!({"role":"system","content":"You are a search query planner. Return ONLY a JSON array of up to four concise web search queries. Preserve names, versions, dates, and technical terms. Do not answer the question."})];
+    messages.extend(context.iter().rev().take(8).cloned());
+    messages.push(json!({"role":"user","content":question}));
+    let raw = call_provider(http, kind, base, key, model, &messages, Some(0.0), None).await?;
+    let candidate = raw.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
+    let parsed: Value = serde_json::from_str(candidate).or_else(|_| {
+        let start = candidate.find('[').ok_or(())?;
+        let end = candidate.rfind(']').ok_or(())?;
+        serde_json::from_str(&candidate[start..=end]).map_err(|_| ())
+    }).map_err(|_| ApiError::bad("The provider returned invalid search queries."))?;
+    Ok(parsed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|q| !q.is_empty()).take(4).map(ToOwned::to_owned).collect())
+}
+
 async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiError> {
     let base = state
         .searxng_url
@@ -1451,19 +1483,22 @@ async fn call_provider(
     key: &str,
     model: &str,
     messages: &[Value],
+    temperature: Option<f32>,
+    reasoning_effort: Option<&str>,
 ) -> Result<String, ApiError> {
     let url = match kind {
         "anthropic" => format!("{}/v1/messages", base.trim_end_matches('/')),
         _ => format!("{}/v1/chat/completions", base.trim_end_matches('/')),
     };
     let response = if kind == "anthropic" {
-        http.post(url).header("x-api-key",key).header("anthropic-version","2023-06-01").json(&json!({"model":model,"max_tokens":4096,"messages":messages.iter().filter(|m|m["role"]!="system").collect::<Vec<_>>() })).send().await?
+        let mut body = json!({"model":model,"max_tokens":4096,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
+        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
+        http.post(url).header("x-api-key",key).header("anthropic-version","2023-06-01").json(&body).send().await?
     } else {
-        http.post(url)
-            .bearer_auth(key)
-            .json(&json!({"model":model,"messages":messages,"stream":false}))
-            .send()
-            .await?
+        let mut body = json!({"model":model,"messages":messages,"stream":false});
+        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
+        if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
+        http.post(url).bearer_auth(key).json(&body).send().await?
     };
     let body: Value = response.error_for_status()?.json().await?;
     let answer = if kind == "anthropic" {
