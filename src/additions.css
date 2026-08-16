@@ -1,0 +1,41 @@
+/* Markdown stays opt-in and supports GFM tables, code blocks, and highlights. */
+.plain-content { white-space: pre-wrap; }
+.markdown-content { white-space: normal; }
+.markdown-content > :first-child { margin-top: 0; }
+.markdown-content > :last-child { margin-bottom: 0; }
+.markdown-content h1, .markdown-content h2, .markdown-content h3 { line-height: 1.3; margin: 1.1em 0 .5em; }
+.markdown-content h1 { font-size: 1.35em; }
+.markdown-content h2 { font-size: 1.2em; }
+.markdown-content h3 { font-size: 1.05em; }
+.markdown-content p, .markdown-content ul, .markdown-content ol, .markdown-content pre, .markdown-content blockquote, .markdown-content table { margin: 0 0 .85em; }
+.markdown-content ul, .markdown-content ol { padding-left: 1.5em; }
+.markdown-content blockquote { border-left: 3px solid #a9d5cd; color: #59666d; margin-left: 0; padding-left: 12px; }
+.markdown-content pre { overflow: auto; border: 1px solid #dce5e2; border-radius: 6px; background: #f6f8f8; padding: 12px; font-size: 12px; line-height: 1.55; }
+.markdown-content :not(pre) > code { border-radius: 4px; background: #edf3f2; padding: 2px 4px; font-size: .9em; }
+.markdown-content table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.markdown-content th, .markdown-content td { border: 1px solid #dfe7e4; padding: 7px 9px; text-align: left; }
+.markdown-content th { background: #f2f7f5; }
+.markdown-content a { color: #0f766e; }
+.markdown-toggle { display: flex !important; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid #e7ecea; padding-top: 9px; }
+.markdown-toggle input { appearance: none; width: 32px; height: 18px; border: 0; border-radius: 999px; background: #cdd7d4; padding: 0; position: relative; cursor: pointer; }
+.markdown-toggle input::after { content: ""; position: absolute; width: 14px; height: 14px; top: 2px; left: 2px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.2); transition: transform .16s ease; }
+.markdown-toggle input:checked { background: #0f766e; }
+.markdown-toggle input:checked::after { transform: translateX(14px); }
+
+/* Position is computed after measurement, so a dictionary result cannot escape the viewport. */
+.dictionary-popover, .dictionary-popover.up { transform: none !important; }
+.dictionary-popover.up { animation: menu-enter .16s ease-out; }
+.dictionary-popover .malim-entry { padding: 12px 0; color: #374151; line-height: 1.6; }
+.dictionary-popover .malim-entry h1 { font-size: 22px; line-height: 1.25; margin: 0 0 7px; color: #173c38; }
+.dictionary-popover .malim-entry h2 { font-size: 14px; margin: 15px 0 7px; color: #49605c; }
+.dictionary-popover .malim-entry h3 { font-size: 12px; text-transform: uppercase; margin: 13px 0 6px; color: #718078; }
+.dictionary-popover .malim-entry .pos { display: inline-flex; border-radius: 999px; background: #e9f5f2; color: #0f766e; padding: 2px 7px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
+.dictionary-popover .malim-entry .meaning, .dictionary-popover .malim-entry .sense { border-left: 2px solid #d5e9e5; padding: 7px 0 7px 10px; margin: 7px 0; }
+.dictionary-popover .malim-entry .meaning p, .dictionary-popover .malim-entry .sense p { margin: 0; }
+.dictionary-popover .malim-entry ul, .dictionary-popover .malim-entry ol { padding-left: 19px; margin: 7px 0; display: grid; gap: 5px; }
+.dictionary-popover .malim-entry table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
+.dictionary-popover .malim-entry th, .dictionary-popover .malim-entry td { border: 1px solid #dfe7e4; padding: 5px 7px; text-align: left; }
+.dictionary-popover .malim-entry th { background: #f2f7f5; }
+.dictionary-popover .malim-entry .example, .dictionary-popover .malim-entry .sentence { border-radius: 5px; background: #f6faf9; padding: 8px; margin: 7px 0; }
+.dictionary-popover .malim-entry a { color: #0f766e; text-decoration: none; }
+.dictionary-popover .malim-entry hr { border: 0; border-top: 1px solid #e4e9e7; margin: 13px 0; }

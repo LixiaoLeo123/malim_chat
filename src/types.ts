@@ -8,5 +8,5 @@ export interface Message { id: string; conversation_id: string; sequence: number
 export interface SearchResult { title: string; url: string; content: string; engine: string }
 export interface Page<T> { items: T[]; next_cursor: string | null }
 export interface Session { access_token: string; refresh_token: string; user: User }
-export interface DictionaryEntry { headword: string; pronunciation: string; definitions: string[]; translations: string[]; forms: string[]; labels: string[]; examples: string[]; detail: unknown }
+export interface DictionaryEntry { headword: string; lemma: string; pronunciation: string; definitions: string[]; translations: string[]; forms: string[]; labels: string[]; examples: string[]; detail: unknown; definition_html: string; matched_terms: string[] }
 export interface DictionaryResponse { word: string; dictionary: "russian_en" | "german_en" | "english_zh"; entries: DictionaryEntry[] }

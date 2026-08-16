@@ -346,6 +346,7 @@ struct RespondRequest {
     search: Option<bool>,
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
+    enable_markdown: Option<bool>,
 }
 #[derive(Deserialize)]
 struct CompactRequest {
@@ -378,6 +379,7 @@ struct DictionaryQuery {
 #[derive(Serialize)]
 struct DictionaryEntryResponse {
     headword: String,
+    lemma: String,
     pronunciation: String,
     definitions: Vec<String>,
     translations: Vec<String>,
@@ -385,6 +387,8 @@ struct DictionaryEntryResponse {
     labels: Vec<String>,
     examples: Vec<String>,
     detail: Value,
+    definition_html: String,
+    matched_terms: Vec<String>,
 }
 #[derive(Serialize)]
 struct DictionaryResponse {
@@ -975,12 +979,21 @@ async fn respond(
         .collect();
     let api_key = decrypt(&state, &p.3, &p.4)?;
     let model = conversation.model.clone().unwrap_or_else(|| p.2.clone());
-    let sources = if request.search.unwrap_or(false) {
-        let queries = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await
-            .unwrap_or_else(|_| vec![focused_search_query(&input.content)]);
+    let sources = if request.search.unwrap_or(false) && should_search_web(&input.content) {
+        // The user's question is always searched first. Planner output only broadens it;
+        // it must never replace the subject of the question with a weak keyword.
+        let fallback = focused_search_query(&input.content);
+        let mut queries = vec![fallback.clone()];
+        if let Ok(planned) = generate_search_queries(&state.http, &p.0, &p.1, &api_key, &model, &input.content).await {
+            for query in planned {
+                if !queries.iter().any(|existing| existing.eq_ignore_ascii_case(&query)) {
+                    queries.push(query);
+                }
+            }
+        }
         let mut merged = Vec::new();
         for query in queries.into_iter().take(4) {
-            for mut result in fetch_search(&state, &query).await.unwrap_or_default() {
+            for mut result in fetch_search(&state, &query, &input.content).await.unwrap_or_default() {
                 result["query"] = json!(query);
                 if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); }
             }
@@ -994,11 +1007,13 @@ async fn respond(
     if !sources.is_empty() {
         transcript.insert(0,json!({"role":"system","content":format!("Web search is enabled. Answer the latest user question using only relevant sources below. Cite supporting claims with their source URLs. Do not claim that web sources are unavailable when they are listed. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
     }
+    let enable_markdown = request.enable_markdown.unwrap_or(true);
+    transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
     let answer = call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
     let tokens = estimate_tokens(&answer);
     let mut tx = state.db.begin().await?;
     let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
-    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(seq.0).bind(answer).bind(&model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(seq.0).bind(answer).bind(if enable_markdown { "markdown" } else { "plain" }).bind(&model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     event(&state.db, user_id, "message", m.id, "created", seq.0).await?;
     let _ = auto_compact(&state.db, id).await;
@@ -1090,7 +1105,7 @@ async fn search(
     if query.q.trim().is_empty() {
         return Err(ApiError::bad("Search query cannot be empty."));
     };
-    Ok(Json(fetch_search(&state, &query.q).await?))
+    Ok(Json(fetch_search(&state, &query.q, &query.q).await?))
 }
 
 async fn dictionary_lookup(
@@ -1155,47 +1170,6 @@ fn normalize_dictionary_key(value: &str) -> String {
         .collect()
 }
 
-fn plain_text(value: &str) -> String {
-    let mut output = String::new();
-    let mut in_tag = false;
-    for character in value.chars() {
-        match character {
-            '<' => in_tag = true,
-            '>' => {
-                in_tag = false;
-                output.push(' ');
-            }
-            _ if !in_tag => output.push(character),
-            _ => {}
-        }
-    }
-    output
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn structured_plain_text(value: &str) -> String {
-    let with_breaks = value
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n")
-        .replace("</div>", "\n")
-        .replace("</p>", "\n")
-        .replace("</li>", "\n")
-        .replace("<li>", "• ");
-    with_breaks
-        .lines()
-        .map(plain_text)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 fn split_lines(value: &str) -> Vec<String> {
     value
         .lines()
@@ -1255,14 +1229,17 @@ fn russian_response(headword: String, definition: &str, linked_from: Option<&str
     let mut labels = vec!["OpenRussian".into()];
     if let Some(source) = linked_from { labels.push(format!("Lemma for {source}")); }
     Some(DictionaryEntryResponse {
+        lemma: headword.clone(),
+        matched_terms: linked_from.into_iter().map(str::to_string).collect(),
         headword,
         pronunciation: String::new(),
-        definitions: split_lines(&structured_plain_text(definition)),
+        definitions: Vec::new(),
         translations: Vec::new(),
         forms: Vec::new(),
         labels,
         examples: Vec::new(),
         detail: Value::Null,
+        definition_html: definition.to_string(),
     })
 }
 
@@ -1316,14 +1293,17 @@ fn lookup_german_dictionary(
         .filter_map(Result::ok)
         .map(
             |(headword, lemma, forms, definition)| DictionaryEntryResponse {
+                lemma: lemma.clone(),
+                matched_terms: vec![word.to_string()],
                 headword,
                 pronunciation: String::new(),
-                definitions: split_lines(&structured_plain_text(&definition)),
+                definitions: Vec::new(),
                 translations: Vec::new(),
                 forms: serde_json::from_str::<Vec<String>>(&forms).unwrap_or_else(|_| vec![lemma]),
                 labels: vec!["Kaikki German".into()],
                 examples: Vec::new(),
                 detail: Value::Null,
+                definition_html: definition,
             },
         )
         .collect::<Vec<_>>();
@@ -1343,14 +1323,17 @@ fn lookup_german_dictionary(
             .filter_map(Result::ok)
             .map(
                 |(headword, lemma, forms, definition)| DictionaryEntryResponse {
+                    lemma: lemma.clone(),
+                    matched_terms: vec![word.to_string()],
                     headword,
                     pronunciation: String::new(),
-                    definitions: split_lines(&structured_plain_text(&definition)),
+                    definitions: Vec::new(),
                     translations: Vec::new(),
                     forms: serde_json::from_str(&forms).unwrap_or_else(|_| vec![lemma]),
                     labels: vec!["Kaikki German".into()],
                     examples: Vec::new(),
                     detail: Value::Null,
+                    definition_html: definition,
                 },
             )
             .collect();
@@ -1447,6 +1430,8 @@ fn lookup_english_chinese_dictionary(
                     }
                 });
                 DictionaryEntryResponse {
+                    lemma: headword.clone(),
+                    matched_terms: vec![word.to_string()],
                     headword,
                     pronunciation,
                     definitions: split_lines(&definition),
@@ -1455,6 +1440,7 @@ fn lookup_english_chinese_dictionary(
                     labels,
                     examples: Vec::new(),
                     detail: detail_value,
+                    definition_html: String::new(),
                 }
             },
         )
@@ -1502,7 +1488,16 @@ fn is_valid_search_query(query: &str, question_terms: &[String]) -> bool {
     question_terms.is_empty() || question_terms.iter().any(|term| lower.contains(term))
 }
 
-async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiError> {
+fn should_search_web(question: &str) -> bool {
+    let normalized = question.trim().to_lowercase();
+    !normalized.is_empty()
+        && !matches!(normalized.as_str(), "use web search" | "search the web" | "online search" | "使用网络搜索" | "使用网络")
+        && !normalized.starts_with("answer in ")
+        && !normalized.starts_with("reply in ")
+        && !normalized.starts_with("respond in ")
+}
+
+async fn fetch_search(state: &AppState, query: &str, question: &str) -> Result<Vec<Value>, ApiError> {
     let base = state
         .searxng_url
         .as_deref()
@@ -1522,7 +1517,7 @@ async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiEr
         .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
         .map(|v| json!({"title":v["title"],"url":v["url"],"content":v["content"],"engine":v["engine"]}))
         .collect::<Vec<_>>();
-    let terms = search_terms(&search_query);
+    let terms = search_terms(question);
     results.retain(|result| terms.is_empty() || terms.iter().any(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term)));
     results.sort_by_key(|result| std::cmp::Reverse(terms.iter().filter(|term| format!("{} {}", result["title"], result["content"]).to_lowercase().contains(term.as_str())).count()));
     results.truncate(8);
@@ -1570,7 +1565,11 @@ async fn call_provider(
         _ => format!("{}/v1/chat/completions", base.trim_end_matches('/')),
     };
     let response = if kind == "anthropic" {
+        // Anthropic uses a top-level system field. Dropping it made the search planner
+        // and the final search-grounding instructions ineffective for Claude providers.
+        let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
         let mut body = json!({"model":model,"max_tokens":4096,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
+        if !system.is_empty() { body["system"] = json!(system); }
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         http.post(url).header("x-api-key",key).header("anthropic-version","2023-06-01").json(&body).send().await?
     } else {
