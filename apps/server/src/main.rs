@@ -1029,7 +1029,7 @@ async fn respond(
     let (sources, planner_returned_no_queries) = if search_requested && should_search_web(&input.content) {
         // Search is deliberately a two-call workflow: plan queries, collect sources,
         // then make the answering call below with those sources as context.
-        let queries = generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &input.content).await?;
+        let queries = generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &transcript, &input.content).await?;
         info!(conversation_id=%id, planned_queries=queries.len(), "search planner completed");
         let planner_returned_no_queries = queries.is_empty();
         let mut merged = Vec::new();
@@ -1530,11 +1530,29 @@ async fn generate_search_queries(
     base: &str,
     key: &str,
     model: &str,
+    history: &[Value],
     question: &str,
 ) -> Result<Vec<String>, ApiError> {
+    let mut lines: Vec<String> = history
+        .iter()
+        .rev()
+        .take(20)
+        .rev()
+        .filter_map(|m| {
+            let role = m["role"].as_str()?;
+            let content = m["content"].as_str()?;
+            Some(format!("{role}: {}", content.chars().take(800).collect::<String>()))
+        })
+        .collect();
+    let question_last = history
+        .last()
+        .is_some_and(|m| m["role"].as_str() == Some("user") && m["content"].as_str() == Some(question));
+    if !question_last {
+        lines.push(format!("user: {question}"));
+    }
     let messages = vec![
-        json!({"role":"system","content":"You plan web searches. Return ONLY a JSON array containing zero to four search-engine queries. Return [] only when an external lookup is not useful. Otherwise, each query must contain a specific named entity or key phrase from the question; include dates or versions when relevant. Do not answer the question."}),
-        json!({"role":"user","content":format!("Question: {question}")}),
+        json!({"role":"system","content":"You plan web searches for the LATEST user message in a conversation. Use the earlier conversation history for context when choosing queries. Return ONLY a JSON array containing zero to four search-engine queries. Return [] only when an external lookup is not useful. Otherwise, each query must contain a specific named entity or key phrase from the latest question; include dates or versions when relevant. Do not answer the question."}),
+        json!({"role":"user","content":format!("Conversation history (most recent message last):\n{}", lines.join("\n"))}),
     ];
     let raw = call_provider(http, kind, base, key, model, &messages, Some(0.0), None).await?;
     let candidate = raw.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
