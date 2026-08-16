@@ -9,9 +9,10 @@ import "highlight.js/styles/github.css";
 import "./additions.css";
 import { api, setSession, subscribeSession } from "./api";
 import { useAppStore } from "./store";
-import type { Conversation, DictionaryResponse, Message, Provider, ProviderModel, Session } from "./types";
+import type { Conversation, DictionaryResponse, GenerationSettings, Message, Provider, ProviderModel, Session } from "./types";
 
 const now = () => new Date().toISOString();
+const defaultGeneration: GenerationSettings = { temperature: 0.7, reasoning_effort: "medium", enable_markdown: true, stream: false };
 function uuid() {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
   const bytes = crypto.getRandomValues(new Uint8Array(16));
@@ -69,7 +70,8 @@ function Chat() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [modelChanging, setModelChanging] = useState(false);
-  const [generation, setGeneration] = useState({ temperature: 0.7, reasoning_effort: "medium", enable_markdown: true, stream: false });
+  const [generation, setGeneration] = useState<GenerationSettings>(defaultGeneration);
+  const generationTimers = useRef<Record<string, number>>({});
   const [theme, setTheme] = useState<"light" | "dark">(() => localStorage.getItem("malim-theme") === "dark" ? "dark" : "light");
   const [compacting, setCompacting] = useState(false);
   const activeConversation = activeId ? conversations.find((item) => item.id === activeId) ?? null : null;
@@ -77,6 +79,8 @@ function Chat() {
   useEffect(() => { void bootstrap(); }, []);
   useEffect(() => { if (activeId && !messages[activeId]) void loadMessages(activeId); }, [activeId]);
   useEffect(() => { localStorage.setItem("malim-theme", theme); }, [theme]);
+  useEffect(() => { if (activeConversation) setGeneration(activeConversation.generation_settings ?? defaultGeneration); }, [activeConversation?.id]);
+  useEffect(() => () => { Object.values(generationTimers.current).forEach((timer) => window.clearTimeout(timer)); }, []);
 
   async function bootstrap() {
     try {
@@ -118,6 +122,14 @@ function Chat() {
     finally { setModelChanging(false); }
   }
   function signOut() { setSession(null); }
+  function changeGeneration(next: GenerationSettings) {
+    if (!activeConversation) return;
+    const conversationId = activeConversation.id;
+    setGeneration(next);
+    state.setConversations(useAppStore.getState().conversations.map((conversation) => conversation.id === conversationId ? { ...conversation, generation_settings: next } : conversation));
+    window.clearTimeout(generationTimers.current[conversationId]);
+    generationTimers.current[conversationId] = window.setTimeout(() => { void api.updateConversation(conversationId, { generation_settings: next }).catch((cause) => state.setError(cause instanceof Error ? cause.message : "Unable to save conversation parameters.")); }, 350);
+  }
   async function sendMessage(conversationId: string, content: string, search: boolean, options = generation) {
     const mutationId = uuid();
     const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, reasoning_content: "", content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
@@ -175,7 +187,7 @@ function Chat() {
   }
 
   async function compactConversation() { if (!activeId || compacting) return; setCompacting(true); try { const result = await api.compact(activeId); state.upsertMessage(activeId, result.message); state.setConversations((await api.conversations()).items); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Compaction failed."); } finally { setCompacting(false); } }
-  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={state.setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); state.setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} onSettings={() => setProviderOpen(true)} onClose={() => state.setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={state.session?.user.display_name ?? "Account"} onSignOut={signOut} /><section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => state.setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}<button className="icon-button theme-toggle" type="button" onClick={() => setTheme(theme === "light" ? "dark" : "light")} title={theme === "light" ? "Use dark mode" : "Use light mode"}>{theme === "light" ? <Moon size={17} /> : <Sun size={17} />}</button></header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => state.setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={setGeneration} onSend={(content) => activeId ? sendMessage(activeId, content, searchEnabled) : Promise.resolve()} onEdit={editMessage} onDelete={deleteMessage} onRetry={retryMessage} onLookup={(word, anchor) => setLookup({ word, ...anchor })} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { state.setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => setLookup(null)} />}</main>;
+  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={state.setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); state.setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} onSettings={() => setProviderOpen(true)} onClose={() => state.setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={state.session?.user.display_name ?? "Account"} onSignOut={signOut} /><section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => state.setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}<button className="icon-button theme-toggle" type="button" onClick={() => setTheme(theme === "light" ? "dark" : "light")} title={theme === "light" ? "Use dark mode" : "Use light mode"}>{theme === "light" ? <Moon size={17} /> : <Sun size={17} />}</button></header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => state.setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content) => activeId ? sendMessage(activeId, content, searchEnabled) : Promise.resolve()} onEdit={editMessage} onDelete={deleteMessage} onRetry={retryMessage} onLookup={(word, anchor) => setLookup({ word, ...anchor })} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { state.setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => setLookup(null)} />}</main>;
 }
 
 function Sidebar({ conversations, activeId, open, collapsed, onNew, onSelect, onRename, onSettings, onClose, onCollapse, userName, onSignOut }: { conversations: Conversation[]; activeId: string | null; open: boolean; collapsed: boolean; onNew: () => void; onSelect: (id: string) => void; onRename: (id: string, title: string) => Promise<void>; onSettings: () => void; onClose: () => void; onCollapse: () => void; userName: string; onSignOut: () => void }) {
@@ -196,7 +208,7 @@ function ModelSelector({ conversation, providers, open, busy, onToggle, onChange
   return <div className="model-selector"><button type="button" className="model-button" aria-expanded={open} onClick={onToggle}><span>{model || "Choose model"}</span><ChevronsUpDown size={15} /></button>{open && <div className="model-popover"><div className="model-picker-heading">Provider</div><div className="provider-options">{providers.map((provider) => <button type="button" key={provider.id} className={provider.id === providerId ? "selected" : ""} onClick={() => { setProviderId(provider.id); setModel(provider.models[0]?.model ?? provider.default_model); }}>{provider.name}</button>)}</div><div className="model-picker-heading">Model</div><div className="configured-models">{Object.entries(groups).map(([group, items]) => <section key={group}><h4>{group}</h4>{items.map((item) => <button type="button" key={item.id} className={item.model === model ? "selected" : ""} onClick={() => { setModel(item.model); void onChange(providerId, item.model); }}>{item.model}</button>)}</section>)}</div></div>}</div>;
 }
 
-function ConversationView({ conversation, messages, providers, searchEnabled, busy, compacting, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; generation: { temperature: number; reasoning_effort: string; enable_markdown: boolean; stream: boolean }; onGenerationChange: (value: { temperature: number; reasoning_effort: string; enable_markdown: boolean; stream: boolean }) => void; onToggleSearch: () => void; onSend: (content: string) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
+function ConversationView({ conversation, messages, providers, searchEnabled, busy, compacting, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; generation: GenerationSettings; onGenerationChange: (value: GenerationSettings) => void; onToggleSearch: () => void; onSend: (content: string) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
   const [input, setInput] = useState("");
   const endRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -215,7 +227,7 @@ function RightNavigator({ messages }: { messages: Message[] }) {
   return <aside className="right-navigator" aria-label="Conversation navigation"><div className="right-nav-inner"><strong>In this chat</strong>{questions.length === 0 ? <span className="muted">No questions yet</span> : questions.map((message) => <button key={message.id} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}><span className="right-nav-label">{message.content}</span></button>)}</div></aside>;
 }
 
-function GenerationButton({ generation, onChange, provider, model }: { generation: { temperature: number; reasoning_effort: string; enable_markdown: boolean; stream: boolean }; onChange: (value: { temperature: number; reasoning_effort: string; enable_markdown: boolean; stream: boolean }) => void; provider?: Provider; model: string }) {
+function GenerationButton({ generation, onChange, provider, model }: { generation: GenerationSettings; onChange: (value: GenerationSettings) => void; provider?: Provider; model: string }) {
   const [open, setOpen] = useState(false);
   const controlRef = useRef<HTMLDivElement>(null);
   const supportsReasoning = provider?.kind === "openai_compatible" && /(?:gpt-5|\bo[1-9]\b|codex|reasoner|thinking|deepseek-r1)/i.test(model);

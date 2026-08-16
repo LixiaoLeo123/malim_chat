@@ -265,6 +265,7 @@ struct Conversation {
     model: Option<String>,
     context_window: i32,
     context_tokens: i32,
+    generation_settings: Value,
     revision: i64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -310,6 +311,14 @@ struct UpdateConversation {
     archived: Option<bool>,
     provider_id: Option<Uuid>,
     model: Option<String>,
+    generation_settings: Option<GenerationSettings>,
+}
+#[derive(Deserialize, Serialize)]
+struct GenerationSettings {
+    temperature: f32,
+    reasoning_effort: String,
+    enable_markdown: bool,
+    stream: bool,
 }
 #[derive(Deserialize)]
 struct ProviderRequest {
@@ -461,12 +470,21 @@ fn decrypt(state: &AppState, encrypted: &[u8], nonce: &[u8]) -> Result<String, A
 fn estimate_tokens(content: &str) -> i32 {
     ((content.chars().count() as f64 / 3.5).ceil() as i32).max(1)
 }
+fn validate_generation_settings(settings: GenerationSettings) -> Result<Value, ApiError> {
+    if !settings.temperature.is_finite() || !(0.0..=2.0).contains(&settings.temperature) {
+        return Err(ApiError::bad("Temperature must be between 0 and 2."));
+    }
+    if !matches!(settings.reasoning_effort.as_str(), "low" | "medium" | "high") {
+        return Err(ApiError::bad("Reasoning effort must be low, medium, or high."));
+    }
+    Ok(json!(settings))
+}
 async fn own_conversation(
     pool: &PgPool,
     user_id: Uuid,
     id: Uuid,
 ) -> Result<Conversation, ApiError> {
-    sqlx::query_as::<_, Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at FROM conversations WHERE id=$1 AND user_id=$2 AND archived_at IS NULL").bind(id).bind(user_id).fetch_optional(pool).await?.ok_or_else(ApiError::not_found)
+    sqlx::query_as::<_, Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at FROM conversations WHERE id=$1 AND user_id=$2 AND archived_at IS NULL").bind(id).bind(user_id).fetch_optional(pool).await?.ok_or_else(ApiError::not_found)
 }
 async fn event(
     pool: &PgPool,
@@ -781,7 +799,7 @@ async fn list_conversations(
         .cursor
         .as_deref()
         .and_then(|s| s.parse::<DateTime<Utc>>().ok());
-    let rows=sqlx::query_as::<_,Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at FROM conversations WHERE user_id=$1 AND archived_at IS NULL AND ($2::timestamptz IS NULL OR updated_at < $2) ORDER BY updated_at DESC,id DESC LIMIT $3").bind(user_id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
+    let rows=sqlx::query_as::<_,Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at FROM conversations WHERE user_id=$1 AND archived_at IS NULL AND ($2::timestamptz IS NULL OR updated_at < $2) ORDER BY updated_at DESC,id DESC LIMIT $3").bind(user_id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
     let next = rows.get(limit as usize).map(|c| c.updated_at.to_rfc3339());
     Ok(Json(Page {
         items: rows.into_iter().take(limit as usize).collect(),
@@ -801,7 +819,7 @@ async fn create_conversation(
         let context_window: (i32,) = sqlx::query_as("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(pid).bind(&model).fetch_one(&state.db).await?;
         (Some(model), context_window.0)
     } else { (request.model, 128_000) };
-    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(context_window).fetch_one(&state.db).await?;
+    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(context_window).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -830,6 +848,7 @@ async fn update_conversation(
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let existing = own_conversation(&state.db, user_id, id).await?;
+    let generation_settings = request.generation_settings.map(validate_generation_settings).transpose()?;
     let model_changed = request.model.is_some();
     let model = request.model.map(|value| value.trim().to_string());
     if model.as_ref().is_some_and(String::is_empty) {
@@ -845,7 +864,7 @@ async fn update_conversation(
             selected_context_window = Some(sqlx::query_as::<_, (i32,)>("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(provider_id).bind(model).fetch_one(&state.db).await?.0);
         }
     }
-    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).fetch_one(&state.db).await?;
+    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),generation_settings=COALESCE($8,generation_settings),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).bind(generation_settings).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
