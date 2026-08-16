@@ -58,7 +58,7 @@
 .app-shell.dark { background: #212121; color: #ececec; }.app-shell.dark .sidebar { background: #000 !important; border-color: #2a2a2a !important; }.app-shell.dark .chat-header, .app-shell.dark .composer, .app-shell.dark .dictionary-popover, .app-shell.dark .modal { background: #212121 !important; border-color: #3b3b3b !important; color: #ececec !important; }.app-shell.dark .chat-shell { background: #212121; }.app-shell.dark .new-chat, .app-shell.dark .settings-button, .app-shell.dark .conversation-row > button:first-child, .app-shell.dark .icon-button, .app-shell.dark .model-button, .app-shell.dark .search-chip { color: #ececec !important; }.app-shell.dark .conversation-row.selected, .app-shell.dark .conversation-row:hover, .app-shell.dark .new-chat:hover, .app-shell.dark .settings-button:hover, .app-shell.dark .icon-button:hover { background: #2f2f2f !important; }.app-shell.dark .message-content { color: #ececec !important; }.app-shell.dark .message.user .message-avatar, .app-shell.dark .message-avatar { background: #303030 !important; color: #e5e5e5 !important; }.app-shell.dark .model-button, .app-shell.dark .model-popover, .app-shell.dark .generation-popover, .app-shell.dark input, .app-shell.dark select, .app-shell.dark textarea { background: #2a2a2a !important; border-color: #4a4a4a !important; color: #ececec !important; }.app-shell.dark .composer-wrap { background: linear-gradient(to bottom, rgba(33,33,33,0), #212121 22%) !important; }.app-shell.dark .markdown-content pre { background: #171717 !important; }.app-shell.dark .markdown-content th { background: #303030 !important; }.app-shell.dark .markdown-content th, .app-shell.dark .markdown-content td { border-color: #4a4a4a !important; }.app-shell.dark .dictionary-popover .malim-entry, .app-shell.dark .dictionary-popover .malim-entry h1 { color: #ececec !important; }.app-shell.dark .dictionary-popover .malim-entry th { background: #303030 !important; }.app-shell.dark .dictionary-popover .malim-entry th, .app-shell.dark .dictionary-popover .malim-entry td { border-color: #4a4a4a !important; }.app-shell.dark .right-navigator { background: linear-gradient(to right, transparent, #212121 35%) !important; border-color: #383838 !important; }.app-shell.dark .right-nav-inner button { color: #d5d5d5 !important; }
 .right-navigator,.right-nav-inner{overflow-x:hidden!important}.right-nav-inner button{display:block!important;min-width:0!important;overflow:hidden!important}.right-nav-label{display:block!important;width:100%!important;min-width:0!important;overflow:hidden!important;text-overflow:ellipsis!important;white-space:nowrap!important}
 
-.thinking-block{margin:0 0 10px;border:1px solid #e1e5e3;border-radius:7px;background:#f8faf9;color:#536068;font-size:13px;line-height:1.55}.thinking-block summary{cursor:pointer;padding:8px 10px;color:#58666d;user-select:none;list-style:none;display:flex;align-items:center;gap:6px}.thinking-block summary::-webkit-details-marker{display:none}.thinking-block summary::after{content:"▾";margin-left:auto;font-size:10px;opacity:.65;transition:transform .2s ease}.thinking-block[open] summary::after{transform:rotate(180deg)}.thinking-block[open] summary{border-bottom:1px solid #e1e5e3}.thinking-block>div{display:grid;grid-template-rows:0fr;overflow:hidden;transition:grid-template-rows .24s ease}.thinking-block[open]>div{grid-template-rows:1fr}.thinking-block>div>.plain-content{min-height:0;overflow:auto;max-height:300px;padding:9px 10px;color:#59656c}
+.thinking-block{margin:0 0 10px;border:1px solid #e1e5e3;border-radius:7px;background:#f8faf9;color:#536068;font-size:13px;line-height:1.55;overflow:hidden}.thinking-summary{cursor:pointer;width:100%;border:0;background:transparent;color:#58666d;padding:9px 10px;user-select:none;display:flex;align-items:center;gap:6px;font-size:13px}.thinking-summary::after{content:"▾";margin-left:auto;font-size:10px;opacity:.65;transition:transform .2s ease}.thinking-summary[aria-expanded="true"]::after{transform:rotate(180deg)}.thinking-collapse{overflow:hidden;transition:max-height .32s cubic-bezier(.4,0,.2,1)}.thinking-scroll{max-height:300px;overflow:auto;padding:0 10px 9px;color:#59656c}
 
 /* Dark mode uses only neutral graphite surfaces. Green is used for neither state nor emphasis. */
 .app-shell.dark,.app-shell.dark .chat-shell,.app-shell.dark .message-list{background:#212121!important;color:#ececec!important}.app-shell.dark .sidebar{background:#000!important;border-color:#2a2a2a!important}.app-shell.dark .chat-header,.app-shell.dark .composer,.app-shell.dark .dictionary-popover,.app-shell.dark .modal,.app-shell.dark .model-popover,.app-shell.dark .generation-popover{background:#212121!important;border-color:#414141!important;color:#ececec!important}.app-shell.dark .model-popover,.app-shell.dark .generation-popover,.app-shell.dark .dictionary-popover,.app-shell.dark .modal{box-shadow:0 16px 42px rgba(0,0,0,.42)!important}
@@ -66,15 +66,63 @@
 .app-shell.dark .search-chip.enabled,.app-shell.dark .provider-options button.selected,.app-shell.dark .configured-models button.selected,.app-shell.dark .api-format-picker button.selected{background:#363636!important;border-color:#707070!important;color:#fff!important;box-shadow:none!important}.app-shell.dark .provider-options button,.app-shell.dark .configured-models button,.app-shell.dark .api-format-picker button,.app-shell.dark .provider-card.selected,.app-shell.dark .provider-models{background:#292929!important;border-color:#464646!important;color:#e8e8e8!important}.app-shell.dark .provider-card-main span,.app-shell.dark .provider-options button,.app-shell.dark .configured-models h4,.app-shell.dark .model-picker-heading,.app-shell.dark label,.app-shell.dark .muted,.app-shell.dark .right-nav-inner strong,.app-shell.dark .right-nav-inner>span{color:#b6b6b6!important}
 .app-shell.dark input,.app-shell.dark select,.app-shell.dark textarea{background:#2a2a2a!important;color:#f1f1f1!important;border-color:#525252!important}.app-shell.dark input:focus,.app-shell.dark select:focus,.app-shell.dark textarea:focus{border-color:#6b6b6b!important;box-shadow:0 0 0 2px rgba(255,255,255,.05)!important}.app-shell.dark .composer-wrap{background:linear-gradient(to bottom,rgba(33,33,33,0),#212121 22%)!important}.app-shell.dark .context-meter,.app-shell.dark .disclaimer{color:#a8a8a8!important}.app-shell.dark .context-meter div{background:#414141!important}.app-shell.dark .context-meter i{background:#d0d0d0!important}.app-shell.dark .context-meter button{color:#e0e0e0!important}
 .app-shell.dark .markdown-toggle{border-color:#464646!important}.app-shell.dark .markdown-toggle input{background:#555!important}.app-shell.dark .markdown-toggle input:checked{background:#d4d4d4!important}.app-shell.dark .markdown-toggle input:checked::after{background:#202020!important}.app-shell.dark .generation-popover label b{color:#f0f0f0!important}.app-shell.dark .generation-popover input[type=range]{background:#555!important;accent-color:#e0e0e0!important}.app-shell.dark .generation-popover input[type=range]::-webkit-slider-thumb{background:#e3e3e3!important;border-color:#303030!important;box-shadow:none!important}
-.app-shell.dark .right-navigator{background:linear-gradient(to right,transparent,#212121 35%)!important;border-color:#414141!important}.app-shell.dark .thinking-block{background:#292929!important;border-color:#454545!important;color:#cfcfcf!important}.app-shell.dark .thinking-block summary{color:#e0e0e0!important}.app-shell.dark .thinking-block[open] summary{border-color:#454545!important}.app-shell.dark .thinking-block>div>.plain-content{color:#c8c8c8!important}.app-shell.dark .markdown-content pre{background:#171717!important}.app-shell.dark .markdown-content :not(pre)>code{background:#303030!important}.app-shell.dark .markdown-content a,.app-shell.dark .dictionary-popover .malim-entry a{color:#e1e1e1!important}.app-shell.dark .sources a{background:#303030!important;border-color:#505050!important;color:#e6e6e6!important}.app-shell.dark .message.summary .message-content{background:#2b2920!important;border-color:#85733c!important;color:#eee2b8!important}
+.app-shell.dark .right-navigator{background:linear-gradient(to right,transparent,#212121 35%)!important;border-color:#414141!important}.app-shell.dark .thinking-block{background:#292929!important;border-color:#454545!important;color:#cfcfcf!important}.app-shell.dark .thinking-summary{color:#e0e0e0!important}.app-shell.dark .thinking-scroll{color:#c8c8c8!important}.app-shell.dark .markdown-content pre{background:#171717!important}.app-shell.dark .markdown-content :not(pre)>code{background:#303030!important}.app-shell.dark .markdown-content a,.app-shell.dark .dictionary-popover .malim-entry a{color:#e1e1e1!important}.app-shell.dark .sources a{background:#303030!important;border-color:#505050!important;color:#e6e6e6!important}.app-shell.dark .message.summary .message-content{background:#2b2920!important;border-color:#85733c!important;color:#eee2b8!important}
 
 
 /* Dark mode refinements: keep focus subtle, dark scrollbars, copy confirmation. */
 .app-shell.dark .composer:focus-within{border-color:#5a5a5a!important;box-shadow:0 0 0 2px rgba(255,255,255,.05)!important}
-.app-shell.dark .message-list,.app-shell.dark .history,.app-shell.dark .thinking-block>div>.plain-content,.app-shell.dark .right-nav-inner,.app-shell.dark .dictionary-popover,.app-shell.dark .model-popover,.app-shell.dark .generation-popover{scrollbar-width:thin;scrollbar-color:#4f4f4f transparent}
+.app-shell.dark .message-list,.app-shell.dark .history,.app-shell.dark .thinking-scroll,.app-shell.dark .right-nav-inner,.app-shell.dark .dictionary-popover,.app-shell.dark .model-popover,.app-shell.dark .generation-popover{scrollbar-width:thin;scrollbar-color:#4f4f4f transparent}
 .app-shell.dark *::-webkit-scrollbar{width:8px;height:8px}
 .app-shell.dark *::-webkit-scrollbar-thumb{background:#4a4a4a;border-radius:4px}
 .app-shell.dark *::-webkit-scrollbar-thumb:hover{background:#5c5c5c}
 .app-shell.dark *::-webkit-scrollbar-track{background:transparent}
 .message-tools button.copied{color:#0f766e}
 .app-shell.dark .message-tools button.copied{color:#7bd88f}
+
+/* Provider settings: card layout, per-model API format toggle, responsive rows. */
+.provider-modal{width:min(680px,100%)}
+.provider-list{display:grid;gap:8px;border:0;margin:0 0 18px}
+.provider-card{border:1px solid #e4e9e6;border-radius:10px;background:#fff;padding:10px 12px;box-shadow:0 1px 2px rgba(15,23,42,.04);transition:border-color .15s ease,box-shadow .15s ease,background-color .15s ease}
+.provider-card:hover{border-color:#c8d8d3;background:#fafcfb}
+.provider-card.selected{border-color:#86bfb6;background:#f0f8f6;box-shadow:0 0 0 2px #d9efece0}
+.provider-card-main{display:flex;align-items:center;gap:11px;flex:1;min-width:0;text-align:left;border:0;background:transparent;padding:2px}
+.provider-avatar{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,#0f766e,#17b3a2);color:#fff;display:grid;place-items:center;font-size:14px;font-weight:700;flex:none;text-transform:uppercase}
+.provider-copy{display:grid;gap:2px;min-width:0;flex:1}
+.provider-copy strong{font-size:14px;color:#1f2a33;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.provider-copy span{font-size:12px;color:#78858d}
+.provider-models{border:1px solid #e2e7e4;border-radius:12px;background:#fafcfb;padding:16px;margin:18px 0}
+.provider-models h3{font-size:14px;margin:0 0 12px;color:#26323d}
+.model-group{padding:12px 0 4px;border-top:1px solid #ebefec}
+.model-group:first-of-type{border-top:0;padding-top:0}
+.model-group-head{display:flex;align-items:center;justify-content:space-between;margin:0 0 6px}
+.model-group-head h4{font-size:11px;text-transform:uppercase;color:#718079;margin:0;letter-spacing:.05em}
+.model-group-head span{font-size:10px;color:#7e8c86;background:#eef2f0;border-radius:999px;padding:1px 7px;font-weight:700}
+.model-config-row input,.add-model input{padding:7px 8px;font-size:12px}
+.model-config-row input[aria-label="Model name"],.add-model input[placeholder="Model name"]{flex:1 1 150px;min-width:110px}
+.model-config-row input[aria-label="Model group"],.add-model input[placeholder="Group"]{flex:0 1 110px;min-width:88px}
+.model-config-row input[aria-label="Maximum context tokens"],.add-model input[aria-label="Maximum context tokens"]{flex:0 1 108px;min-width:88px}
+.model-config-row .kind-toggle,.add-model .kind-toggle{flex:none}
+.model-config-row .text-button{margin-left:auto}
+.model-config-row .icon-button{width:30px;height:30px;flex:none}
+.add-model{border-top:1px solid #ebefec;padding-top:12px}
+.add-model .primary{margin-left:auto}
+.kind-toggle{display:inline-flex;border:1px solid #dce4e1;border-radius:7px;overflow:hidden;background:#eef3f1;flex:none}
+.kind-toggle button{border:0;background:transparent;color:#64727a;font-size:11.5px;font-weight:600;padding:6px 11px;cursor:pointer;transition:background-color .15s ease,color .15s ease}
+.kind-toggle button:not(.selected):hover{color:#0d665f;background:#e2ebe8}
+.kind-toggle button.selected{background:#0f766e;color:#fff}
+.provider-form{border:1px solid #e2e7e4;border-radius:12px;background:#fafcfb;padding:16px}
+.provider-form h3{font-size:15px;margin:0 0 12px}
+.app-shell.dark .provider-card{background:#262626!important;border-color:#3d3d3d!important;box-shadow:none!important}
+.app-shell.dark .provider-card:hover{background:#2c2c2c!important;border-color:#4d4d4d!important}
+.app-shell.dark .provider-card.selected{background:#303030!important;border-color:#56615e!important;box-shadow:0 0 0 2px rgba(255,255,255,.07)!important}
+.app-shell.dark .provider-avatar{background:linear-gradient(135deg,#0e6f68,#12a394)!important;color:#fff!important}
+.app-shell.dark .provider-copy strong{color:#ececec!important}
+.app-shell.dark .provider-copy span{color:#9a9a9a!important}
+.app-shell.dark .provider-models,.app-shell.dark .provider-form{background:#262626!important;border-color:#3d3d3d!important}
+.app-shell.dark .model-group,.app-shell.dark .add-model{border-color:#3d3d3d!important}
+.app-shell.dark .model-group-head h4{color:#9a9a9a!important}
+.app-shell.dark .model-group-head span{background:#1f1f1f!important;color:#a9a9a9!important}
+.app-shell.dark .kind-toggle{background:#1f1f1f!important;border-color:#464646!important}
+.app-shell.dark .kind-toggle button{color:#b0b0b0!important}
+.app-shell.dark .kind-toggle button:not(.selected):hover{background:#2c2c2c!important;color:#e8e8e8!important}
+.app-shell.dark .kind-toggle button.selected{background:#e0e0e0!important;color:#171717!important}
