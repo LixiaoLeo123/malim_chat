@@ -1011,6 +1011,14 @@ async fn respond(
                 Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search provider request failed"),
             }
         }
+        if merged.is_empty() {
+            for query in search_fallback_queries(&input.content) {
+                match fetch_search(&state, &query, &query).await {
+                    Ok(results) => for mut result in results { result["query"] = json!(query); if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); } },
+                    Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search fallback request failed"),
+                }
+            }
+        }
         merged.truncate(8);
         info!(conversation_id=%id, source_count=merged.len(), "search collection completed");
         merged
@@ -1027,7 +1035,7 @@ async fn respond(
         let upstream = call_provider_stream(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
         return Ok(stream_response(state, upstream, id, user_id, model, sources, enable_markdown));
     }
-    let answer = call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
+    let answer = strip_thinking(&call_provider(&state.http, &p.0, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?);
     let m = persist_assistant_message(&state, id, user_id, &model, answer, &sources, enable_markdown).await?;
     Ok(Json(m).into_response())
 }
@@ -1595,6 +1603,15 @@ fn normalized_search_query(query: &str) -> String {
     let hints = ["最新", "最强", "模型", "发布", "价格", "新闻"].into_iter().filter(|hint| query.contains(hint)).collect::<Vec<_>>();
     format!("{} {}", latin.join(" "), hints.join(" ")).trim().to_string()
 }
+
+fn search_fallback_queries(question: &str) -> Vec<String> {
+    let lower = question.to_lowercase();
+    if lower.contains("现在的时间") || lower.contains("当前时间") || lower.contains("current time") || lower.contains("what time") {
+        return vec!["current time China".into(), "current time Beijing".into()];
+    }
+    let entities = question.split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_').filter(|term| term.len() >= 3).collect::<Vec<_>>();
+    if entities.is_empty() { vec![] } else { vec![format!("{} latest information", entities.join(" "))] }
+}
 async fn sync(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1678,13 +1695,36 @@ fn provider_stream_delta(kind: &str, frame: &str) -> Option<String> {
     if kind == "anthropic" { value["delta"]["text"].as_str().map(str::to_string) } else { value["choices"].as_array()?.first()?["delta"]["content"].as_str().map(str::to_string) }
 }
 
+fn filter_thinking_delta(input: &str, in_think: &mut bool) -> String {
+    let mut remaining = input;
+    let mut visible = String::new();
+    loop {
+        if *in_think {
+            match remaining.find("</think>") {
+                Some(end) => { remaining = &remaining[end + "</think>".len()..]; *in_think = false; }
+                None => return visible,
+            }
+        } else {
+            match remaining.find("<think>") {
+                Some(start) => { visible.push_str(&remaining[..start]); remaining = &remaining[start + "<think>".len()..]; *in_think = true; }
+                None => { visible.push_str(remaining); return visible; }
+            }
+        }
+    }
+}
+
+fn strip_thinking(input: &str) -> String {
+    let mut in_think = false;
+    filter_thinking_delta(input, &mut in_think)
+}
+
 fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id: Uuid, user_id: Uuid, model: String, sources: Vec<Value>, enable_markdown: bool) -> Response {
     let kind = if upstream.url().path().ends_with("/v1/messages") { "anthropic".to_string() } else { "openai_compatible".to_string() };
     let output = async_stream::stream! {
-        let mut answer = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream();
+        let mut answer = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut in_think = false;
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(delta) = provider_stream_delta(&kind, &frame) { answer.push_str(&delta); let payload = serde_json::to_string(&json!({"type":"delta","delta":delta})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } }
+                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(delta) = provider_stream_delta(&kind, &frame) { let visible = filter_thinking_delta(&delta, &mut in_think); if !visible.is_empty() { answer.push_str(&visible); let payload = serde_json::to_string(&json!({"type":"delta","delta":visible})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
                 Err(error) => { warn!(conversation_id=%conversation_id, %error, "upstream stream interrupted"); let payload = serde_json::to_string(&json!({"type":"error","message":"The provider stream was interrupted."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
             }
         }
@@ -1702,17 +1742,26 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
 
 #[cfg(test)]
 mod tests {
-    use super::{focused_search_query, normalized_search_query, provider_stream_delta, search_terms};
+    use super::{filter_thinking_delta, focused_search_query, normalized_search_query, provider_stream_delta, search_fallback_queries, search_terms, strip_thinking};
 
     #[test]
     fn strips_explicit_search_instruction_from_query() {
         assert_eq!(focused_search_query("Anthropic现在最强的模型是什么？联网搜索"), "Anthropic现在最强的模型是什么");
         assert_eq!(normalized_search_query("Anthropic现在最强的模型是什么"), "Anthropic 最强 模型");
         assert!(search_terms("Anthropic现在最强的模型是什么").contains(&"anthropic".to_string()));
+        assert_eq!(search_fallback_queries("上网搜索，现在的时间是多少？")[0], "current time China");
     }
 
     #[test]
     fn parses_openai_stream_delta() {
         assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"), Some("hello".into()));
+    }
+
+    #[test]
+    fn removes_thinking_from_streamed_and_complete_text() {
+        assert_eq!(strip_thinking("Before<think>private</think>After"), "BeforeAfter");
+        let mut in_think = false;
+        assert_eq!(filter_thinking_delta("<think>private", &mut in_think), "");
+        assert_eq!(filter_thinking_delta(" reasoning</think>visible", &mut in_think), "visible");
     }
 }

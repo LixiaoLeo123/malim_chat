@@ -212,7 +212,7 @@ function ConversationView({ conversation, messages, providers, searchEnabled, bu
 
 function RightNavigator({ messages }: { messages: Message[] }) {
   const questions = messages.filter((message) => message.role === "user");
-  return <aside className="right-navigator" aria-label="Conversation navigation"><div className="right-nav-inner"><strong>In this chat</strong>{questions.length === 0 ? <span className="muted">No questions yet</span> : questions.map((message, index) => <button key={message.id} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}><span>{index + 1}</span><span className="right-nav-label">{message.content}</span></button>)}</div></aside>;
+  return <aside className="right-navigator" aria-label="Conversation navigation"><div className="right-nav-inner"><strong>In this chat</strong>{questions.length === 0 ? <span className="muted">No questions yet</span> : questions.map((message) => <button key={message.id} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}><span className="right-nav-label">{message.content}</span></button>)}</div></aside>;
 }
 
 function GenerationButton({ generation, onChange, provider, model }: { generation: { temperature: number; reasoning_effort: string; enable_markdown: boolean; stream: boolean }; onChange: (value: { temperature: number; reasoning_effort: string; enable_markdown: boolean; stream: boolean }) => void; provider?: Provider; model: string }) {
