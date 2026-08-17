@@ -1,4 +1,4 @@
-import { Component, FormEvent, ReactNode, useEffect, useRef, useState } from "react";
+import { Component, FormEvent, ReactNode, TouchEvent, useEffect, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import { Bot, Check, ChevronsUpDown, CircleAlert, Copy, Edit3, LoaderCircle, LogOut, Menu, MessageSquare, PanelLeftClose, PanelLeftOpen, Search, Settings2, SquarePen, Trash2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -277,6 +277,71 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
   const [copied, setCopied] = useState(false);
+  const bodyRef = useRef<HTMLDivElement | null>(null);
+  const selectionCaptured = useRef(false);
+  const longPressTimer = useRef<number | null>(null);
+  const longPress = useRef<{ x: number; y: number; fired: boolean } | null>(null);
+  function cancelLongPress() {
+    if (longPressTimer.current !== null) { window.clearTimeout(longPressTimer.current); longPressTimer.current = null; }
+    longPress.current = null;
+  }
+  function lookupAt(x: number, y: number) {
+    const range = document.caretRangeFromPoint ? document.caretRangeFromPoint(x, y) : null;
+    const node = range?.startContainer;
+    if (!range || !node || node.nodeType !== Node.TEXT_NODE || !bodyRef.current?.contains(node)) return;
+    const text = node.textContent ?? "";
+    const before = text.slice(0, range.startOffset);
+    const after = text.slice(range.startOffset);
+    const start = /[A-Za-z\u00C0-\u024F\u0370-\u052F'\u2019\-]*$/.exec(before)?.[0] ?? "";
+    const end = /^[A-Za-z\u00C0-\u024F\u0370-\u052F'\u2019\-]*/.exec(after)?.[0] ?? "";
+    const word = (start + end).trim();
+    if (word && word.length <= 120) { selectionCaptured.current = true; onLookup(word, { x: Math.min(window.innerWidth - 18, Math.max(18, x)), y: Math.min(window.innerHeight - 18, Math.max(18, y + 12)) }); }
+  }
+  function handleTouchStart(event: TouchEvent<HTMLDivElement>) {
+    if ((event.target as HTMLElement).closest?.("button, a, textarea, input, select")) return;
+    const touch = event.touches[0];
+    if (!touch) return;
+    cancelLongPress();
+    const point = { x: touch.clientX, y: touch.clientY, fired: false };
+    longPress.current = point;
+    longPressTimer.current = window.setTimeout(() => {
+      if (!longPress.current || longPress.current.fired) return;
+      longPress.current.fired = true;
+      lookupAt(longPress.current.x, longPress.current.y);
+    }, 450);
+  }
+  function handleTouchMove(event: TouchEvent<HTMLDivElement>) {
+    const point = longPress.current;
+    const touch = event.touches[0];
+    if (point && touch && (Math.abs(touch.clientX - point.x) > 20 || Math.abs(touch.clientY - point.y) > 20)) cancelLongPress();
+  }
+  function handleTouchEnd() {
+    const fired = longPress.current?.fired ?? false;
+    cancelLongPress();
+    if (fired) return;
+    captureSelection();
+  }
+  const selectionTimer = useRef<number | null>(null);
+  function onSelectionChange() {
+    const selection = window.getSelection();
+    if (!selection || selection.isCollapsed || !selection.toString().trim()) {
+      if (selectionTimer.current !== null) { window.clearTimeout(selectionTimer.current); selectionTimer.current = null; }
+      selectionCaptured.current = false;
+      return;
+    }
+    if (selectionCaptured.current || !bodyRef.current || !selection.containsNode(bodyRef.current, true)) return;
+    if (selectionTimer.current !== null) { window.clearTimeout(selectionTimer.current); selectionTimer.current = null; }
+    selectionTimer.current = window.setTimeout(() => {
+      selectionTimer.current = null;
+      const latest = window.getSelection();
+      if (selectionCaptured.current) return;
+      if (latest && !latest.isCollapsed && latest.toString().trim() && bodyRef.current && latest.containsNode(bodyRef.current, true)) {
+        selectionCaptured.current = true;
+        captureSelection();
+      }
+    }, 200);
+  }
+  useEffect(() => { document.addEventListener("selectionchange", onSelectionChange); return () => { document.removeEventListener("selectionchange", onSelectionChange); if (selectionTimer.current !== null) window.clearTimeout(selectionTimer.current); }; }, []);
   async function copyContent() {
     const text = content;
     try {
@@ -296,12 +361,12 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
       window.setTimeout(() => setCopied(false), 1600);
     } catch { /* clipboard unavailable */ }
   }
-  function captureSelection() { const selected = window.getSelection()?.toString().trim() ?? ""; if (selected && selected.length <= 120) { const range = window.getSelection()?.rangeCount ? window.getSelection()?.getRangeAt(0).getBoundingClientRect() : undefined; onLookup(selected, { x: Math.min(window.innerWidth - 18, Math.max(18, range?.left ?? window.innerWidth / 2)), y: Math.min(window.innerHeight - 18, Math.max(18, range?.bottom ?? window.innerHeight / 2)) }); } }
+  function captureSelection() { const selected = window.getSelection()?.toString().trim() ?? ""; if (selected && selected.length <= 120) { selectionCaptured.current = true; const range = window.getSelection()?.rangeCount ? window.getSelection()?.getRangeAt(0).getBoundingClientRect() : undefined; onLookup(selected, { x: Math.min(window.innerWidth - 18, Math.max(18, range?.left ?? window.innerWidth / 2)), y: Math.min(window.innerHeight - 18, Math.max(18, range?.bottom ?? window.innerHeight / 2)) }); } }
   const legacy = splitLegacyThinking(message.content);
   const content = message.reasoning_content ? message.content : legacy.content;
   const reasoning = message.reasoning_content || legacy.reasoning;
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
-  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" onMouseUp={captureSelection} onTouchEnd={captureSelection}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : content && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <SyntaxHighlighter language={language} style={theme === "dark" ? oneDark : oneLight} showLineNumbers wrapLongLines customStyle={{ margin: "0", background: "transparent", padding: "12px 0" }}>{source}</SyntaxHighlighter> : <code className={className} {...props}>{children}</code>; } }}>{preprocessLatex(content)}</ReactMarkdown> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" title="Delete" onClick={() => void onDelete(message)}><Trash2 size={14} /></button></div></div></article>;
+  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : content && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <SyntaxHighlighter language={language} style={theme === "dark" ? oneDark : oneLight} showLineNumbers wrapLongLines customStyle={{ margin: "0", background: "transparent", padding: "12px 0" }}>{source}</SyntaxHighlighter> : <code className={className} {...props}>{children}</code>; } }}>{preprocessLatex(content)}</ReactMarkdown> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" title="Delete" onClick={() => void onDelete(message)}><Trash2 size={14} /></button></div></div></article>;
 }
 
 function splitLegacyThinking(value: string) {
