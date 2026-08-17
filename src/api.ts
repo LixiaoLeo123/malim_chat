@@ -1,6 +1,6 @@
 import type { Conversation, DictionaryResponse, GenerationSettings, Message, Page, Provider, ProviderKind, ProviderModel, SearchResult, Session, User } from "./types";
 
-const apiBase = import.meta.env.VITE_API_URL ?? "http://your-server.example/malim_chat_api";
+const apiBase = import.meta.env.VITE_API_URL || "/malim_chat_api";
 let session: Session | null = null;
 let refreshInFlight: Promise<Session | null> | null = null;
 let sessionListener: ((value: Session | null) => void) | null = null;

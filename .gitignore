@@ -11,6 +11,7 @@ target/
 apps/server/dictionaries/*.mdx
 apps/server/dictionaries/*.mdd
 apps/client/src-tauri/gen/
+infra/nginx/leospaper-malim-chat.conf
 android_build.txt
 *.jks
 apps/client/src-tauri/target/
