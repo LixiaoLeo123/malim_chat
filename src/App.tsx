@@ -280,7 +280,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const selectionCaptured = useRef(false);
   const longPressTimer = useRef<number | null>(null);
-  const longPress = useRef<{ x: number; y: number; fired: boolean } | null>(null);
+  const longPress = useRef<{ x: number; y: number } | null>(null);
   function cancelLongPress() {
     if (longPressTimer.current !== null) { window.clearTimeout(longPressTimer.current); longPressTimer.current = null; }
     longPress.current = null;
@@ -302,12 +302,14 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
     const touch = event.touches[0];
     if (!touch) return;
     cancelLongPress();
-    const point = { x: touch.clientX, y: touch.clientY, fired: false };
+    const point = { x: touch.clientX, y: touch.clientY };
     longPress.current = point;
     longPressTimer.current = window.setTimeout(() => {
-      if (!longPress.current || longPress.current.fired) return;
-      longPress.current.fired = true;
-      lookupAt(longPress.current.x, longPress.current.y);
+      if (!longPress.current) return;
+      const target = longPress.current;
+      longPress.current = null;
+      longPressTimer.current = null;
+      lookupAt(target.x, target.y);
     }, 450);
   }
   function handleTouchMove(event: TouchEvent<HTMLDivElement>) {
@@ -315,12 +317,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
     const touch = event.touches[0];
     if (point && touch && (Math.abs(touch.clientX - point.x) > 20 || Math.abs(touch.clientY - point.y) > 20)) cancelLongPress();
   }
-  function handleTouchEnd() {
-    const fired = longPress.current?.fired ?? false;
-    cancelLongPress();
-    if (fired) return;
-    captureSelection();
-  }
+  function handleTouchEnd() { cancelLongPress(); }
   const selectionTimer = useRef<number | null>(null);
   function onSelectionChange() {
     const selection = window.getSelection();

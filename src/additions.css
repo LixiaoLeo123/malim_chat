@@ -192,3 +192,7 @@
 .app-shell.dark .dictionary-senses { border-color: #3f5651; }
 .app-shell.dark .dictionary-senses h4 { color: #93a19d; }
 .app-shell.dark .dictionary-senses li::marker { color: #7fd0c4; }
+
+@media (hover: none) and (pointer: coarse) {
+  .message-content, .thinking-scroll { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+}
