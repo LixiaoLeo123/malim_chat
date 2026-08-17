@@ -196,3 +196,6 @@
 @media (max-width: 720px), (hover: none) and (pointer: coarse) {
   .message-content, .thinking-scroll { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 }
+
+::highlight(dictionary-lookup) { background-color: rgba(15, 118, 110, 0.28); }
+.app-shell.dark ::highlight(dictionary-lookup) { background-color: rgba(127, 208, 196, 0.32); }
