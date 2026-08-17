@@ -137,3 +137,6 @@
 .markdown-content .katex {
   color: inherit;
 }
+
+/* On mobile the avatar is a plain label row; keep it transparent in dark mode too. */
+@media(max-width:720px){.app-shell.dark .message-avatar,.app-shell.dark .message.user .message-avatar{background:transparent!important}}
