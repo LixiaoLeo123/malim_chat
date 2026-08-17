@@ -6,7 +6,11 @@ target/
 !.env.example
 *.db
 *.sqlite
+*.sqlite.gz
 *.sqlite3
-!apps/server/dictionaries/ecdict_en_zh.sqlite
+apps/server/dictionaries/*.mdx
+apps/server/dictionaries/*.mdd
 apps/client/src-tauri/gen/
+android_build.txt
+*.jks
 apps/client/src-tauri/target/
