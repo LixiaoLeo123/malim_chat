@@ -290,11 +290,14 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
     const node = range?.startContainer;
     if (!range || !node || node.nodeType !== Node.TEXT_NODE || !bodyRef.current?.contains(node)) return;
     const text = node.textContent ?? "";
-    const before = text.slice(0, range.startOffset);
-    const after = text.slice(range.startOffset);
-    const start = /[A-Za-z\u00C0-\u024F\u0370-\u052F'\u2019\-]*$/.exec(before)?.[0] ?? "";
-    const end = /^[A-Za-z\u00C0-\u024F\u0370-\u052F'\u2019\-]*/.exec(after)?.[0] ?? "";
-    const word = (start + end).trim();
+    const isWord = (char?: string) => char ? /[A-Za-z\u00C0-\u024F\u0370-\u052F'\u2019]/.test(char) : false;
+    const offset = range.startOffset;
+    if (!isWord(text[offset - 1]) && !isWord(text[offset])) return;
+    let start = offset;
+    while (start > 0 && isWord(text[start - 1])) start--;
+    let end = offset;
+    while (end < text.length && isWord(text[end])) end++;
+    const word = text.slice(start, end);
     if (word && word.length <= 120) { selectionCaptured.current = true; onLookup(word, { x: Math.min(window.innerWidth - 18, Math.max(18, x)), y: Math.min(window.innerHeight - 18, Math.max(18, y + 12)) }); }
   }
   function handleTouchStart(event: TouchEvent<HTMLDivElement>) {
