@@ -528,6 +528,7 @@ async fn main() -> anyhow::Result<()> {
         .max_connections(20)
         .connect(&config.database_url)
         .await?;
+    // Apply embedded schema migrations before serving requests.
     sqlx::migrate!().run(&db).await?;
     let russian_dictionary = Mdx::new(config.dictionary_dir.join("OpenRussian.mdx"))
         .map_err(|_| anyhow::anyhow!("Russian dictionary could not be opened"))?;
