@@ -25,20 +25,48 @@
 /* Position is computed after measurement, so a dictionary result cannot escape the viewport. */
 .dictionary-popover, .dictionary-popover.up { transform: none !important; }
 .dictionary-popover.up { animation: menu-enter .16s ease-out; }
-.dictionary-popover .malim-entry { padding: 12px 0; color: #374151; line-height: 1.6; }
-.dictionary-popover .malim-entry h1 { font-size: 22px; line-height: 1.25; margin: 0 0 7px; color: #173c38; }
-.dictionary-popover .malim-entry h2 { font-size: 14px; margin: 15px 0 7px; color: #49605c; }
-.dictionary-popover .malim-entry h3 { font-size: 12px; text-transform: uppercase; margin: 13px 0 6px; color: #718078; }
-.dictionary-popover .malim-entry .pos { display: inline-flex; border-radius: 999px; background: #e9f5f2; color: #0f766e; padding: 2px 7px; font-size: 10px; font-weight: 700; text-transform: uppercase; }
-.dictionary-popover .malim-entry .meaning, .dictionary-popover .malim-entry .sense { border-left: 2px solid #d5e9e5; padding: 7px 0 7px 10px; margin: 7px 0; }
+/* Dictionary entries (OpenRussian / German): compact and scannable. */
+.dictionary-popover .malim-entry { padding: 10px 0 2px; color: #374151; line-height: 1.45; font-size: 13px; }
+.dictionary-popover .malim-entry .section { margin: 0 0 10px; }
+.dictionary-popover .malim-entry h1 { font-size: 19px; line-height: 1.2; margin: 0 0 4px; color: #173c38; }
+.dictionary-popover .malim-entry h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .05em; font-weight: 700; color: #5c6b66; margin: 10px 0 5px; border-bottom: 1px solid #e7ecea; padding-bottom: 3px; }
+.dictionary-popover .malim-entry h3 { font-size: 11px; text-transform: uppercase; margin: 9px 0 4px; color: #718078; }
+.dictionary-popover .malim-entry p { margin: 2px 0; }
+.dictionary-popover .malim-entry .pos { display: inline-flex; border-radius: 999px; background: #e9f5f2; color: #0f766e; padding: 1px 7px; font-size: 10px; font-weight: 700; text-transform: uppercase; margin-bottom: 6px; }
+.dictionary-popover .malim-entry .overview p { font-size: 11.5px; color: #6b7671; }
+.dictionary-popover .malim-entry .overview p:first-child { text-transform: capitalize; }
+.dictionary-popover .malim-entry .section.translations li { margin: 3px 0; }
+.dictionary-popover .malim-entry .section.translations .tl { font-size: 13.5px; font-weight: 600; color: #26323d; }
+.dictionary-popover .malim-entry .section.translations .example, .dictionary-popover .malim-entry .section.translations .info { font-size: 11.5px; color: #6b7671; }
+.dictionary-popover .malim-entry .meaning, .dictionary-popover .malim-entry .sense { border-left: 2px solid #d5e9e5; padding: 5px 0 5px 9px; margin: 5px 0; }
 .dictionary-popover .malim-entry .meaning p, .dictionary-popover .malim-entry .sense p { margin: 0; }
-.dictionary-popover .malim-entry ul, .dictionary-popover .malim-entry ol { padding-left: 19px; margin: 7px 0; display: grid; gap: 5px; }
-.dictionary-popover .malim-entry table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
-.dictionary-popover .malim-entry th, .dictionary-popover .malim-entry td { border: 1px solid #dfe7e4; padding: 5px 7px; text-align: left; }
-.dictionary-popover .malim-entry th { background: #f2f7f5; }
-.dictionary-popover .malim-entry .example, .dictionary-popover .malim-entry .sentence { border-radius: 5px; background: #f6faf9; padding: 8px; margin: 7px 0; }
+.dictionary-popover .malim-entry ul, .dictionary-popover .malim-entry ol { padding-left: 16px; margin: 4px 0; display: grid; gap: 3px; }
+.dictionary-popover .malim-entry ul.sentences, .dictionary-popover .malim-entry .section.relateds2 ul { list-style: none; padding-left: 0; }
+.dictionary-popover .malim-entry .sentence { margin: 4px 0; }
+.dictionary-popover .malim-entry .sentence .ru { display: block; }
+.dictionary-popover .malim-entry .sentence .tl, .dictionary-popover .malim-entry .relateds2 li span { display: block; font-size: 11.5px; color: #6b7671; }
+.dictionary-popover .malim-entry .section.expressions li, .dictionary-popover .malim-entry .section.components li { margin: 3px 0; }
+.dictionary-popover .malim-entry .section.expressions .ru, .dictionary-popover .malim-entry .section.components .ru { display: block; }
+.dictionary-popover .malim-entry .section.expressions .tl, .dictionary-popover .malim-entry .section.components .tl { display: block; font-size: 11.5px; color: #6b7671; }
+.dictionary-popover .malim-entry .section.usage .content { font-size: 12.5px; }
+.dictionary-popover .malim-entry .table-container { overflow-x: auto; margin: 5px 0; }
+.dictionary-popover .malim-entry table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 0; }
+.dictionary-popover .malim-entry th, .dictionary-popover .malim-entry td { border: 1px solid #dfe7e4; padding: 3px 7px; text-align: left; }
+.dictionary-popover .malim-entry .section.declension th, .dictionary-popover .malim-entry .section.declension td, .dictionary-popover .malim-entry .section.conjugation th, .dictionary-popover .malim-entry .section.conjugation td { white-space: nowrap; }
+.dictionary-popover .malim-entry th { background: #f2f7f5; font-weight: 600; }
+.dictionary-popover .malim-entry .past-imp { display: flex; gap: 8px; }
+.dictionary-popover .malim-entry .past-imp .table-container { flex: 1; }
+.dictionary-popover .malim-entry .participles h2 { margin-top: 8px; }
+.dictionary-popover .malim-entry .example { border-radius: 5px; background: #f6faf9; padding: 6px 8px; margin: 5px 0; font-size: 12px; }
 .dictionary-popover .malim-entry a { color: #0f766e; text-decoration: none; }
-.dictionary-popover .malim-entry hr { border: 0; border-top: 1px solid #e4e9e7; margin: 13px 0; }
+.dictionary-popover .malim-entry hr { border: 0; border-top: 1px solid #e4e9e7; margin: 8px 0; }
+
+/* Russian entries: keep examples after the conjugation/declension tables. */
+.dictionary-popover .malim-entry .version { display: flex; flex-direction: column; }
+.dictionary-popover .malim-entry .section { order: 0; }
+.dictionary-popover .malim-entry .section.declension, .dictionary-popover .malim-entry .section.conjugation, .dictionary-popover .malim-entry .section.comparatives, .dictionary-popover .malim-entry .section.shorts { order: 1; }
+.dictionary-popover .malim-entry .section.sentences { order: 2; }
+.dictionary-popover .malim-entry .section.relateds2 { order: 3; }
 
 .markdown-content pre { border: 0; background: #f2f5f4; padding: 0 12px; }
 .markdown-content pre code { font-size: 12px; }
@@ -140,3 +168,27 @@
 
 /* On mobile the avatar is a plain label row; keep it transparent in dark mode too. */
 @media(max-width:720px){.app-shell.dark .message-avatar,.app-shell.dark .message.user .message-avatar{background:transparent!important}}
+
+
+/* Dictionary dark mode: coordinated and readable. */
+.app-shell.dark .dictionary-popover .malim-entry { color: #d5ddda; }
+.app-shell.dark .dictionary-popover .malim-entry .bare h1 { color: #bdebe3 !important; }
+.app-shell.dark .dictionary-popover .malim-entry h2 { color: #9db3ad; border-color: #3a4542; }
+.app-shell.dark .dictionary-popover .malim-entry h3 { color: #93a19d; }
+.app-shell.dark .dictionary-popover .malim-entry .overview p { color: #93a19d; }
+.app-shell.dark .dictionary-popover .malim-entry .section.translations .tl { color: #ececec; }
+.app-shell.dark .dictionary-popover .malim-entry .section.translations .example, .app-shell.dark .dictionary-popover .malim-entry .section.translations .info, .app-shell.dark .dictionary-popover .malim-entry .sentence .tl, .app-shell.dark .dictionary-popover .malim-entry .relateds2 li span, .app-shell.dark .dictionary-popover .malim-entry .section.expressions .tl, .app-shell.dark .dictionary-popover .malim-entry .section.components .tl { color: #93a19d; }
+.app-shell.dark .dictionary-popover .malim-entry .sentence .ru, .app-shell.dark .dictionary-popover .malim-entry .section.expressions .ru, .app-shell.dark .dictionary-popover .malim-entry .section.components .ru, .app-shell.dark .dictionary-popover .malim-entry .section.usage .content { color: #d5ddda; }
+.app-shell.dark .dictionary-popover .malim-entry th { background: #2a3030 !important; }
+.app-shell.dark .dictionary-popover .malim-entry th, .app-shell.dark .dictionary-popover .malim-entry td { border-color: #3a4542 !important; }
+.app-shell.dark .dictionary-popover .malim-entry .pos { background: #1f3a36 !important; color: #8fe0d2 !important; }
+.app-shell.dark .dictionary-popover .malim-entry .example { background: #262c2b !important; }
+.app-shell.dark .dictionary-popover .malim-entry a { color: #7fd0c4 !important; }
+.app-shell.dark .dictionary-popover .malim-entry .meaning, .app-shell.dark .dictionary-popover .malim-entry .sense { border-color: #3f5651; }
+/* Structured (English etc.) entries. */
+.app-shell.dark .dictionary-head h3 { color: #7bd88f; }
+.app-shell.dark .dictionary-head span, .app-shell.dark .dictionary-forms > b { color: #93a19d; }
+.app-shell.dark .dictionary-pills span { background: #2a3030 !important; border-color: #3f5651 !important; color: #c8d6d2 !important; }
+.app-shell.dark .dictionary-senses { border-color: #3f5651; }
+.app-shell.dark .dictionary-senses h4 { color: #93a19d; }
+.app-shell.dark .dictionary-senses li::marker { color: #7fd0c4; }
