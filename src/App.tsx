@@ -1,4 +1,4 @@
-import { Component, FormEvent, ReactNode, TouchEvent, useEffect, useRef, useState } from "react";
+import { Component, FormEvent, ReactNode, TouchEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import { Bot, Check, ChevronsUpDown, CircleAlert, Copy, Edit3, LoaderCircle, LogOut, Menu, MessageSquare, PanelLeftClose, PanelLeftOpen, Search, Settings2, SquarePen, Trash2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -220,16 +220,59 @@ function ModelSelector({ conversation, providers, open, busy, onToggle, onChange
 
 function ConversationView({ conversation, messages, providers, searchEnabled, busy, compacting, theme, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; theme: "light" | "dark"; generation: GenerationSettings; onGenerationChange: (value: GenerationSettings) => void; onToggleSearch: () => void; onSend: (content: string) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
   const [input, setInput] = useState("");
-  const endRef = useRef<HTMLDivElement>(null);
+  const messageListRef = useRef<HTMLElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  useEffect(() => { endRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages.length, busy]);
+  const conversationIdRef = useRef<string | null>(null);
+  const initialContentLoadedRef = useRef(false);
+  const wasStreamingRef = useRef(false);
+  const atBottomRef = useRef(true);
+  const followResponseRef = useRef(true);
+  const isStreaming = messages.some((message) => message.status === "streaming");
+  useEffect(() => {
+    const node = messageListRef.current;
+    if (!node) return;
+    const updatePosition = () => {
+      const distanceFromBottom = node.scrollHeight - node.scrollTop - node.clientHeight;
+      atBottomRef.current = distanceFromBottom <= 24;
+      if (isStreaming) followResponseRef.current = atBottomRef.current;
+    };
+    updatePosition();
+    node.addEventListener("scroll", updatePosition, { passive: true });
+    return () => node.removeEventListener("scroll", updatePosition);
+  }, [conversation?.id, isStreaming]);
+  // Keep streamed responses pinned only while the reader remains at the bottom.
+  useLayoutEffect(() => {
+    const node = messageListRef.current;
+    if (!node) return;
+    if (conversationIdRef.current !== conversation?.id) {
+      conversationIdRef.current = conversation?.id ?? null;
+      initialContentLoadedRef.current = false;
+      wasStreamingRef.current = false;
+      atBottomRef.current = true;
+      followResponseRef.current = true;
+    }
+    if (!initialContentLoadedRef.current && messages.length > 0) {
+      node.scrollTop = node.scrollHeight;
+      initialContentLoadedRef.current = true;
+      atBottomRef.current = true;
+      followResponseRef.current = true;
+    }
+    if (isStreaming) {
+      if (!wasStreamingRef.current) followResponseRef.current = atBottomRef.current;
+      if (followResponseRef.current) {
+        node.scrollTop = node.scrollHeight;
+        atBottomRef.current = true;
+      }
+    }
+    wasStreamingRef.current = isStreaming;
+  }, [conversation?.id, isStreaming, messages]);
   useEffect(() => { const node = inputRef.current; if (!node) return; node.style.height = "auto"; node.style.height = `${Math.min(node.scrollHeight, 180)}px`; }, [input]);
   if (!conversation) return <section className="empty-state"><div className="empty-logo"><Bot size={34} /></div><h1>How can I help you today?</h1><p>Start a new conversation to work with your configured AI providers.</p></section>;
   const usage = Math.min(100, Math.round((conversation.context_tokens / conversation.context_window) * 100));
   const hasActiveProvider = providers.some((provider) => provider.id === conversation.model_provider_id && provider.models.some((item) => item.model === conversation.model));
   function send() { const text = input.trim(); if (!text || busy || !hasActiveProvider) return; setInput(""); void onSend(text); }
   function submit(event: FormEvent) { event.preventDefault(); send(); }
-  return <><section className="message-list">{messages.map((message, index) => <MessageBubble key={message.id} message={message} markdownEnabled={generation.enable_markdown} theme={theme} isLast={index === messages.length - 1} onEdit={onEdit} onDelete={onDelete} onRetry={onRetry} onLookup={onLookup} />)}<div ref={endRef} /></section><footer className="composer-wrap"><div className="context-meter"><span>Context {conversation.context_tokens.toLocaleString()} / {conversation.context_window.toLocaleString()} tokens</span><div><i style={{ width: `${usage}%` }} /></div><button type="button" disabled={compacting} onClick={() => void onCompact()} title="Compact previous context">{compacting ? <><LoaderCircle className="spin" size={12} />Compacting</> : "Compact"}</button></div><form className="composer" onSubmit={submit}><textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} placeholder={hasActiveProvider ? "Message malim_chat" : "Choose a model from the conversation header"} disabled={!hasActiveProvider || busy || compacting} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }} /><div className="composer-controls"><button type="button" className={searchEnabled ? "search-chip enabled" : "search-chip"} aria-pressed={searchEnabled} onClick={onToggleSearch}><Search size={14} />{searchEnabled ? "Web search on" : "Web search off"}</button><GenerationButton generation={generation} onChange={onGenerationChange} kind={providers.find((item) => item.id === conversation.model_provider_id)?.models.find((item) => item.model === conversation.model)?.kind} model={conversation.model ?? ""} /><button type="submit" className="send-button" aria-label="Send message" disabled={!input.trim() || busy || compacting || !hasActiveProvider}>{busy ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}</button></div></form><p className="disclaimer">AI responses may be inaccurate. Review important information.</p></footer></>;
+  return <><section ref={messageListRef} className="message-list">{messages.map((message, index) => <MessageBubble key={message.id} message={message} markdownEnabled={generation.enable_markdown} theme={theme} isLast={index === messages.length - 1} onEdit={onEdit} onDelete={onDelete} onRetry={onRetry} onLookup={onLookup} />)}</section><footer className="composer-wrap"><div className="context-meter"><span>Context {conversation.context_tokens.toLocaleString()} / {conversation.context_window.toLocaleString()} tokens</span><div><i style={{ width: `${usage}%` }} /></div><button type="button" disabled={compacting} onClick={() => void onCompact()} title="Compact previous context">{compacting ? <><LoaderCircle className="spin" size={12} />Compacting</> : "Compact"}</button></div><form className="composer" onSubmit={submit}><textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} placeholder={hasActiveProvider ? "Message malim_chat" : "Choose a model from the conversation header"} disabled={!hasActiveProvider || busy || compacting} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }} /><div className="composer-controls"><button type="button" className={searchEnabled ? "search-chip enabled" : "search-chip"} aria-pressed={searchEnabled} onClick={onToggleSearch}><Search size={14} />{searchEnabled ? "Web search on" : "Web search off"}</button><GenerationButton generation={generation} onChange={onGenerationChange} kind={providers.find((item) => item.id === conversation.model_provider_id)?.models.find((item) => item.model === conversation.model)?.kind} model={conversation.model ?? ""} /><button type="submit" className="send-button" aria-label="Send message" disabled={!input.trim() || busy || compacting || !hasActiveProvider}>{busy ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}</button></div></form><p className="disclaimer">AI responses may be inaccurate. Review important information.</p></footer></>;
 }
 
 function RightNavigator({ messages }: { messages: Message[] }) {
