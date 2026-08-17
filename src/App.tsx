@@ -295,9 +295,11 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
   const selectionCaptured = useRef(false);
   const longPressTimer = useRef<number | null>(null);
   const longPress = useRef<{ x: number; y: number } | null>(null);
+  const cancelLongPressScroll = useRef<(() => void) | null>(null);
   function cancelLongPress() {
     if (longPressTimer.current !== null) { window.clearTimeout(longPressTimer.current); longPressTimer.current = null; }
     longPress.current = null;
+    if (cancelLongPressScroll.current) { cancelLongPressScroll.current(); cancelLongPressScroll.current = null; }
   }
   function lookupAt(x: number, y: number) {
     const range = document.caretRangeFromPoint ? document.caretRangeFromPoint(x, y) : null;
@@ -321,18 +323,20 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
     cancelLongPress();
     const point = { x: touch.clientX, y: touch.clientY };
     longPress.current = point;
+    const onScroll = () => cancelLongPress();
+    window.addEventListener("scroll", onScroll, true);
+    cancelLongPressScroll.current = () => window.removeEventListener("scroll", onScroll, true);
     longPressTimer.current = window.setTimeout(() => {
-      if (!longPress.current) return;
       const target = longPress.current;
-      longPress.current = null;
-      longPressTimer.current = null;
+      if (!target) return;
+      cancelLongPress();
       lookupAt(target.x, target.y);
     }, 450);
   }
   function handleTouchMove(event: TouchEvent<HTMLDivElement>) {
     const point = longPress.current;
     const touch = event.touches[0];
-    if (point && touch && (Math.abs(touch.clientX - point.x) > 20 || Math.abs(touch.clientY - point.y) > 20)) cancelLongPress();
+    if (point && touch && (Math.abs(touch.clientX - point.x) > 10 || Math.abs(touch.clientY - point.y) > 10)) cancelLongPress();
   }
   function handleTouchEnd() { cancelLongPress(); }
   const selectionTimer = useRef<number | null>(null);
