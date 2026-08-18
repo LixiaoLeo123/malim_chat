@@ -147,6 +147,11 @@ function Chat() {
     try {
       sent = await api.createMessage(conversationId, content, mutationId, search);
       state.upsertMessage(conversationId, sent);
+      const list = useAppStore.getState().conversations;
+      if (list[0]?.id !== conversationId) {
+        const item = list.find((conversation) => conversation.id === conversationId);
+        if (item) state.setConversations([{ ...item, updated_at: now() }, ...list.filter((conversation) => conversation.id !== conversationId)]);
+      }
       pendingId = `assistant-${mutationId}`;
       state.upsertMessage(conversationId, { ...sent, id: pendingId, sequence: sent.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
       const answer = options.stream ? await api.respondStream(conversationId, sent.id, search, options, (event) => { const current = useAppStore.getState().messages[conversationId]?.find((item) => item.id === pendingId); if (current) state.upsertMessage(conversationId, event.type === "reasoning" ? { ...current, reasoning_content: current.reasoning_content + (event.delta ?? "") } : { ...current, content: current.content + (event.delta ?? "") }); }) : await api.respond(conversationId, sent.id, search, options);
