@@ -267,6 +267,7 @@ struct ProviderModel {
     kind: String,
     sort_order: i32,
     context_window: i32,
+    supports_images: bool,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
