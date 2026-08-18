@@ -1,6 +1,6 @@
 import { Component, FormEvent, ReactNode, TouchEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
 import DOMPurify from "dompurify";
-import { Bot, Check, ChevronsUpDown, CircleAlert, Copy, Edit3, LoaderCircle, LogOut, Menu, MessageSquare, PanelLeftClose, PanelLeftOpen, Search, Settings2, SquarePen, Trash2, X } from "lucide-react";
+import { Bot, Check, ChevronsUpDown, CircleAlert, Copy, Edit3, ImagePlus, LoaderCircle, LogOut, Menu, MessageSquare, PanelLeftClose, PanelLeftOpen, Search, Settings2, SquarePen, Trash2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -20,6 +20,20 @@ function uuid() {
   bytes[6] = (bytes[6] & 0x0f) | 0x40;
   bytes[8] = (bytes[8] & 0x3f) | 0x80;
   return [...bytes].map((value, index) => `${[4, 6, 8, 10].includes(index) ? "-" : ""}${value.toString(16).padStart(2, "0")}`).join("");
+}
+async function copyText(text: string) {
+  if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); }
+  else {
+    const area = document.createElement("textarea");
+    area.value = text;
+    area.setAttribute("readonly", "");
+    area.style.position = "fixed";
+    area.style.top = "-9999px";
+    document.body.appendChild(area);
+    area.select();
+    document.execCommand("copy");
+    area.remove();
+  }
 }
 
 export function App() {
@@ -137,15 +151,15 @@ function Chat() {
     window.clearTimeout(generationTimers.current[conversationId]);
     generationTimers.current[conversationId] = window.setTimeout(() => { void api.updateConversation(conversationId, { generation_settings: next }).catch((cause) => state.setError(cause instanceof Error ? cause.message : "Unable to save conversation parameters.")); }, 350);
   }
-  async function sendMessage(conversationId: string, content: string, search: boolean, options = generation) {
+  async function sendMessage(conversationId: string, content: string, search: boolean, options = generation, images: string[] = []) {
     const mutationId = uuid();
-    const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, reasoning_content: "", content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
+    const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, images, reasoning_content: "", content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
     let sent: Message | null = null;
     let pendingId: string | null = null;
     state.upsertMessage(conversationId, optimistic);
     state.setBusy(true);
     try {
-      sent = await api.createMessage(conversationId, content, mutationId, search);
+      sent = await api.createMessage(conversationId, content, mutationId, search, images);
       state.upsertMessage(conversationId, sent);
       const list = useAppStore.getState().conversations;
       if (list[0]?.id !== conversationId) {
@@ -161,7 +175,7 @@ function Chat() {
     } catch (cause) {
       if (pendingId) state.removeMessage(conversationId, pendingId);
       state.upsertMessage(conversationId, { ...(sent ?? optimistic), status: "error", optimistic: !sent, updated_at: now() });
-      state.upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true, retry_message_id: (sent ?? optimistic).id });
+      state.upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", images: [], reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true, retry_message_id: (sent ?? optimistic).id });
       state.setError(cause instanceof Error ? cause.message : "Message delivery failed.");
     } finally { state.setBusy(false); }
   }
@@ -169,7 +183,7 @@ function Chat() {
     if (!activeId) return;
     const target = message.retry_message_id ? (messages[activeId]?.find((item) => item.id === message.retry_message_id) ?? message) : message;
     if (message.retry_message_id) state.removeMessage(activeId, message.id);
-    if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled); return; }
+    if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled, generation, target.images ?? []); return; }
     const pendingId = `retry-${target.id}`;
     state.upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
     state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
@@ -202,7 +216,7 @@ function Chat() {
   }
 
   async function compactConversation() { if (!activeId || compacting) return; setCompacting(true); try { const result = await api.compact(activeId); state.upsertMessage(activeId, result.message); state.setConversations((await api.conversations()).items); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Compaction failed."); } finally { setCompacting(false); } }
-  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={state.setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); state.setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} onSettings={() => setProviderOpen(true)} onClose={() => state.setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={state.session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => state.setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => state.setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => state.setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content) => activeId ? sendMessage(activeId, content, searchEnabled) : Promise.resolve()} onEdit={editMessage} onDelete={deleteMessage} onRetry={retryMessage} onLookup={(word, anchor) => setLookup({ word, ...anchor })} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { state.setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); setLookup(null); }} />}</main>;
+  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={state.setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); state.setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} onSettings={() => setProviderOpen(true)} onClose={() => state.setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={state.session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => state.setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => state.setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => state.setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content, images) => activeId ? sendMessage(activeId, content, searchEnabled, generation, images ?? []) : Promise.resolve()} onEdit={editMessage} onDelete={deleteMessage} onRetry={retryMessage} onLookup={(word, anchor) => setLookup({ word, ...anchor })} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { state.setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); setLookup(null); }} />}</main>;
 }
 
 function Sidebar({ conversations, activeId, open, collapsed, onNew, onSelect, onRename, onSettings, onClose, onCollapse, userName, onSignOut }: { conversations: Conversation[]; activeId: string | null; open: boolean; collapsed: boolean; onNew: () => void; onSelect: (id: string) => void; onRename: (id: string, title: string) => Promise<void>; onSettings: () => void; onClose: () => void; onCollapse: () => void; userName: string; onSignOut: () => void }) {
@@ -223,10 +237,14 @@ function ModelSelector({ conversation, providers, open, busy, onToggle, onChange
   return <div className="model-selector"><button type="button" className="model-button" aria-expanded={open} onClick={onToggle}><span>{model || "Choose model"}</span><ChevronsUpDown size={15} /></button>{open && <div className="model-popover"><div className="model-picker-heading">Provider</div><div className="provider-options">{providers.map((provider) => <button type="button" key={provider.id} className={provider.id === providerId ? "selected" : ""} onClick={() => { setProviderId(provider.id); setModel(provider.models[0]?.model ?? ""); }}>{provider.name}</button>)}</div><div className="model-picker-heading">Model</div><div className="configured-models">{Object.entries(groups).map(([group, items]) => <section key={group}><h4>{group}</h4>{items.map((item) => <button type="button" key={item.id} className={item.model === model ? "selected" : ""} onClick={() => { setModel(item.model); void onChange(providerId, item.model); }}>{item.model}</button>)}</section>)}</div></div>}</div>;
 }
 
-function ConversationView({ conversation, messages, providers, searchEnabled, busy, compacting, theme, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; theme: "light" | "dark"; generation: GenerationSettings; onGenerationChange: (value: GenerationSettings) => void; onToggleSearch: () => void; onSend: (content: string) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
+function ConversationView({ conversation, messages, providers, searchEnabled, busy, compacting, theme, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; theme: "light" | "dark"; generation: GenerationSettings; onGenerationChange: (value: GenerationSettings) => void; onToggleSearch: () => void; onSend: (content: string, images?: string[]) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
   const [input, setInput] = useState("");
+  const [images, setImages] = useState<string[]>([]);
+  const [dragging, setDragging] = useState(false);
+  const [imageError, setImageError] = useState<string | null>(null);
   const messageListRef = useRef<HTMLElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const conversationIdRef = useRef<string | null>(null);
   const initialContentLoadedRef = useRef(false);
   const wasStreamingRef = useRef(false);
@@ -272,17 +290,43 @@ function ConversationView({ conversation, messages, providers, searchEnabled, bu
     wasStreamingRef.current = isStreaming;
   }, [conversation?.id, isStreaming, messages]);
   useEffect(() => { const node = inputRef.current; if (!node) return; node.style.height = "auto"; node.style.height = `${Math.min(node.scrollHeight, 180)}px`; }, [input]);
+  useEffect(() => { setImages([]); setImageError(null); setDragging(false); }, [conversation?.id]);
   if (!conversation) return <section className="empty-state"><div className="empty-logo"><Bot size={34} /></div><h1>How can I help you today?</h1><p>Start a new conversation to work with your configured AI providers.</p></section>;
   const usage = Math.min(100, Math.round((conversation.context_tokens / conversation.context_window) * 100));
   const hasActiveProvider = providers.some((provider) => provider.id === conversation.model_provider_id && provider.models.some((item) => item.model === conversation.model));
-  function send() { const text = input.trim(); if (!text || busy || !hasActiveProvider) return; setInput(""); void onSend(text); }
+  function addFiles(list: FileList | File[] | null) {
+    if (!list) return;
+    for (const file of Array.from(list)) {
+      if (!file.type.startsWith("image/")) { setImageError("Only image files can be attached."); continue; }
+      if (file.size > 5 * 1024 * 1024) { setImageError("Each image must be 5 MB or smaller."); continue; }
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result !== "string") return;
+        setImages((current) => {
+          if (current.length >= 8) { setImageError("A message can hold up to 8 images."); return current; }
+          setImageError(null);
+          return [...current, reader.result as string];
+        });
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+  function send() {
+    const text = input.trim();
+    if ((!text && images.length === 0) || busy || !hasActiveProvider) return;
+    const payload = images;
+    setInput("");
+    setImages([]);
+    setImageError(null);
+    void onSend(text, payload);
+  }
   function submit(event: FormEvent) { event.preventDefault(); send(); }
-  return <><section ref={messageListRef} className="message-list">{messages.map((message, index) => <MessageBubble key={message.id} message={message} markdownEnabled={generation.enable_markdown} theme={theme} isLast={index === messages.length - 1} onEdit={onEdit} onDelete={onDelete} onRetry={onRetry} onLookup={onLookup} />)}</section><footer className="composer-wrap"><div className="context-meter"><span>Context {conversation.context_tokens.toLocaleString()} / {conversation.context_window.toLocaleString()} tokens</span><div><i style={{ width: `${usage}%` }} /></div><button type="button" disabled={compacting} onClick={() => void onCompact()} title="Compact previous context">{compacting ? <><LoaderCircle className="spin" size={12} />Compacting</> : "Compact"}</button></div><form className="composer" onSubmit={submit}><textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} placeholder={hasActiveProvider ? "Message malim_chat" : "Choose a model from the conversation header"} disabled={!hasActiveProvider || busy || compacting} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }} /><div className="composer-controls"><button type="button" className={searchEnabled ? "search-chip enabled" : "search-chip"} aria-pressed={searchEnabled} onClick={onToggleSearch}><Search size={14} />{searchEnabled ? "Web search on" : "Web search off"}</button><GenerationButton generation={generation} onChange={onGenerationChange} kind={providers.find((item) => item.id === conversation.model_provider_id)?.models.find((item) => item.model === conversation.model)?.kind} model={conversation.model ?? ""} /><button type="submit" className="send-button" aria-label="Send message" disabled={!input.trim() || busy || compacting || !hasActiveProvider}>{busy ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}</button></div></form><p className="disclaimer">AI responses may be inaccurate. Review important information.</p></footer></>;
+  return <><section ref={messageListRef} className="message-list">{messages.map((message, index) => <MessageBubble key={message.id} message={message} markdownEnabled={generation.enable_markdown} theme={theme} isLast={index === messages.length - 1} onEdit={onEdit} onDelete={onDelete} onRetry={onRetry} onLookup={onLookup} />)}</section><footer className="composer-wrap"><div className="context-meter"><span>Context {conversation.context_tokens.toLocaleString()} / {conversation.context_window.toLocaleString()} tokens</span><div><i style={{ width: `${usage}%` }} /></div><button type="button" disabled={compacting} onClick={() => void onCompact()} title="Compact previous context">{compacting ? <><LoaderCircle className="spin" size={12} />Compacting</> : "Compact"}</button></div><form className={`composer ${dragging ? "dragging" : ""}`} onSubmit={submit} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); addFiles(event.dataTransfer.files); }}><input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={(event) => { addFiles(event.target.files); event.target.value = ""; }} />{images.length > 0 && <div className="image-previews">{images.map((src, index) => <div className="image-preview" key={`${index}-${src.slice(0, 40)}`}><img src={src} alt={`Attachment ${index + 1}`} /><button type="button" aria-label={`Remove image ${index + 1}`} title="Remove image" onClick={() => setImages(images.filter((_, item) => item !== index))}><X size={13} /></button></div>)}</div>}{imageError && <p className="image-error">{imageError}</p>}<textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} placeholder={hasActiveProvider ? "Message malim_chat" : "Choose a model from the conversation header"} disabled={!hasActiveProvider || busy || compacting} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }} /><div className="composer-controls"><button type="button" className="attach-button" aria-label="Attach images" title="Attach images" onClick={() => fileInputRef.current?.click()} disabled={!hasActiveProvider || busy || compacting}><ImagePlus size={17} /></button><button type="button" className={searchEnabled ? "search-chip enabled" : "search-chip"} aria-pressed={searchEnabled} onClick={onToggleSearch}><Search size={14} />{searchEnabled ? "Web search on" : "Web search off"}</button><GenerationButton generation={generation} onChange={onGenerationChange} kind={providers.find((item) => item.id === conversation.model_provider_id)?.models.find((item) => item.model === conversation.model)?.kind} model={conversation.model ?? ""} /><button type="submit" className="send-button" aria-label="Send message" disabled={(!input.trim() && images.length === 0) || busy || compacting || !hasActiveProvider}>{busy ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}</button></div></form><p className="disclaimer">AI responses may be inaccurate. Review important information.</p></footer></>;
 }
 
 function RightNavigator({ messages }: { messages: Message[] }) {
   const questions = messages.filter((message) => message.role === "user");
-  return <aside className="right-navigator" aria-label="Conversation navigation"><div className="right-nav-inner"><strong>In this chat</strong>{questions.length === 0 ? <span className="muted">No questions yet</span> : questions.map((message) => <button key={message.id} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}><span className="right-nav-label">{message.content}</span></button>)}</div></aside>;
+  return <aside className="right-navigator" aria-label="Conversation navigation"><div className="right-nav-inner"><strong>In this chat</strong>{questions.length === 0 ? <span className="muted">No questions yet</span> : questions.map((message) => <button key={message.id} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}><span className="right-nav-label">{message.content || "[Image]"}</span></button>)}</div></aside>;
 }
 
 function GenerationButton({ generation, onChange, kind, model }: { generation: GenerationSettings; onChange: (value: GenerationSettings) => void; kind?: ProviderKind; model: string }) {
@@ -335,6 +379,18 @@ function applyLookupHighlight(node: Node, start: number, end: number) {
 function clearLookupHighlight() {
   try { (CSS as unknown as { highlights?: { delete(name: string): void } }).highlights?.delete("dictionary-lookup"); } catch { /* noop */ }
 }
+function CodeBlock({ language, code, theme }: { language: string; code: string; theme: "light" | "dark" }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      await copyText(code);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch { /* clipboard unavailable */ }
+  }
+  return <div className="code-block"><div className="code-block-head"><span className="code-block-lang">{language}</span><button type="button" className={copied ? "code-copy copied" : "code-copy"} title={copied ? "Copied" : "Copy code"} onClick={() => void copy()}>{copied ? <Check size={13} /> : <Copy size={13} />}</button></div><SyntaxHighlighter language={language} style={theme === "dark" ? oneDark : oneLight} showLineNumbers wrapLongLines customStyle={{ margin: "0", background: "transparent", padding: "12px 0" }}>{code}</SyntaxHighlighter></div>;
+}
+
 function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDelete, onRetry, onLookup }: { message: Message; markdownEnabled: boolean; theme: "light" | "dark"; isLast: boolean; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(message.content);
@@ -409,20 +465,8 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
   }
   useEffect(() => { document.addEventListener("selectionchange", onSelectionChange); return () => { document.removeEventListener("selectionchange", onSelectionChange); if (selectionTimer.current !== null) window.clearTimeout(selectionTimer.current); }; }, []);
   async function copyContent() {
-    const text = content;
     try {
-      if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); }
-      else {
-        const area = document.createElement("textarea");
-        area.value = text;
-        area.setAttribute("readonly", "");
-        area.style.position = "fixed";
-        area.style.top = "-9999px";
-        document.body.appendChild(area);
-        area.select();
-        document.execCommand("copy");
-        area.remove();
-      }
+      await copyText(content);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1600);
     } catch { /* clipboard unavailable */ }
@@ -432,7 +476,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, onEdit, onDele
   const content = message.reasoning_content ? message.content : legacy.content;
   const reasoning = message.reasoning_content || legacy.reasoning;
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
-  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : content && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <SyntaxHighlighter language={language} style={theme === "dark" ? oneDark : oneLight} showLineNumbers wrapLongLines customStyle={{ margin: "0", background: "transparent", padding: "12px 0" }}>{source}</SyntaxHighlighter> : <code className={className} {...props}>{children}</code>; } }}>{preprocessLatex(content)}</ReactMarkdown> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" title="Delete" onClick={() => void onDelete(message)}><Trash2 size={14} /></button></div></div></article>;
+  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning && !message.images?.length ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <CodeBlock language={language} code={source} theme={theme} /> : <code className={className} {...props}>{children}</code>; } }}>{preprocessLatex(content)}</ReactMarkdown> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" title="Delete" onClick={() => void onDelete(message)}><Trash2 size={14} /></button></div></div></article>;
 }
 
 function splitLegacyThinking(value: string) {
@@ -448,15 +492,15 @@ function ProviderDialog({ providers, onClose, onChanged }: { providers: Provider
 }
 
 function ProviderModelsEditor({ provider, onChanged, onError }: { provider: Provider; onChanged: () => Promise<void>; onError: (value: string | null) => void }) {
-  const [group, setGroup] = useState("General"); const [model, setModel] = useState(""); const [kind, setKind] = useState<ProviderKind>("openai_compatible"); const [contextWindow, setContextWindow] = useState(128000); const [busy, setBusy] = useState(false);
-  async function add(event: FormEvent) { event.preventDefault(); setBusy(true); onError(null); try { await api.createProviderModel(provider.id, { group_name: group, model, kind, context_window: contextWindow }); setModel(""); await onChanged(); } catch (cause) { onError(cause instanceof Error ? cause.message : "Could not add model."); } finally { setBusy(false); } }
+  const [group, setGroup] = useState("General"); const [model, setModel] = useState(""); const [kind, setKind] = useState<ProviderKind>("openai_compatible"); const [contextWindow, setContextWindow] = useState(128000); const [vision, setVision] = useState(false); const [busy, setBusy] = useState(false);
+  async function add(event: FormEvent) { event.preventDefault(); setBusy(true); onError(null); try { await api.createProviderModel(provider.id, { group_name: group, model, kind, context_window: contextWindow, supports_images: vision }); setModel(""); setVision(false); await onChanged(); } catch (cause) { onError(cause instanceof Error ? cause.message : "Could not add model."); } finally { setBusy(false); } }
   const groups = provider.models.reduce<Record<string, ProviderModel[]>>((all, item) => { (all[item.group_name] ??= []).push(item); return all; }, {});
-  return <section className="provider-models"><h3>Configured models</h3>{Object.entries(groups).map(([label, items]) => <div className="model-group" key={label}><div className="model-group-head"><h4>{label}</h4><span>{items.length}</span></div>{items.map((item) => <ModelConfigRow key={item.id} providerId={provider.id} item={item} onChanged={onChanged} onError={onError} />)}</div>)}<form className="add-model" onSubmit={add}><input value={group} onChange={(event) => setGroup(event.target.value)} placeholder="Group" required /><input value={model} onChange={(event) => setModel(event.target.value)} placeholder="Model name" required /><div className="kind-toggle" role="radiogroup" aria-label="API format"><button type="button" role="radio" aria-checked={kind === "openai_compatible"} className={kind === "openai_compatible" ? "selected" : ""} onClick={() => setKind("openai_compatible")}>OpenAI</button><button type="button" role="radio" aria-checked={kind === "anthropic"} className={kind === "anthropic" ? "selected" : ""} onClick={() => setKind("anthropic")}>Anthropic</button></div><input value={contextWindow} type="number" min="4096" max="2000000" aria-label="Maximum context tokens" onChange={(event) => setContextWindow(Number(event.target.value))} /><button className="primary small" disabled={busy}>Add model</button></form></section>;
+  return <section className="provider-models"><h3>Configured models</h3>{Object.entries(groups).map(([label, items]) => <div className="model-group" key={label}><div className="model-group-head"><h4>{label}</h4><span>{items.length}</span></div>{items.map((item) => <ModelConfigRow key={item.id} providerId={provider.id} item={item} onChanged={onChanged} onError={onError} />)}</div>)}<form className="add-model" onSubmit={add}><input value={group} onChange={(event) => setGroup(event.target.value)} placeholder="Group" required /><input value={model} onChange={(event) => setModel(event.target.value)} placeholder="Model name" required /><div className="kind-toggle" role="radiogroup" aria-label="API format"><button type="button" role="radio" aria-checked={kind === "openai_compatible"} className={kind === "openai_compatible" ? "selected" : ""} onClick={() => setKind("openai_compatible")}>OpenAI</button><button type="button" role="radio" aria-checked={kind === "anthropic"} className={kind === "anthropic" ? "selected" : ""} onClick={() => setKind("anthropic")}>Anthropic</button></div><input value={contextWindow} type="number" min="4096" max="2000000" aria-label="Maximum context tokens" onChange={(event) => setContextWindow(Number(event.target.value))} /><label className="vision-toggle" title="This model can analyze images"><input type="checkbox" checked={vision} onChange={(event) => setVision(event.target.checked)} />Vision</label><button className="primary small" disabled={busy}>Add model</button></form></section>;
 }
 
 function ModelConfigRow({ providerId, item, onChanged, onError }: { providerId: string; item: ProviderModel; onChanged: () => Promise<void>; onError: (value: string | null) => void }) {
-  const [group, setGroup] = useState(item.group_name); const [model, setModel] = useState(item.model); const [kind, setKind] = useState<ProviderKind>(item.kind); const [contextWindow, setContextWindow] = useState(item.context_window);
-  return <div className="model-config-row"><input value={group} aria-label="Model group" onChange={(event) => setGroup(event.target.value)} /><input value={model} aria-label="Model name" onChange={(event) => setModel(event.target.value)} /><div className="kind-toggle" role="radiogroup" aria-label="API format"><button type="button" role="radio" aria-checked={kind === "openai_compatible"} className={kind === "openai_compatible" ? "selected" : ""} onClick={() => setKind("openai_compatible")}>OpenAI</button><button type="button" role="radio" aria-checked={kind === "anthropic"} className={kind === "anthropic" ? "selected" : ""} onClick={() => setKind("anthropic")}>Anthropic</button></div><input value={contextWindow} type="number" min="4096" max="2000000" aria-label="Maximum context tokens" onChange={(event) => setContextWindow(Number(event.target.value))} /><button type="button" className="text-button small" onClick={async () => { try { await api.updateProviderModel(providerId, item.id, { group_name: group, model, kind, context_window: contextWindow }); await onChanged(); } catch (cause) { onError(cause instanceof Error ? cause.message : "Could not update model."); } }}>Save</button><button type="button" className="icon-button danger" aria-label={`Delete ${item.model}`} onClick={async () => { try { await api.deleteProviderModel(providerId, item.id); await onChanged(); } catch (cause) { onError(cause instanceof Error ? cause.message : "Could not delete model."); } }}><Trash2 size={15} /></button></div>;
+  const [group, setGroup] = useState(item.group_name); const [model, setModel] = useState(item.model); const [kind, setKind] = useState<ProviderKind>(item.kind); const [contextWindow, setContextWindow] = useState(item.context_window); const [vision, setVision] = useState(item.supports_images);
+  return <div className="model-config-row"><input value={group} aria-label="Model group" onChange={(event) => setGroup(event.target.value)} /><input value={model} aria-label="Model name" onChange={(event) => setModel(event.target.value)} /><div className="kind-toggle" role="radiogroup" aria-label="API format"><button type="button" role="radio" aria-checked={kind === "openai_compatible"} className={kind === "openai_compatible" ? "selected" : ""} onClick={() => setKind("openai_compatible")}>OpenAI</button><button type="button" role="radio" aria-checked={kind === "anthropic"} className={kind === "anthropic" ? "selected" : ""} onClick={() => setKind("anthropic")}>Anthropic</button></div><input value={contextWindow} type="number" min="4096" max="2000000" aria-label="Maximum context tokens" onChange={(event) => setContextWindow(Number(event.target.value))} /><label className="vision-toggle" title="This model can analyze images"><input type="checkbox" checked={vision} onChange={(event) => setVision(event.target.checked)} />Vision</label><button type="button" className="text-button small" onClick={async () => { try { await api.updateProviderModel(providerId, item.id, { group_name: group, model, kind, context_window: contextWindow, supports_images: vision }); await onChanged(); } catch (cause) { onError(cause instanceof Error ? cause.message : "Could not update model."); } }}>Save</button><button type="button" className="icon-button danger" aria-label={`Delete ${item.model}`} onClick={async () => { try { await api.deleteProviderModel(providerId, item.id); await onChanged(); } catch (cause) { onError(cause instanceof Error ? cause.message : "Could not delete model."); } }}><Trash2 size={15} /></button></div>;
 }
 
 function DictionaryPopover({ word, anchor, onClose }: { word: string; anchor: { x: number; y: number }; onClose: () => void }) {

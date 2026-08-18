@@ -297,6 +297,7 @@ struct Message {
     model: Option<String>,
     token_count: i32,
     search_sources: Value,
+    images: Value,
     edited_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -348,6 +349,7 @@ struct ProviderModelRequest {
     kind: String,
     sort_order: Option<i32>,
     context_window: Option<i32>,
+    supports_images: Option<bool>,
 }
 #[derive(Deserialize)]
 struct UpdateProviderModelRequest {
@@ -356,12 +358,14 @@ struct UpdateProviderModelRequest {
     kind: Option<String>,
     sort_order: Option<i32>,
     context_window: Option<i32>,
+    supports_images: Option<bool>,
 }
 #[derive(Deserialize)]
 struct CreateMessage {
     content: String,
     client_mutation_id: Uuid,
     search: Option<bool>,
+    images: Option<Vec<String>>,
 }
 #[derive(Deserialize)]
 struct UpdateMessage {
@@ -482,6 +486,71 @@ fn decrypt(state: &AppState, encrypted: &[u8], nonce: &[u8]) -> Result<String, A
         .map_err(|_| ApiError::internal("stored credential could not be decrypted"))?;
     String::from_utf8(plain).map_err(|_| ApiError::internal("stored credential is invalid"))
 }
+
+fn estimate_image_tokens(images: &[String]) -> i32 {
+    images
+        .iter()
+        .map(|image| {
+            let bytes = image.split(',').last().map(|part| part.len()).unwrap_or(0);
+            (bytes / 1024).clamp(300, 2400) as i32
+        })
+        .sum()
+}
+
+fn parse_data_url(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (meta, data) = rest.split_once(',')?;
+    if !meta.starts_with("image/") || data.is_empty() {
+        return None;
+    }
+    Some((meta.split(';').next()?.to_string(), data.to_string()))
+}
+
+fn plain_text_content(content: &str, images: &[Value]) -> String {
+    if images.is_empty() {
+        return content.to_string();
+    }
+    let mut text = content.to_string();
+    for _ in images {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str("[Image attachment omitted: the selected model does not support image input.]");
+    }
+    text
+}
+
+fn content_part(kind: &str, supports_images: bool, content: &str, images: &[Value]) -> Value {
+    if images.is_empty() {
+        return json!(content);
+    }
+    if !supports_images {
+        return json!(plain_text_content(content, images));
+    }
+    let mut parts: Vec<Value> = Vec::new();
+    if !content.trim().is_empty() {
+        parts.push(json!({"type": "text", "text": content}));
+    }
+    for image in images {
+        if let Some((media_type, data)) = parse_data_url(image.as_str().unwrap_or("")) {
+            if kind == "anthropic" {
+                parts.push(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}));
+            } else {
+                parts.push(json!({"type": "image_url", "image_url": {"url": image}}));
+            }
+        } else {
+            parts.push(json!({"type": "text", "text": "[Image attachment omitted: invalid image data.]"}));
+        }
+    }
+    if parts.is_empty() {
+        return json!(content);
+    }
+    if kind == "anthropic" && !parts.iter().any(|part| part["type"] == "text") {
+        parts.insert(0, json!({"type": "text", "text": ""}));
+    }
+    json!(parts)
+}
+
 fn estimate_tokens(content: &str) -> i32 {
     ((content.chars().count() as f64 / 3.5).ceil() as i32).max(1)
 }
@@ -581,7 +650,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/search", get(search))
         .route("/v1/dictionary", get(dictionary_lookup))
         .route("/v1/sync", get(sync))
-        .layer(RequestBodyLimitLayer::new(1_048_576))
+        .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .layer(SetSensitiveRequestHeadersLayer::new(std::iter::once(
             http::header::AUTHORIZATION,
         )))
@@ -742,7 +811,7 @@ async fn create_provider(
 }
 
 async fn provider_with_models(pool: &PgPool, row: ProviderRow) -> Result<Provider, ApiError> {
-    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
+    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
         .bind(row.id).fetch_all(pool).await?;
     Ok(Provider { id: row.id, name: row.name, kind: row.kind, base_url: row.base_url, default_model: row.default_model, created_at: row.created_at, updated_at: row.updated_at, models })
 }
@@ -767,13 +836,18 @@ async fn provider_model_kind(pool: &PgPool, provider_id: Uuid, model: &str) -> R
         .bind(provider_id).bind(model).fetch_optional(pool).await?.map(|value| value.0))
 }
 
+async fn provider_model_supports_images(pool: &PgPool, provider_id: Uuid, model: &str) -> Result<Option<bool>, ApiError> {
+    Ok(sqlx::query_as::<_, (bool,)>("SELECT supports_images FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1")
+        .bind(provider_id).bind(model).fetch_optional(pool).await?.map(|value| value.0))
+}
+
 async fn create_provider_model(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>, Json(request): Json<ProviderModelRequest>) -> Result<Json<ProviderModel>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
     if request.group_name.trim().is_empty() || request.model.trim().is_empty() { return Err(ApiError::bad("Model group and model name are required.")); }
     if !matches!(request.kind.as_str(), "openai_compatible" | "anthropic") { return Err(ApiError::bad("Model API format must be OpenAI-compatible or Anthropic.")); }
-    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window) VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,created_at,updated_at")
-        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).fetch_one(&state.db).await?;
+    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at")
+        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).bind(request.supports_images.unwrap_or(false)).fetch_one(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
 }
@@ -784,8 +858,8 @@ async fn update_provider_model(State(state): State<AppState>, headers: HeaderMap
     if request.group_name.as_ref().is_some_and(|v| v.trim().is_empty()) || request.model.as_ref().is_some_and(|v| v.trim().is_empty()) { return Err(ApiError::bad("Model group and model name cannot be empty.")); }
     if request.kind.as_deref().is_some_and(|v| !matches!(v, "openai_compatible" | "anthropic")) { return Err(ApiError::bad("Model API format must be OpenAI-compatible or Anthropic.")); }
     let previous: (String,) = sqlx::query_as("SELECT model FROM provider_models WHERE id=$1 AND provider_id=$2").bind(model_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
-    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,created_at,updated_at")
-        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window),supports_images=COALESCE($8,supports_images) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at")
+        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).bind(request.supports_images).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2").bind(id).bind(previous.0).bind(&item.model).execute(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
@@ -943,7 +1017,7 @@ async fn list_messages(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
     let cursor = page.cursor.as_deref().and_then(|s| s.parse::<i64>().ok());
-    let mut rows=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR sequence < $2) ORDER BY sequence DESC LIMIT $3").bind(id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
+    let mut rows=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR sequence < $2) ORDER BY sequence DESC LIMIT $3").bind(id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
     let next = rows.get(limit as usize).map(|m| m.sequence.to_string());
     rows.truncate(limit as usize);
     rows.reverse();
@@ -961,19 +1035,34 @@ async fn create_message(
     let user_id = user_from_headers(&state, &headers)?;
     let c = own_conversation(&state.db, user_id, id).await?;
     let content = request.content.trim();
-    if content.is_empty() || content.len() > 200_000 {
-        return Err(ApiError::bad(
-            "Message must contain 1 to 200,000 characters.",
-        ));
+    let images = request.images.unwrap_or_default();
+    if images.len() > 8 {
+        return Err(ApiError::bad("A message may contain at most 8 images."));
+    }
+    for image in &images {
+        if !image.starts_with("data:image/") || image.len() > 7_000_000 {
+            return Err(ApiError::bad("Each image must be a data URL of at most 5 MB."));
+        }
+        if parse_data_url(image).is_none() {
+            return Err(ApiError::bad("Each image must be a valid base64 image data URL."));
+        }
+    }
+    if content.is_empty() && images.is_empty() {
+        return Err(ApiError::bad("Message must contain text or at least one image."));
+    }
+    if content.len() > 200_000 {
+        return Err(ApiError::bad("Message text must be at most 200,000 characters."));
     };
-    if let Some(existing)=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND client_mutation_id=$2").bind(id).bind(request.client_mutation_id).fetch_optional(&state.db).await? { return Ok(Json(existing)); }
+    if let Some(existing)=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND client_mutation_id=$2").bind(id).bind(request.client_mutation_id).fetch_optional(&state.db).await? { return Ok(Json(existing)); }
     let mut tx = state.db.begin().await?;
     let is_first_user_message: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id=$1 AND role='user' AND deleted_at IS NULL)").bind(id).fetch_one(&mut *tx).await?;
-    let (sequence, mut revision): (i64, i64) = sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1, revision").bind(id).bind(user_id).bind(estimate_tokens(content)).fetch_one(&mut *tx).await?;
-    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence).bind(request.client_mutation_id).bind(content).bind(estimate_tokens(content)).bind(if request.search.unwrap_or(false){json!([])}else{json!([])}).fetch_one(&mut *tx).await?;
+    let tokens = estimate_tokens(content) + estimate_image_tokens(&images);
+    let (sequence, mut revision): (i64, i64) = sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1, revision").bind(id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,images,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7,$8) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence).bind(request.client_mutation_id).bind(content).bind(json!(images)).bind(tokens).bind(if request.search.unwrap_or(false){json!([])}else{json!([])}).fetch_one(&mut *tx).await?;
     let mut title_changed = false;
     if is_first_user_message && c.title == "New chat" {
-        let title: String = content.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(40).collect();
+        let title_source = if content.is_empty() { "[Image]".to_string() } else { content.to_string() };
+        let title: String = title_source.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(40).collect();
         if !title.is_empty() {
             let updated: (i64,) = sqlx::query_as("UPDATE conversations SET title=$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING revision").bind(id).bind(user_id).bind(&title).fetch_one(&mut *tx).await?;
             revision = updated.0;
@@ -999,7 +1088,7 @@ async fn update_message(
     if content.is_empty() {
         return Err(ApiError::bad("Message cannot be empty."));
     }
-    let m:Message=sqlx::query_as("UPDATE messages SET content=$3,token_count=$4,edited_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(message_id).bind(id).bind(content).bind(estimate_tokens(content)).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let m:Message=sqlx::query_as("UPDATE messages SET content=$3,token_count=$4,edited_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(message_id).bind(id).bind(content).bind(estimate_tokens(content)).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     event(
         &state.db, user_id, "message", message_id, "updated", m.sequence,
     )
@@ -1029,31 +1118,47 @@ async fn respond(
 ) -> Result<Response, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let conversation = own_conversation(&state.db, user_id, id).await?;
-    let input:Message=sqlx::query_as("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at FROM messages WHERE id=$1 AND conversation_id=$2 AND role='user' AND deleted_at IS NULL").bind(request.message_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let input:Message=sqlx::query_as("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE id=$1 AND conversation_id=$2 AND role='user' AND deleted_at IS NULL").bind(request.message_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     let provider_id = conversation
         .model_provider_id
         .ok_or_else(|| ApiError::bad("Choose a provider before requesting a response."))?;
     let p:(String,String,String,Vec<u8>,Vec<u8>)=sqlx::query_as("SELECT kind,base_url,default_model,encrypted_api_key,key_nonce FROM providers WHERE id=$1 AND user_id=$2").bind(provider_id).bind(user_id).fetch_optional(&state.db).await?.ok_or_else(||ApiError::bad("The selected provider was removed."))?;
     let prior_summary: Option<(String, i64)> = sqlx::query_as("SELECT content,ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1").bind(id).fetch_optional(&state.db).await?;
-    let messages:Vec<(String,String)>=sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80").bind(id).bind(prior_summary.as_ref().map(|summary| summary.1).unwrap_or(0)).fetch_all(&state.db).await?;
-    let mut transcript: Vec<Value> = messages
-        .into_iter()
-        .rev()
-        .map(|(role, content)| json!({"role":role,"content":strip_thinking(&content)}))
-        .collect();
     let api_key = decrypt(&state, &p.3, &p.4)?;
     let model = match conversation.model.as_deref().filter(|value| !value.trim().is_empty()) {
         Some(value) => value.to_string(),
         None => provider_first_model(&state.db, provider_id).await?.unwrap_or_else(|| p.2.clone()),
     };
     let kind = provider_model_kind(&state.db, provider_id, &model).await?.unwrap_or_else(|| p.0.clone());
+    let supports_images = provider_model_supports_images(&state.db, provider_id, &model).await?.unwrap_or(false);
+    let messages:Vec<(String,String,Value)>=sqlx::query_as("SELECT role,content,images FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80").bind(id).bind(prior_summary.as_ref().map(|summary| summary.1).unwrap_or(0)).fetch_all(&state.db).await?;
+    let mut transcript: Vec<Value> = messages
+        .into_iter()
+        .rev()
+        .map(|(role, content, images)| {
+            let images = images.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            json!({"role":role,"content":content_part(&kind, supports_images, &strip_thinking(&content), images)})
+        })
+        .collect();
+    let plain_transcript: Vec<Value> = transcript
+        .iter()
+        .map(|message| {
+            let role = message["role"].as_str().unwrap_or("user").to_string();
+            let content = match &message["content"] {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n"),
+                _ => String::new(),
+            };
+            json!({"role": role, "content": content})
+        })
+        .collect();
     let explicit_search = content_requests_web_search(&input.content);
     let search_requested = request.search.unwrap_or(false) || explicit_search;
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
     let (sources, planner_returned_no_queries) = if search_requested && should_search_web(&input.content) {
         // Search is deliberately a two-call workflow: plan queries, collect sources,
         // then make the answering call below with those sources as context.
-        let queries = generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &transcript, &input.content).await?;
+        let queries = generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &plain_transcript, &input.content).await?;
         info!(conversation_id=%id, planned_queries=queries.len(), "search planner completed");
         let planner_returned_no_queries = queries.is_empty();
         let mut merged = Vec::new();
@@ -1095,7 +1200,7 @@ async fn persist_assistant_message(state: &AppState, conversation_id: Uuid, user
     let tokens = estimate_tokens(&answer);
     let mut tx = state.db.begin().await?;
     let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(conversation_id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
-    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,reasoning_content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8,$9) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(conversation_id).bind(seq.0).bind(answer).bind(reasoning).bind(if enable_markdown { "markdown" } else { "plain" }).bind(model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,reasoning_content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8,$9) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(conversation_id).bind(seq.0).bind(answer).bind(reasoning).bind(if enable_markdown { "markdown" } else { "plain" }).bind(model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     event(&state.db, user_id, "message", m.id, "created", seq.0).await?;
     let _ = auto_compact(&state.db, conversation_id).await;
@@ -1118,13 +1223,16 @@ async fn auto_compact(pool: &PgPool, conversation_id: Uuid) -> Result<(), ApiErr
     if end <= existing_end {
         return Ok(());
     }
-    let rows: Vec<(String, String)> = sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence > $2 AND sequence <= $3 AND deleted_at IS NULL ORDER BY sequence").bind(conversation_id).bind(existing_end).bind(end).fetch_all(pool).await?;
+    let rows: Vec<(String, String, Value)> = sqlx::query_as("SELECT role,content,images FROM messages WHERE conversation_id=$1 AND sequence > $2 AND sequence <= $3 AND deleted_at IS NULL ORDER BY sequence").bind(conversation_id).bind(existing_end).bind(end).fetch_all(pool).await?;
     if rows.is_empty() {
         return Ok(());
     }
     let compacted = rows
         .iter()
-        .map(|(role, content)| format!("{role}: {}", strip_thinking(content)))
+        .map(|(role, content, images)| {
+            let has_images = images.as_array().map(|items| !items.is_empty()).unwrap_or(false);
+            format!("{role}: {}{}", strip_thinking(content), if has_images { " [image attachments were present in this message]" } else { "" })
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let content = format!(
@@ -1159,13 +1267,16 @@ async fn compact(
     }
     let last:(i64,)=sqlx::query_as("SELECT COALESCE(MAX(sequence),0) FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL").bind(id).fetch_one(&state.db).await?;
     let end = request.through_sequence.unwrap_or(last.0);
-    let rows:Vec<(String,String)>=sqlx::query_as("SELECT role,content FROM messages WHERE conversation_id=$1 AND sequence <= $2 AND deleted_at IS NULL ORDER BY sequence").bind(id).bind(end).fetch_all(&state.db).await?;
+    let rows:Vec<(String,String,Value)>=sqlx::query_as("SELECT role,content,images FROM messages WHERE conversation_id=$1 AND sequence <= $2 AND deleted_at IS NULL ORDER BY sequence").bind(id).bind(end).fetch_all(&state.db).await?;
     if rows.is_empty() {
         return Err(ApiError::bad("There are no messages to compact."));
     }
     let source = rows
         .iter()
-        .map(|(role, content)| format!("{role}: {}", strip_thinking(content)))
+        .map(|(role, content, images)| {
+            let has_images = images.as_array().map(|items| !items.is_empty()).unwrap_or(false);
+            format!("{role}: {}{}", strip_thinking(content), if has_images { " [image attachments were present in this message]" } else { "" })
+        })
         .collect::<Vec<_>>()
         .join("\n");
     let prior: Option<(String, i64)> = sqlx::query_as("SELECT content,ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1").bind(id).fetch_optional(&state.db).await?;
@@ -1189,7 +1300,7 @@ async fn compact(
     sqlx::query("INSERT INTO conversation_summaries (id,conversation_id,starts_at_sequence,ends_at_sequence,content,token_count) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (conversation_id,starts_at_sequence,ends_at_sequence) DO UPDATE SET content=EXCLUDED.content,token_count=EXCLUDED.token_count").bind(summary_id).bind(id).bind(prior.as_ref().map(|item| item.1 + 1).unwrap_or(1)).bind(end).bind(&concise).bind(summary_tokens).execute(&mut *tx).await?;
     let sequence:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(summary_tokens).fetch_one(&mut *tx).await?;
     let marker = format!("Context compacted through message {end}. The conversation now uses a durable summary ({summary_tokens} estimated tokens).");
-    let message:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,token_count) VALUES ($1,$2,$3,'summary',$4,'plain',0) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence.0).bind(marker).fetch_one(&mut *tx).await?;
+    let message:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,token_count) VALUES ($1,$2,$3,'summary',$4,'plain',0) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence.0).bind(marker).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     event(&state.db, user_id, "message", message.id, "created", sequence.0).await?;
     info!(conversation_id=%id, through_sequence=end, summary_tokens, "manual compaction completed");
@@ -1794,7 +1905,7 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
 
 #[cfg(test)]
 mod tests {
-    use super::{is_valid_search_query, provider_stream_delta, split_thinking, strip_thinking, ThinkingStream};
+    use super::{content_part, is_valid_search_query, parse_data_url, plain_text_content, provider_stream_delta, split_thinking, strip_thinking, ThinkingStream};
 
     #[test]
     fn accepts_generic_planner_queries_without_topic_rules() {
@@ -1806,6 +1917,38 @@ mod tests {
     #[test]
     fn parses_openai_stream_delta() {
         assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"), Some("hello".into()));
+    }
+
+    #[test]
+    fn parses_image_data_urls() {
+        assert_eq!(parse_data_url("data:image/png;base64,AAAA"), Some(("image/png".into(), "AAAA".into())));
+        assert_eq!(parse_data_url("data:image/jpeg;base64,BBBB"), Some(("image/jpeg".into(), "BBBB".into())));
+        assert_eq!(parse_data_url("data:text/plain;base64,AAAA"), None);
+        assert_eq!(parse_data_url("data:image/png;base64,"), None);
+        assert_eq!(parse_data_url("https://example.com/a.png"), None);
+    }
+
+    #[test]
+    fn degrades_images_to_placeholder_when_model_has_no_vision() {
+        let images = vec![serde_json::json!("data:image/png;base64,AAAA")];
+        let content = content_part("openai_compatible", false, "describe this", &images);
+        assert!(content.as_str().unwrap().contains("does not support image input"));
+        let text = plain_text_content("describe this", &images);
+        assert!(text.contains("does not support image input"));
+        assert!(text.starts_with("describe this"));
+    }
+
+    #[test]
+    fn builds_multimodal_content_for_vision_models() {
+        let images = vec![serde_json::json!("data:image/png;base64,AAAA")];
+        let openai = content_part("openai_compatible", true, "describe this", &images);
+        assert_eq!(openai[0]["type"], "text");
+        assert_eq!(openai[1]["type"], "image_url");
+        assert_eq!(openai[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        let anthropic = content_part("anthropic", true, "describe this", &images);
+        assert_eq!(anthropic[1]["type"], "image");
+        assert_eq!(anthropic[1]["source"]["media_type"], "image/png");
+        assert_eq!(anthropic[1]["source"]["data"], "AAAA");
     }
 
     #[test]
