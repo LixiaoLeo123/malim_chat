@@ -200,19 +200,14 @@
 ::highlight(dictionary-lookup) { background-color: rgba(15, 118, 110, 0.28); }
 .app-shell.dark ::highlight(dictionary-lookup) { background-color: rgba(127, 208, 196, 0.32); }
 
-/* Code block copy button: revealed on hover/focus, matches message copy style. */
-.code-block { position: relative; margin: 0 0 .85em; border: 1px solid #dce5e2; border-radius: 6px; background: #f6f8f8; overflow: hidden; }
-.code-block-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 6px 4px 12px; border-bottom: 1px solid #e2e9e7; background: #eef3f2; }
-.code-block-lang { font-size: 11px; font-weight: 600; color: #64727a; text-transform: lowercase; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-.code-copy { display: grid; place-items: center; width: 26px; height: 24px; border: 0; border-radius: 4px; background: transparent; color: #68737c; opacity: 0; transition: opacity .16s ease, background-color .16s ease, color .16s ease; }
+/* Code block copy button: floats top-right, revealed on hover; code styling untouched. */
+.code-block { position: relative; }
+.code-copy { position: absolute; top: 4px; right: 6px; z-index: 2; display: grid; place-items: center; width: 26px; height: 24px; border: 0; border-radius: 4px; background: transparent; color: #68737c; opacity: 0; transition: opacity .16s ease, background-color .16s ease, color .16s ease; }
 .code-block:hover .code-copy, .code-copy:focus-visible, .code-copy.copied { opacity: 1; }
-.code-copy:hover { background: #dfe8e5; color: #1f2933; }
+.code-copy:hover { background: rgba(15, 23, 42, 0.08); color: #1f2933; }
 .code-copy.copied { color: #0f766e; }
-.app-shell.dark .code-block { background: #171717 !important; border-color: #3d3d3d !important; }
-.app-shell.dark .code-block-head { background: #232323 !important; border-color: #3d3d3d !important; }
-.app-shell.dark .code-block-lang { color: #9a9a9a !important; }
 .app-shell.dark .code-copy { color: #b6b6b6 !important; }
-.app-shell.dark .code-copy:hover { background: #303030 !important; color: #fff !important; }
+.app-shell.dark .code-copy:hover { background: rgba(255, 255, 255, 0.12) !important; color: #fff !important; }
 .app-shell.dark .code-copy.copied { color: #7bd88f !important; }
 @media (hover: none) { .code-copy { opacity: 1; } }
 
