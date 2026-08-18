@@ -167,7 +167,7 @@ function Chat() {
         if (item) state.setConversations([{ ...item, updated_at: now() }, ...list.filter((conversation) => conversation.id !== conversationId)]);
       }
       pendingId = `assistant-${mutationId}`;
-      state.upsertMessage(conversationId, { ...sent, id: pendingId, sequence: sent.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
+      state.upsertMessage(conversationId, { ...sent, id: pendingId, sequence: sent.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
       const answer = options.stream ? await api.respondStream(conversationId, sent.id, search, options, (event) => { const current = useAppStore.getState().messages[conversationId]?.find((item) => item.id === pendingId); if (current) state.upsertMessage(conversationId, event.type === "reasoning" ? { ...current, reasoning_content: current.reasoning_content + (event.delta ?? "") } : { ...current, content: current.content + (event.delta ?? "") }); }) : await api.respond(conversationId, sent.id, search, options);
       state.removeMessage(conversationId, pendingId);
       state.upsertMessage(conversationId, answer);
@@ -186,7 +186,7 @@ function Chat() {
     if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled, generation, target.images ?? []); return; }
     const pendingId = `retry-${target.id}`;
     state.upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
-    state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
+    state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
     state.setBusy(true);
     try {
       const answer = generation.stream ? await api.respondStream(activeId, target.id, searchEnabled, generation, (event) => { const current = useAppStore.getState().messages[activeId]?.find((item) => item.id === pendingId); if (current) state.upsertMessage(activeId, event.type === "reasoning" ? { ...current, reasoning_content: current.reasoning_content + (event.delta ?? "") } : { ...current, content: current.content + (event.delta ?? "") }); }) : await api.respond(activeId, target.id, searchEnabled, generation);
