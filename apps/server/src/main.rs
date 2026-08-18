@@ -1801,12 +1801,12 @@ async fn call_provider(
         // Anthropic uses a top-level system field. Dropping it made the search planner
         // and the final search-grounding instructions ineffective for Claude providers.
         let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":4096,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
+        let mut body = json!({"model":model,"max_tokens":64000,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
         if !system.is_empty() { body["system"] = json!(system); }
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         http.post(url).header("x-api-key",key).header("anthropic-version","2023-06-01").json(&body).send().await?
     } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":false});
+        let mut body = json!({"model":model,"max_tokens":32000,"messages":messages,"stream":false});
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
         http.post(url).bearer_auth(key).json(&body).send().await?
@@ -1829,12 +1829,12 @@ async fn call_provider_stream(http: &Client, kind: &str, base: &str, key: &str, 
     let url = match kind { "anthropic" => format!("{}/v1/messages", base.trim_end_matches('/')), _ => format!("{}/v1/chat/completions", base.trim_end_matches('/')) };
     let response = if kind == "anthropic" {
         let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":4096,"stream":true,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
+        let mut body = json!({"model":model,"max_tokens":64000,"stream":true,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
         if !system.is_empty() { body["system"] = json!(system); }
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         http.post(url).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body).send().await?
     } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":true});
+        let mut body = json!({"model":model,"max_tokens":32000,"messages":messages,"stream":true});
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
         http.post(url).bearer_auth(key).json(&body).send().await?

@@ -55,10 +55,10 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
 }
 
 type StreamEvent = { type: string; delta?: string; message?: Message | string };
-async function requestStream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void): Promise<Message> {
+async function requestStream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal): Promise<Message> {
   const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
-  const response = await fetch(`${apiBase}${path}`, { method: "POST", headers, body: JSON.stringify(payload) });
+  const response = await fetch(`${apiBase}${path}`, { method: "POST", headers, body: JSON.stringify(payload), signal });
   if (!response.ok || !response.body) { const body = await response.json().catch(() => null); throw new Error(body?.error?.message ?? `Request failed (${response.status})`); }
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
   while (true) {
@@ -94,7 +94,7 @@ export const api = {
   messages: (id: string, cursor?: string) => request<Page<Message>>(`/v1/conversations/${id}/messages?limit=50${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createMessage: (conversationId: string, content: string, mutationId: string, search: boolean, images: string[] = []) => request<Message>(`/v1/conversations/${conversationId}/messages`, { method: "POST", body: JSON.stringify({ content, client_mutation_id: mutationId, search, images }) }),
   respond: (conversationId: string, messageId: string, search: boolean, options?: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean; stream?: boolean }) => request<Message>(`/v1/conversations/${conversationId}/respond`, { method: "POST", body: JSON.stringify({ message_id: messageId, search, ...options }) }),
-  respondStream: (conversationId: string, messageId: string, search: boolean, options: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean }, onEvent: (event: StreamEvent) => void) => requestStream(`/v1/conversations/${conversationId}/respond`, { message_id: messageId, search, ...options, stream: true }, onEvent),
+  respondStream: (conversationId: string, messageId: string, search: boolean, options: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean }, onEvent: (event: StreamEvent) => void, signal?: AbortSignal) => requestStream(`/v1/conversations/${conversationId}/respond`, { message_id: messageId, search, ...options, stream: true }, onEvent, signal),
   updateMessage: (conversationId: string, messageId: string, content: string) => request<Message>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "PATCH", body: JSON.stringify({ content }) }),
   deleteMessage: (conversationId: string, messageId: string) => request<void>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "DELETE" }),
   compact: (conversationId: string, force = true) => request<{ compacted: boolean; message: Message; context_tokens: number }>(`/v1/conversations/${conversationId}/compact`, { method: "POST", body: JSON.stringify({ force }) }),

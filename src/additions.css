@@ -238,3 +238,4 @@
 
 /* Conversation favorites: star, collapsible section, and message model label in dark mode. */
 .app-shell.dark .section-toggle{color:#a8a8a8!important}.app-shell.dark .section-toggle:hover{color:#fff!important;background:#303030!important}.app-shell.dark .section-count{color:#6f6f6f!important}.app-shell.dark .row-action.star{color:#9c9c9c!important}.app-shell.dark .row-action.star.active{color:#e8b64c!important}.app-shell.dark .message-model{color:#7f7f7f!important}
+.app-shell.dark .send-button.stop{background:#c5453a!important}.app-shell.dark .send-button.stop:hover{background:#d0554a!important}
