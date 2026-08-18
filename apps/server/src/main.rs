@@ -279,6 +279,7 @@ struct Conversation {
     model: Option<String>,
     context_window: i32,
     context_tokens: i32,
+    is_favorite: bool,
     generation_settings: Value,
     revision: i64,
     created_at: DateTime<Utc>,
@@ -327,6 +328,7 @@ struct UpdateConversation {
     provider_id: Option<Uuid>,
     model: Option<String>,
     generation_settings: Option<GenerationSettings>,
+    is_favorite: Option<bool>,
 }
 #[derive(Deserialize, Serialize)]
 struct GenerationSettings {
@@ -569,7 +571,7 @@ async fn own_conversation(
     user_id: Uuid,
     id: Uuid,
 ) -> Result<Conversation, ApiError> {
-    sqlx::query_as::<_, Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at FROM conversations WHERE id=$1 AND user_id=$2 AND archived_at IS NULL").bind(id).bind(user_id).fetch_optional(pool).await?.ok_or_else(ApiError::not_found)
+    sqlx::query_as::<_, Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at FROM conversations WHERE id=$1 AND user_id=$2 AND archived_at IS NULL").bind(id).bind(user_id).fetch_optional(pool).await?.ok_or_else(ApiError::not_found)
 }
 async fn event(
     pool: &PgPool,
@@ -907,7 +909,7 @@ async fn list_conversations(
         .cursor
         .as_deref()
         .and_then(|s| s.parse::<DateTime<Utc>>().ok());
-    let rows=sqlx::query_as::<_,Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at FROM conversations WHERE user_id=$1 AND archived_at IS NULL AND ($2::timestamptz IS NULL OR updated_at < $2) ORDER BY updated_at DESC,id DESC LIMIT $3").bind(user_id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
+    let rows=sqlx::query_as::<_,Conversation>("SELECT id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at FROM conversations WHERE user_id=$1 AND archived_at IS NULL AND ($2::timestamptz IS NULL OR updated_at < $2) ORDER BY updated_at DESC,id DESC LIMIT $3").bind(user_id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
     let next = rows.get(limit as usize).map(|c| c.updated_at.to_rfc3339());
     Ok(Json(Page {
         items: rows.into_iter().take(limit as usize).collect(),
@@ -930,7 +932,7 @@ async fn create_conversation(
         let context_window: (i32,) = sqlx::query_as("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(pid).bind(&model).fetch_one(&state.db).await?;
         (Some(model), context_window.0)
     } else { (request.model, 128_000) };
-    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(context_window).fetch_one(&state.db).await?;
+    let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(context_window).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -975,7 +977,7 @@ async fn update_conversation(
             selected_context_window = Some(sqlx::query_as::<_, (i32,)>("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(provider_id).bind(model).fetch_one(&state.db).await?.0);
         }
     }
-    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),generation_settings=COALESCE($8,generation_settings),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,generation_settings,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).bind(generation_settings).fetch_one(&state.db).await?;
+    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),generation_settings=COALESCE($8,generation_settings),is_favorite=COALESCE($9,is_favorite),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).bind(generation_settings).bind(request.is_favorite).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -1077,6 +1079,15 @@ async fn create_message(
     }
     Ok(Json(m))
 }
+async fn recompute_context_tokens(pool: &PgPool, conversation_id: Uuid) -> Result<i32, ApiError> {
+    let tokens: i32 = sqlx::query_scalar(
+        "SELECT (COALESCE((SELECT token_count FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1),0) + COALESCE((SELECT SUM(token_count) FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL AND sequence > COALESCE((SELECT ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1),0)),0))::int4",
+    )
+    .bind(conversation_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(tokens)
+}
 async fn update_message(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1090,8 +1101,14 @@ async fn update_message(
         return Err(ApiError::bad("Message cannot be empty."));
     }
     let m:Message=sqlx::query_as("UPDATE messages SET content=$3,token_count=$4,edited_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(message_id).bind(id).bind(content).bind(estimate_tokens(content)).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let tokens = recompute_context_tokens(&state.db, id).await?;
+    let (revision,): (i64,) = sqlx::query_as("UPDATE conversations SET context_tokens=$2,revision=revision+1 WHERE id=$1 AND user_id=$3 RETURNING revision").bind(id).bind(tokens).bind(user_id).fetch_one(&state.db).await?;
     event(
         &state.db, user_id, "message", message_id, "updated", m.sequence,
+    )
+    .await?;
+    event(
+        &state.db, user_id, "conversation", id, "updated", revision,
     )
     .await?;
     Ok(Json(m))
@@ -1107,7 +1124,13 @@ async fn delete_message(
     if r.rows_affected() == 0 {
         return Err(ApiError::not_found());
     };
+    let tokens = recompute_context_tokens(&state.db, id).await?;
+    let (revision,): (i64,) = sqlx::query_as("UPDATE conversations SET context_tokens=$2,revision=revision+1 WHERE id=$1 AND user_id=$3 RETURNING revision").bind(id).bind(tokens).bind(user_id).fetch_one(&state.db).await?;
     event(&state.db, user_id, "message", message_id, "deleted", 0).await?;
+    event(
+        &state.db, user_id, "conversation", id, "updated", revision,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
