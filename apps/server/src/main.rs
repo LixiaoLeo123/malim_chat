@@ -11,7 +11,7 @@ use argon2::{
 use axum::{
     body::{Body, Bytes},
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -653,6 +653,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/search", get(search))
         .route("/v1/dictionary", get(dictionary_lookup))
         .route("/v1/sync", get(sync))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .layer(SetSensitiveRequestHeadersLayer::new(std::iter::once(
             http::header::AUTHORIZATION,

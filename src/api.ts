@@ -41,7 +41,7 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   const headers = new Headers(init.headers);
   headers.set("Content-Type", "application/json");
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
-  const response = await fetch(`${apiBase}${path}`, { ...init, headers });
+  const response = await safeFetch(`${apiBase}${path}`, { ...init, headers });
   if (response.status === 401 && session && retry) {
     const refreshed = await refreshSession();
     if (refreshed) return request<T>(path, init, false);
@@ -58,7 +58,7 @@ type StreamEvent = { type: string; delta?: string; message?: Message | string };
 async function requestStream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal): Promise<Message> {
   const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
-  const response = await fetch(`${apiBase}${path}`, { method: "POST", headers, body: JSON.stringify(payload), signal });
+  const response = await safeFetch(`${apiBase}${path}`, { method: "POST", headers, body: JSON.stringify(payload), signal });
   if (!response.ok || !response.body) { const body = await response.json().catch(() => null); throw new Error(body?.error?.message ?? `Request failed (${response.status})`); }
   const reader = response.body.getReader(); const decoder = new TextDecoder(); let buffer = "";
   while (true) {
@@ -75,6 +75,15 @@ async function requestStream(path: string, payload: unknown, onEvent: (event: St
     }
   }
   throw new Error("The response stream ended before it completed.");
+}
+
+async function safeFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  try {
+    return await fetch(url, init);
+  } catch (cause) {
+    if (cause instanceof DOMException && cause.name === "AbortError") throw cause;
+    throw new Error("Network error — please check your connection and try again.");
+  }
 }
 
 export const api = {
