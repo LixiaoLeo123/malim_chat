@@ -242,8 +242,7 @@
 
 /* Sidebar history: reserve the scrollbar gutter so hover never shifts the layout. */
 .sidebar{--sidebar-scrollbar-size:8px}
-.history-scroll{position:relative;flex:1;min-height:0;overflow:hidden}
-.history{position:absolute;top:0;right:calc(var(--sidebar-scrollbar-size) * -1);bottom:0;left:0;height:100%;min-height:0;overflow-y:auto}
+.history{overflow-y:overlay !important;scrollbar-gutter:auto !important;right:0 !important;left:0 !important;top:0 !important;bottom:0 !important;position:relative !important;width:100% !important}
 .history::-webkit-scrollbar{width:8px;height:8px}
 .history::-webkit-scrollbar-track{background:transparent}
 .history::-webkit-scrollbar-thumb{background:#cdd3d1;border-radius:4px}
