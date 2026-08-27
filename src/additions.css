@@ -241,7 +241,7 @@
 .app-shell.dark .send-button.stop{background:#c5453a!important}.app-shell.dark .send-button.stop:hover{background:#d0554a!important}
 
 /* Sidebar history: reserve the scrollbar gutter so hover never shifts the layout. */
-.history{scrollbar-width:thin;scrollbar-gutter:stable}
+.history{--sidebar-scrollbar-size:8px;scrollbar-width:thin;padding-right:var(--sidebar-scrollbar-size);margin-right:calc(var(--sidebar-scrollbar-size) * -1)}
 .history::-webkit-scrollbar{width:8px;height:8px}
 .history::-webkit-scrollbar-track{background:transparent}
 .history::-webkit-scrollbar-thumb{background:#cdd3d1;border-radius:4px}
@@ -249,14 +249,10 @@
 .app-shell.dark .history::-webkit-scrollbar-thumb{background:#4a4a4a!important}
 .app-shell.dark .history::-webkit-scrollbar-thumb:hover{background:#5c5c5c!important}
 
-/* Conversation row delete: two-step confirm with visible feedback. */
-.row-action.delete{display:inline-flex;align-items:center;gap:5px;max-width:31px;overflow:hidden;white-space:nowrap;padding-left:8px;padding-right:8px;transition:max-width .18s ease,background-color .18s ease,color .18s ease}
-.row-action.delete .delete-label{font-size:11px;font-weight:600;opacity:0;transition:opacity .12s ease .05s}
-.row-action.delete.armed{max-width:96px;visibility:visible;background:#d9534f;color:#fff}
-.row-action.delete.armed:hover{background:#c2443f;color:#fff}
-.row-action.delete.armed .delete-label{opacity:1}
-.app-shell.dark .row-action.delete.armed{background:#c2443f!important;color:#fff!important}
-.app-shell.dark .row-action.delete.armed:hover{background:#d0554a!important;color:#fff!important}
+/* Message delete: two-step confirm with visible feedback. */
+.message-tools button.delete{background:#d9534f;color:#fff;border-radius:5px;padding:4px}
+.message-tools button.delete.armed{min-width:77px;height:25px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#fff}
+.message-tools button.delete.armed::after{content:"Delete?";margin-left:3px}
 
 /* Touch devices: keep rename/delete reachable without hover. */
 @media (hover: none) and (pointer: coarse) {
