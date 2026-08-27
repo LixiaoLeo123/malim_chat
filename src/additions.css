@@ -243,12 +243,8 @@
 /* Sidebar history: reserve the scrollbar gutter so hover never shifts the layout. */
 .sidebar{--sidebar-scrollbar-size:8px}
 .history{overflow-y:overlay !important;scrollbar-gutter:auto !important;right:0 !important;left:0 !important;top:0 !important;bottom:0 !important;position:relative !important;width:100% !important}
-.history::-webkit-scrollbar{width:8px;height:8px}
-.history::-webkit-scrollbar-track{background:transparent}
-.history::-webkit-scrollbar-thumb{background:#cdd3d1;border-radius:4px}
-.history::-webkit-scrollbar-thumb:hover{background:#b0b8b5}
-.app-shell.dark .history::-webkit-scrollbar-thumb{background:#4a4a4a!important}
-.app-shell.dark .history::-webkit-scrollbar-thumb:hover{background:#5c5c5c!important}
+.history{scrollbar-width:none !important}
+.history::-webkit-scrollbar{display:none !important}
 
 /* Message delete: two-step confirm with visible feedback. */
 .message-tools button.delete{border-radius:4px;padding:4px;color:#5e6b74}
