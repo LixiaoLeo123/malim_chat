@@ -241,7 +241,9 @@
 .app-shell.dark .send-button.stop{background:#c5453a!important}.app-shell.dark .send-button.stop:hover{background:#d0554a!important}
 
 /* Sidebar history: reserve the scrollbar gutter so hover never shifts the layout. */
-.history{--sidebar-scrollbar-size:8px;scrollbar-width:thin;padding-right:var(--sidebar-scrollbar-size);margin-right:calc(var(--sidebar-scrollbar-size) * -1)}
+.sidebar{--sidebar-scrollbar-size:8px}
+.history{scrollbar-gutter:stable}
+.history-inner{margin-right:calc(var(--sidebar-scrollbar-size) * -1);padding-right:0}
 .history::-webkit-scrollbar{width:8px;height:8px}
 .history::-webkit-scrollbar-track{background:transparent}
 .history::-webkit-scrollbar-thumb{background:#cdd3d1;border-radius:4px}
@@ -250,9 +252,13 @@
 .app-shell.dark .history::-webkit-scrollbar-thumb:hover{background:#5c5c5c!important}
 
 /* Message delete: two-step confirm with visible feedback. */
-.message-tools button.delete{background:#d9534f;color:#fff;border-radius:5px;padding:4px}
-.message-tools button.delete.armed{min-width:77px;height:25px;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:600;color:#fff}
-.message-tools button.delete.armed::after{content:"Delete?";margin-left:3px}
+.message-tools button.delete{border-radius:4px;padding:4px;color:#5e6b74}
+.message-tools button.delete:hover{color:#38444c;background:#edf1ef}
+.message-tools button.delete.armed{padding-inline:7px;gap:4px;color:#43302d;background:#efe3de}
+.message-tools button.delete.armed::after{content:"Confirm";font-size:11.5px;font-weight:600;line-height:1}
+.app-shell.dark .message-tools button.delete{color:#95a09e}
+.app-shell.dark .message-tools button.delete:hover{background:#2e3534;color:#d5dad8}
+.app-shell.dark .message-tools button.delete.armed{background:#41312e;color:#e9dedb}
 
 /* Touch devices: keep rename/delete reachable without hover. */
 @media (hover: none) and (pointer: coarse) {
