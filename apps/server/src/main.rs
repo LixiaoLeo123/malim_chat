@@ -346,6 +346,12 @@ struct ProviderRequest {
     default_model: Option<String>,
 }
 #[derive(Deserialize)]
+struct UpdateProviderRequest {
+    name: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+}
+#[derive(Deserialize)]
 struct ProviderModelRequest {
     group_name: String,
     model: String,
@@ -627,7 +633,7 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/me", get(me))
         .route("/v1/providers", get(list_providers).post(create_provider))
-        .route("/v1/providers/{id}", delete(delete_provider))
+        .route("/v1/providers/{id}", patch(update_provider).delete(delete_provider))
         .route("/v1/providers/{id}/models", post(create_provider_model))
         .route("/v1/providers/{id}/models/{model_id}", patch(update_provider_model).delete(delete_provider_model))
         .route(
@@ -811,6 +817,34 @@ async fn create_provider(
     tx.commit().await?;
     let provider = provider_with_models(&state.db, row).await?;
     event(&state.db, user_id, "provider", provider.id, "created", 1).await?;
+    Ok(Json(provider))
+}
+async fn update_provider(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpdateProviderRequest>,
+) -> Result<Json<Provider>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let current = own_provider(&state.db, user_id, id).await?;
+    let name = request.name.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).unwrap_or(current.name);
+    let base_url = request.base_url.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(|value| value.trim_end_matches('/').to_string()).unwrap_or(current.base_url);
+    if !base_url.starts_with("https://") {
+        return Err(ApiError::bad("Provider base URL must use HTTPS."));
+    }
+    let (ciphertext, nonce): (Option<Vec<u8>>, Option<Vec<u8>>) = match request.api_key.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        Some(key) => { let (ciphertext, nonce) = encrypt(&state, key)?; (Some(ciphertext), Some(nonce)) }
+        None => (None, None),
+    };
+    let row: ProviderRow = if let (Some(ciphertext), Some(nonce)) = (ciphertext, nonce) {
+        sqlx::query_as("UPDATE providers SET name=$3, base_url=$4, encrypted_api_key=$5, key_nonce=$6 WHERE id=$1 AND user_id=$2 RETURNING id,name,kind,base_url,default_model,created_at,updated_at")
+            .bind(id).bind(user_id).bind(name).bind(base_url).bind(ciphertext).bind(nonce).fetch_one(&state.db).await?
+    } else {
+        sqlx::query_as("UPDATE providers SET name=$3, base_url=$4 WHERE id=$1 AND user_id=$2 RETURNING id,name,kind,base_url,default_model,created_at,updated_at")
+            .bind(id).bind(user_id).bind(name).bind(base_url).fetch_one(&state.db).await?
+    };
+    let provider = provider_with_models(&state.db, row).await?;
+    event(&state.db, user_id, "provider", provider.id, "updated", 1).await?;
     Ok(Json(provider))
 }
 

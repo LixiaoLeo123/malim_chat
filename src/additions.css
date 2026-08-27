@@ -239,3 +239,26 @@
 /* Conversation favorites: star, collapsible section, and message model label in dark mode. */
 .app-shell.dark .section-toggle{color:#a8a8a8!important}.app-shell.dark .section-toggle:hover{color:#fff!important;background:#303030!important}.app-shell.dark .section-count{color:#6f6f6f!important}.app-shell.dark .row-action.star{color:#9c9c9c!important}.app-shell.dark .row-action.star.active{color:#e8b64c!important}.app-shell.dark .message-model{color:#7f7f7f!important}
 .app-shell.dark .send-button.stop{background:#c5453a!important}.app-shell.dark .send-button.stop:hover{background:#d0554a!important}
+
+/* Sidebar history: reserve the scrollbar gutter so hover never shifts the layout. */
+.history{scrollbar-width:thin;scrollbar-gutter:stable}
+.history::-webkit-scrollbar{width:8px;height:8px}
+.history::-webkit-scrollbar-track{background:transparent}
+.history::-webkit-scrollbar-thumb{background:#cdd3d1;border-radius:4px}
+.history::-webkit-scrollbar-thumb:hover{background:#b0b8b5}
+.app-shell.dark .history::-webkit-scrollbar-thumb{background:#4a4a4a!important}
+.app-shell.dark .history::-webkit-scrollbar-thumb:hover{background:#5c5c5c!important}
+
+/* Conversation row delete: two-step confirm with visible feedback. */
+.row-action.delete{display:inline-flex;align-items:center;gap:5px;max-width:31px;overflow:hidden;white-space:nowrap;padding-left:8px;padding-right:8px;transition:max-width .18s ease,background-color .18s ease,color .18s ease}
+.row-action.delete .delete-label{font-size:11px;font-weight:600;opacity:0;transition:opacity .12s ease .05s}
+.row-action.delete.armed{max-width:96px;visibility:visible;background:#d9534f;color:#fff}
+.row-action.delete.armed:hover{background:#c2443f;color:#fff}
+.row-action.delete.armed .delete-label{opacity:1}
+.app-shell.dark .row-action.delete.armed{background:#c2443f!important;color:#fff!important}
+.app-shell.dark .row-action.delete.armed:hover{background:#d0554a!important;color:#fff!important}
+
+/* Touch devices: keep rename/delete reachable without hover. */
+@media (hover: none) and (pointer: coarse) {
+  .conversation-row .row-action{visibility:visible}
+}

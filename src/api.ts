@@ -92,6 +92,7 @@ export const api = {
   me: () => request<User>("/v1/me"),
   providers: () => request<Provider[]>("/v1/providers"),
   createProvider: (payload: { name: string; base_url: string; api_key: string }) => request<Provider>("/v1/providers", { method: "POST", body: JSON.stringify(payload) }),
+  updateProvider: (id: string, payload: { name?: string; base_url?: string; api_key?: string }) => request<Provider>(`/v1/providers/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
   deleteProvider: (id: string) => request<void>(`/v1/providers/${id}`, { method: "DELETE" }),
   createProviderModel: (providerId: string, payload: { group_name: string; model: string; kind: ProviderKind; sort_order?: number; context_window?: number; supports_images?: boolean }) => request<ProviderModel>(`/v1/providers/${providerId}/models`, { method: "POST", body: JSON.stringify(payload) }),
   updateProviderModel: (providerId: string, modelId: string, payload: { group_name?: string; model?: string; kind?: ProviderKind; sort_order?: number; context_window?: number; supports_images?: boolean }) => request<ProviderModel>(`/v1/providers/${providerId}/models/${modelId}`, { method: "PATCH", body: JSON.stringify(payload) }),
