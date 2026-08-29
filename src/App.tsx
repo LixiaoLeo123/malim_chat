@@ -1,4 +1,4 @@
-import { ClipboardEvent, Component, FormEvent, ReactNode, TouchEvent, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { ClipboardEvent, Component, FormEvent, memo, ReactNode, TouchEvent, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import DOMPurify from "dompurify";
 import { Bot, Check, ChevronDown, ChevronsUpDown, CircleAlert, Copy, Edit3, ImagePlus, LoaderCircle, LogOut, Menu, MessageSquare, PanelLeftClose, PanelLeftOpen, Search, Settings2, Square, SquarePen, Star, Trash2, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -91,6 +91,10 @@ function Chat() {
   const [compacting, setCompacting] = useState(false);
   const [streaming, setStreaming] = useState(false);
   const streamAbort = useRef<AbortController | null>(null);
+  const [conversationCursor, setConversationCursor] = useState<string | null>(null);
+  const [loadingConversations, setLoadingConversations] = useState(false);
+  const [messageCursors, setMessageCursors] = useState<Record<string, string | null>>({});
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const activeConversation = activeId ? conversations.find((item) => item.id === activeId) ?? null : null;
 
   useEffect(() => { void bootstrap(); }, []);
@@ -109,13 +113,39 @@ function Chat() {
     try {
       const [chats, configured] = await Promise.all([api.conversations(), api.providers()]);
       state.setConversations(chats.items);
+      setConversationCursor(chats.next_cursor);
       state.setProviders(configured);
       if (!useAppStore.getState().activeId && chats.items[0]) state.setActiveId(chats.items[0].id);
     } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load your workspace."); }
   }
   async function loadMessages(id: string) {
-    try { state.setMessages(id, (await api.messages(id)).items); }
+    try {
+      const page = await api.messages(id);
+      state.setMessages(id, page.items);
+      setMessageCursors((current) => ({ ...current, [id]: page.next_cursor }));
+    }
     catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load messages."); }
+  }
+  const loadMoreConversations = useCallback(async function loadMoreConversations() {
+    if (!conversationCursor || loadingConversations) return;
+    setLoadingConversations(true);
+    try {
+      const page = await api.conversations(conversationCursor);
+      state.appendConversations(page.items);
+      setConversationCursor(page.next_cursor);
+    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load conversations."); }
+    finally { setLoadingConversations(false); }
+  }, [conversationCursor, loadingConversations]);
+  async function loadOlderMessages(id: string) {
+    const cursor = messageCursors[id];
+    if (!cursor || loadingOlder) return;
+    setLoadingOlder(true);
+    try {
+      const page = await api.messages(id, cursor);
+      state.prependMessages(id, page.items);
+      setMessageCursors((current) => ({ ...current, [id]: page.next_cursor }));
+    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load older messages."); }
+    finally { setLoadingOlder(false); }
   }
   async function newChat() {
     if (!providers.length) { setProviderOpen(true); state.setError("Add a provider before creating a chat."); return; }
@@ -161,6 +191,8 @@ function Chat() {
     const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, images, reasoning_content: "", content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
     let sent: Message | null = null;
     let pendingId: string | null = null;
+    let streamedContent = "";
+    let streamedReasoning = "";
     const controller = options.stream ? beginStream() : null;
     state.upsertMessage(conversationId, optimistic);
     state.setBusy(true);
@@ -173,11 +205,16 @@ function Chat() {
         if (item) state.setConversations([{ ...item, updated_at: now() }, ...list.filter((conversation) => conversation.id !== conversationId)]);
       }
       pendingId = `assistant-${mutationId}`;
+      const streamingBase = sent;
+      const streamingId = pendingId;
+      const streamingSequence = sent.sequence + 0.5;
       state.upsertMessage(conversationId, { ...sent, id: pendingId, sequence: sent.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
-      const answer = options.stream ? await api.respondStream(conversationId, sent.id, search, options, (event) => { const current = useAppStore.getState().messages[conversationId]?.find((item) => item.id === pendingId); if (current) state.upsertMessage(conversationId, event.type === "reasoning" ? { ...current, reasoning_content: current.reasoning_content + (event.delta ?? "") } : { ...current, content: current.content + (event.delta ?? "") }); }, controller?.signal) : await api.respond(conversationId, sent.id, search, options);
+      const answer = options.stream ? await api.respondStream(conversationId, sent.id, search, options, (event) => { if (event.type === "reasoning") streamedReasoning += event.delta ?? ""; else streamedContent += event.delta ?? ""; state.upsertMessage(conversationId, { ...streamingBase, id: streamingId, sequence: streamingSequence, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [] }); }, controller?.signal) : await api.respond(conversationId, sent.id, search, options);
       state.removeMessage(conversationId, pendingId);
       state.upsertMessage(conversationId, answer);
-      state.setConversations((await api.conversations()).items);
+      const chats = await api.conversations();
+      state.setConversations(chats.items);
+      setConversationCursor(chats.next_cursor);
     } catch (cause) {
       if (pendingId) state.removeMessage(conversationId, pendingId);
       if ((cause as Error)?.name === "AbortError") return;
@@ -186,18 +223,23 @@ function Chat() {
       state.setError(cause instanceof Error ? cause.message : "Message delivery failed.");
     } finally { state.setBusy(false); if (controller) endStream(); }
   }
+  const handleEditMessage = useCallback(editMessage, [activeId]);
+  const handleDeleteMessage = useCallback(deleteMessage, [activeId]);
+  const handleRetryMessage = useCallback(retryMessage, [activeId, searchEnabled, generation]);
   async function retryMessage(message: Message) {
     if (!activeId) return;
-    const target = message.retry_message_id ? (messages[activeId]?.find((item) => item.id === message.retry_message_id) ?? message) : message;
+    const target = message.retry_message_id ? (useAppStore.getState().messages[activeId]?.find((item) => item.id === message.retry_message_id) ?? message) : message;
     if (message.retry_message_id) state.removeMessage(activeId, message.id);
     if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled, generation, target.images ?? []); return; }
     const pendingId = `retry-${target.id}`;
+    let streamedContent = "";
+    let streamedReasoning = "";
     state.upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
     state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
     const controller = generation.stream ? beginStream() : null;
     state.setBusy(true);
     try {
-      const answer = generation.stream ? await api.respondStream(activeId, target.id, searchEnabled, generation, (event) => { const current = useAppStore.getState().messages[activeId]?.find((item) => item.id === pendingId); if (current) state.upsertMessage(activeId, event.type === "reasoning" ? { ...current, reasoning_content: current.reasoning_content + (event.delta ?? "") } : { ...current, content: current.content + (event.delta ?? "") }); }, controller?.signal) : await api.respond(activeId, target.id, searchEnabled, generation);
+      const answer = generation.stream ? await api.respondStream(activeId, target.id, searchEnabled, generation, (event) => { if (event.type === "reasoning") streamedReasoning += event.delta ?? ""; else streamedContent += event.delta ?? ""; state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [] }); }, controller?.signal) : await api.respond(activeId, target.id, searchEnabled, generation);
       state.removeMessage(activeId, pendingId);
       state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() });
       state.upsertMessage(activeId, answer);
@@ -210,30 +252,52 @@ function Chat() {
   }
   async function editMessage(message: Message, content: string) {
     if (!activeId) return;
-    const before = messages[activeId] ?? [];
+    const before = useAppStore.getState().messages[activeId] ?? [];
     state.upsertMessage(activeId, { ...message, content });
-    try { state.upsertMessage(activeId, await api.updateMessage(activeId, message.id, content)); state.setConversations((await api.conversations()).items); }
+    try {
+      state.upsertMessage(activeId, await api.updateMessage(activeId, message.id, content));
+      const chats = await api.conversations();
+      state.setConversations(chats.items);
+      setConversationCursor(chats.next_cursor);
+    }
     catch (cause) { state.setMessages(activeId, before); state.setError(cause instanceof Error ? cause.message : "Could not edit message."); }
   }
   async function deleteMessage(message: Message) {
     if (!activeId) return;
-    const before = messages[activeId] ?? [];
+    const before = useAppStore.getState().messages[activeId] ?? [];
     state.removeMessage(activeId, message.id);
     if (message.optimistic || message.id.startsWith("local-") || message.id.startsWith("error-") || message.id.startsWith("assistant-") || message.id.startsWith("retry-")) return;
-    try { await api.deleteMessage(activeId, message.id); state.setConversations((await api.conversations()).items); }
+    try {
+      await api.deleteMessage(activeId, message.id);
+      const chats = await api.conversations();
+      state.setConversations(chats.items);
+      setConversationCursor(chats.next_cursor);
+    }
     catch (cause) { state.setMessages(activeId, before); state.setError(cause instanceof Error ? cause.message : "Could not delete message."); }
   }
 
-  async function toggleFavorite(id: string) {
+  const toggleFavorite = useCallback(async function toggleFavorite(id: string) {
     const before = useAppStore.getState().conversations;
     const item = before.find((conversation) => conversation.id === id);
     if (!item) return;
     state.setConversations(before.map((conversation) => conversation.id === id ? { ...conversation, is_favorite: !conversation.is_favorite } : conversation));
     try { const updated = await api.updateConversation(id, { is_favorite: !item.is_favorite }); state.setConversations(useAppStore.getState().conversations.map((conversation) => conversation.id === id ? updated : conversation)); }
     catch (cause) { state.setConversations(before); state.setError(cause instanceof Error ? cause.message : "Unable to update favorite."); }
+  }, []);
+  async function compactConversation() {
+    if (!activeId || compacting) return;
+    setCompacting(true);
+    try {
+      const result = await api.compact(activeId);
+      state.upsertMessage(activeId, result.message);
+      const chats = await api.conversations();
+      state.setConversations(chats.items);
+      setConversationCursor(chats.next_cursor);
+    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Compaction failed."); } finally { setCompacting(false); }
   }
-  async function compactConversation() { if (!activeId || compacting) return; setCompacting(true); try { const result = await api.compact(activeId); state.upsertMessage(activeId, result.message); state.setConversations((await api.conversations()).items); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Compaction failed."); } finally { setCompacting(false); } }
-  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={state.setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); state.setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} onToggleFavorite={toggleFavorite} onSettings={() => setProviderOpen(true)} onClose={() => state.setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={state.session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => state.setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => state.setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => state.setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} lookupActive={lookup !== null} streaming={streaming} onStop={stopStreaming} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content, images) => activeId ? sendMessage(activeId, content, searchEnabled, generation, images ?? []) : Promise.resolve()} onEdit={editMessage} onDelete={deleteMessage} onRetry={retryMessage} onLookup={(word, anchor) => setLookup({ word, ...anchor })} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { state.setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); setLookup(null); }} />}</main>;
+
+  const handleLookup = useCallback((word: string, anchor: { x: number; y: number }) => setLookup({ word, ...anchor }), []);
+  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={state.setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); state.setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} hasMore={conversationCursor !== null} loadingMore={loadingConversations} onLoadMore={loadMoreConversations} onToggleFavorite={toggleFavorite} onSettings={() => setProviderOpen(true)} onClose={() => state.setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={state.session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => state.setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => state.setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => state.setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} hasOlder={Boolean(activeId && messageCursors[activeId])} loadingOlder={loadingOlder} onLoadOlder={loadOlderMessages} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} lookupActive={lookup !== null} streaming={streaming} onStop={stopStreaming} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content, images) => activeId ? sendMessage(activeId, content, searchEnabled, generation, images ?? []) : Promise.resolve()} onEdit={handleEditMessage} onDelete={handleDeleteMessage} onRetry={handleRetryMessage} onLookup={handleLookup} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { state.setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); setLookup(null); }} />}</main>;
 }
 
 function useFlip(ref: { current: HTMLElement | null }, deps: unknown[]) {
@@ -258,19 +322,36 @@ function useFlip(ref: { current: HTMLElement | null }, deps: unknown[]) {
     requestAnimationFrame(() => { moved.forEach((node) => { node.style.transition = "transform 300ms cubic-bezier(.2,.7,.2,1)"; node.style.transform = ""; }); const clear = (event: TransitionEvent) => { const target = event.target as HTMLElement; target.style.transition = ""; target.style.transform = ""; target.removeEventListener("transitionend", clear); }; moved.forEach((node) => node.addEventListener("transitionend", clear)); });
   }, deps);
 }
-function Sidebar({ conversations, activeId, open, collapsed, onNew, onSelect, onRename, onToggleFavorite, onSettings, onClose, onCollapse, userName, onSignOut }: { conversations: Conversation[]; activeId: string | null; open: boolean; collapsed: boolean; onNew: () => void; onSelect: (id: string) => void; onRename: (id: string, title: string) => Promise<void>; onToggleFavorite: (id: string) => void; onSettings: () => void; onClose: () => void; onCollapse: () => void; userName: string; onSignOut: () => void }) {
-  const [renamingId, setRenamingId] = useState<string | null>(null);
-  const [draft, setDraft] = useState("");
+function ConversationRow({ conversation, active, onSelect, onRename, onToggleFavorite }: { conversation: Conversation; active: boolean; onSelect: (id: string) => void; onRename: (id: string, title: string) => Promise<void>; onToggleFavorite: (id: string) => void }) {
+  const [renaming, setRenaming] = useState(false);
+  const [draft, setDraft] = useState(conversation.title);
+  async function finishRename() {
+    const title = draft.trim();
+    if (title) await onRename(conversation.id, title);
+    setRenaming(false);
+  }
+  return <div className={`conversation-row ${active ? "selected" : ""}`} data-flip-id={conversation.id}>{renaming ? <form className="conversation-rename" onSubmit={(event) => { event.preventDefault(); void finishRename(); }}><input autoFocus value={draft} maxLength={160} onChange={(event) => setDraft(event.target.value)} onBlur={() => void finishRename()} /></form> : <button type="button" onClick={() => onSelect(conversation.id)}><MessageSquare size={16} /><span>{conversation.title}</span></button>}<button type="button" className="row-action" aria-label={`Rename ${conversation.title}`} title="Rename conversation" onMouseDown={(event) => event.preventDefault()} onClick={() => { setDraft(conversation.title); setRenaming(true); }}><Edit3 size={15} /></button><button type="button" className={`row-action star ${conversation.is_favorite ? "active" : ""}`} aria-label={conversation.is_favorite ? "Remove from favorites" : "Add to favorites"} title={conversation.is_favorite ? "Remove from favorites" : "Add to favorites"} onMouseDown={(event) => event.preventDefault()} onClick={() => onToggleFavorite(conversation.id)}><Star size={15} fill={conversation.is_favorite ? "currentColor" : "none" } /></button></div>;
+}
+const MemoConversationRow = memo(ConversationRow, (previous, next) => previous.conversation === next.conversation && previous.active === next.active);
+
+function Sidebar({ conversations, activeId, open, collapsed, hasMore, loadingMore, onLoadMore, onNew, onSelect, onRename, onToggleFavorite, onSettings, onClose, onCollapse, userName, onSignOut }: { conversations: Conversation[]; activeId: string | null; open: boolean; collapsed: boolean; hasMore: boolean; loadingMore: boolean; onLoadMore: () => Promise<void>; onNew: () => void; onSelect: (id: string) => void; onRename: (id: string, title: string) => Promise<void>; onToggleFavorite: (id: string) => void; onSettings: () => void; onClose: () => void; onCollapse: () => void; userName: string; onSignOut: () => void }) {
   const [favoritesCollapsed, setFavoritesCollapsed] = useState(() => localStorage.getItem("malim-favorites-collapsed") === "1");
   const historyRef = useRef<HTMLDivElement | null>(null);
-  const favorites = conversations.filter((conversation) => conversation.is_favorite);
-  const recent = conversations.filter((conversation) => !conversation.is_favorite);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
+  const favorites = useMemo(() => conversations.filter((conversation) => conversation.is_favorite), [conversations]);
+  const recent = useMemo(() => conversations.filter((conversation) => !conversation.is_favorite), [conversations]);
   useEffect(() => { localStorage.setItem("malim-favorites-collapsed", favoritesCollapsed ? "1" : "0"); }, [favoritesCollapsed]);
-  useFlip(historyRef, [conversations.map((conversation) => conversation.id).join(",")]);
-  function startRename(conversation: Conversation) { setRenamingId(conversation.id); setDraft(conversation.title); }
-  async function finishRename(id: string) { const title = draft.trim(); if (title) await onRename(id, title); setRenamingId(null); }
-  function row(conversation: Conversation) { return <div className={`conversation-row ${conversation.id === activeId ? "selected" : ""}`} key={conversation.id} data-flip-id={conversation.id}>{renamingId === conversation.id ? <form className="conversation-rename" onSubmit={(event) => { event.preventDefault(); void finishRename(conversation.id); }}><input autoFocus value={draft} maxLength={160} onChange={(event) => setDraft(event.target.value)} onBlur={() => void finishRename(conversation.id)} /></form> : <button type="button" onClick={() => onSelect(conversation.id)}><MessageSquare size={16} /><span>{conversation.title}</span></button>}<button type="button" className="row-action" aria-label={`Rename ${conversation.title}`} title="Rename conversation" onMouseDown={(event) => event.preventDefault()} onClick={() => startRename(conversation)}><Edit3 size={15} /></button><button type="button" className={`row-action star ${conversation.is_favorite ? "active" : ""}`} aria-label={conversation.is_favorite ? "Remove from favorites" : "Add to favorites"} title={conversation.is_favorite ? "Remove from favorites" : "Add to favorites"} onMouseDown={(event) => event.preventDefault()} onClick={() => onToggleFavorite(conversation.id)}><Star size={15} fill={conversation.is_favorite ? "currentColor" : "none"} /></button></div>; }
-  return <aside className={`sidebar ${open ? "open" : ""} ${collapsed ? "collapsed" : ""}`}><div className="sidebar-top"><div className="wordmark"><Bot size={20} /><span>malim_chat</span></div><button className="icon-button desktop-only" aria-label="Collapse navigation" onClick={onCollapse}><PanelLeftClose size={19} /></button><button className="icon-button mobile-only" aria-label="Close navigation" onClick={onClose}><X size={19} /></button></div><button className="new-chat" type="button" onClick={onNew}><SquarePen size={17} />New chat</button><nav aria-label="Conversation history" className="history" ref={historyRef}>{favorites.length > 0 && <><div className="favorites-head"><button type="button" className="section-toggle" aria-expanded={!favoritesCollapsed} onClick={() => setFavoritesCollapsed(!favoritesCollapsed)}><ChevronDown size={14} className={favoritesCollapsed ? "collapsed" : ""} /><span>Starred</span><span className="section-count">{favorites.length}</span></button></div><div className={`favorites-body ${favoritesCollapsed ? "collapsed" : ""}`}><div className="favorites-inner">{favorites.map(row)}</div></div></>}<p>{favorites.length > 0 ? "Recent" : "Conversations"}</p>{recent.map(row)}</nav><div className="sidebar-bottom"><button className="settings-button" type="button" onClick={onSettings}><Settings2 size={17} />Providers & settings</button><div className="account-row"><div className="avatar">{userName.slice(0, 1).toUpperCase()}</div><span>{userName}</span><button type="button" className="row-action" aria-label="Sign out" title="Sign out" onClick={onSignOut}><LogOut size={17} /></button></div></div></aside>;
+  const conversationOrder = useMemo(() => conversations.map((conversation) => conversation.id).join(","), [conversations]);
+  useFlip(historyRef, [conversationOrder]);
+  useEffect(() => {
+    const node = loadMoreRef.current;
+    if (!node || !hasMore || loadingMore) return;
+    const observer = new IntersectionObserver((entries) => { if (entries.some((entry) => entry.isIntersecting)) void onLoadMore(); }, { root: historyRef.current, rootMargin: "240px" });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [favorites.length, hasMore, loadingMore, onLoadMore, recent.length]);
+  const row = (conversation: Conversation) => <MemoConversationRow key={conversation.id} conversation={conversation} active={conversation.id === activeId} onSelect={onSelect} onRename={onRename} onToggleFavorite={onToggleFavorite} />;
+  return <aside className={`sidebar ${open ? "open" : ""} ${collapsed ? "collapsed" : ""}`}><div className="sidebar-top"><div className="wordmark"><Bot size={20} /><span>malim_chat</span></div><button className="icon-button desktop-only" aria-label="Collapse navigation" onClick={onCollapse}><PanelLeftClose size={19} /></button><button className="icon-button mobile-only" aria-label="Close navigation" onClick={onClose}><X size={19} /></button></div><button className="new-chat" type="button" onClick={onNew}><SquarePen size={17} />New chat</button><nav aria-label="Conversation history" className="history" ref={historyRef}>{favorites.length > 0 && <><div className="favorites-head"><button type="button" className="section-toggle" aria-expanded={!favoritesCollapsed} onClick={() => setFavoritesCollapsed(!favoritesCollapsed)}><ChevronDown size={14} className={favoritesCollapsed ? "collapsed" : ""} /><span>Starred</span><span className="section-count">{favorites.length}</span></button></div><div className={`favorites-body ${favoritesCollapsed ? "collapsed" : ""}`}><div className="favorites-inner">{favorites.map(row)}</div></div></>}<p>{favorites.length > 0 ? "Recent" : "Conversations"}</p>{recent.map(row)}<div ref={loadMoreRef} className="sidebar-loader">{loadingMore && <LoaderCircle className="spin" size={15} />}</div></nav><div className="sidebar-bottom"><button className="settings-button" type="button" onClick={onSettings}><Settings2 size={17} />Providers & settings</button><div className="account-row"><div className="avatar">{userName.slice(0, 1).toUpperCase()}</div><span>{userName}</span><button type="button" className="row-action" aria-label="Sign out" title="Sign out" onClick={onSignOut}><LogOut size={17} /></button></div></div></aside>;
 }
 
 function ModelSelector({ conversation, providers, open, busy, onToggle, onChange }: { conversation: Conversation; providers: Provider[]; open: boolean; busy: boolean; onToggle: () => void; onChange: (providerId: string, model: string) => Promise<void> }) {
@@ -283,7 +364,7 @@ function ModelSelector({ conversation, providers, open, busy, onToggle, onChange
   return <div className="model-selector"><button type="button" className="model-button" aria-expanded={open} onClick={onToggle}><span>{model || "Choose model"}</span><ChevronsUpDown size={15} /></button>{open && <div className="model-popover"><div className="model-picker-heading">Provider</div><div className="provider-options">{providers.map((provider) => <button type="button" key={provider.id} className={provider.id === providerId ? "selected" : ""} onClick={() => { setProviderId(provider.id); setModel(provider.models[0]?.model ?? ""); }}>{provider.name}</button>)}</div><div className="model-picker-heading">Model</div><div className="configured-models">{Object.entries(groups).map(([group, items]) => <section key={group}><h4>{group}</h4>{items.map((item) => <button type="button" key={item.id} className={item.model === model ? "selected" : ""} onClick={() => { setModel(item.model); void onChange(providerId, item.model); }}>{item.model}</button>)}</section>)}</div></div>}</div>;
 }
 
-function ConversationView({ conversation, messages, providers, searchEnabled, busy, compacting, theme, lookupActive, streaming, onStop, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; theme: "light" | "dark"; lookupActive: boolean; streaming: boolean; onStop: () => void; generation: GenerationSettings; onGenerationChange: (value: GenerationSettings) => void; onToggleSearch: () => void; onSend: (content: string, images?: string[]) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
+function ConversationView({ conversation, messages, hasOlder, loadingOlder, onLoadOlder, providers, searchEnabled, busy, compacting, theme, lookupActive, streaming, onStop, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; hasOlder: boolean; loadingOlder: boolean; onLoadOlder: (id: string) => Promise<void>; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; theme: "light" | "dark"; lookupActive: boolean; streaming: boolean; onStop: () => void; generation: GenerationSettings; onGenerationChange: (value: GenerationSettings) => void; onToggleSearch: () => void; onSend: (content: string, images?: string[]) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
   const [input, setInput] = useState("");
   const [images, setImages] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
@@ -296,7 +377,7 @@ function ConversationView({ conversation, messages, providers, searchEnabled, bu
   const wasStreamingRef = useRef(false);
   const atBottomRef = useRef(true);
   const followResponseRef = useRef(true);
-  const isStreaming = messages.some((message) => message.status === "streaming");
+  const isStreaming = useMemo(() => messages.some((message) => message.status === "streaming"), [messages]);
   useEffect(() => {
     const node = messageListRef.current;
     if (!node) return;
@@ -375,13 +456,33 @@ function ConversationView({ conversation, messages, providers, searchEnabled, bu
     void onSend(text, payload);
   }
   function submit(event: FormEvent) { event.preventDefault(); send(); }
-  return <><section ref={messageListRef} className="message-list">{messages.map((message, index) => <MessageBubble key={message.id} message={message} markdownEnabled={generation.enable_markdown} theme={theme} isLast={index === messages.length - 1} lookupActive={lookupActive} onEdit={onEdit} onDelete={onDelete} onRetry={onRetry} onLookup={onLookup} />)}</section><footer className="composer-wrap"><div className="context-meter"><span>Context {conversation.context_tokens.toLocaleString()} / {conversation.context_window.toLocaleString()} tokens</span><div><i style={{ width: `${usage}%` }} /></div><button type="button" disabled={compacting} onClick={() => void onCompact()} title="Compact previous context">{compacting ? <><LoaderCircle className="spin" size={12} />Compacting</> : "Compact"}</button></div><form className={`composer ${dragging ? "dragging" : ""}`} onSubmit={submit} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); addFiles(event.dataTransfer.files); }}><input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={(event) => { addFiles(event.target.files); event.target.value = ""; }} />{images.length > 0 && <div className="image-previews">{images.map((src, index) => <div className="image-preview" key={`${index}-${src.slice(0, 40)}`}><img src={src} alt={`Attachment ${index + 1}`} /><button type="button" aria-label={`Remove image ${index + 1}`} title="Remove image" onClick={() => setImages(images.filter((_, item) => item !== index))}><X size={13} /></button></div>)}</div>}{imageError && <p className="image-error">{imageError}</p>}<textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} placeholder={hasActiveProvider ? "Message malim_chat" : "Choose a model from the conversation header"} disabled={!hasActiveProvider || busy || compacting} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }} onPaste={handlePaste} /><div className="composer-controls"><button type="button" className="attach-button" aria-label="Attach images" title="Attach images" onClick={() => fileInputRef.current?.click()} disabled={!hasActiveProvider || busy || compacting}><ImagePlus size={17} /></button><button type="button" className={searchEnabled ? "search-chip enabled" : "search-chip"} aria-pressed={searchEnabled} onClick={onToggleSearch}><Search size={14} />{searchEnabled ? "Web search on" : "Web search off"}</button><GenerationButton generation={generation} onChange={onGenerationChange} kind={providers.find((item) => item.id === conversation.model_provider_id)?.models.find((item) => item.model === conversation.model)?.kind} model={conversation.model ?? ""} /><button type={streaming ? "button" : "submit"} className={`send-button${streaming ? " stop" : ""}`} aria-label={streaming ? "Stop generating" : "Send message"} title={streaming ? "Stop generating" : "Send"} onClick={streaming ? (event) => { event.preventDefault(); onStop(); } : undefined} disabled={!streaming && ((!input.trim() && images.length === 0) || busy || compacting || !hasActiveProvider)}>{streaming ? <Square size={17} /> : busy ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}</button></div></form><p className="disclaimer">AI responses may be inaccurate. Review important information.</p></footer></>;
+  return <><section ref={messageListRef} className="message-list">{hasOlder && <button className="load-older" type="button" disabled={loadingOlder} onClick={() => conversation && void onLoadOlder(conversation.id)}>{loadingOlder ? "Loading older..." : "Load older messages"}</button>}{messages.map((message, index) => <MemoMessageBubble key={message.id} message={message} markdownEnabled={generation.enable_markdown} theme={theme} isLast={index === messages.length - 1} lookupActive={lookupActive} onEdit={onEdit} onDelete={onDelete} onRetry={onRetry} onLookup={onLookup} />)}</section><footer className="composer-wrap"><div className="context-meter"><span>Context {conversation.context_tokens.toLocaleString()} / {conversation.context_window.toLocaleString()} tokens</span><div><i style={{ width: `${usage}%` }} /></div><button type="button" disabled={compacting} onClick={() => void onCompact()} title="Compact previous context">{compacting ? <><LoaderCircle className="spin" size={12} />Compacting</> : "Compact"}</button></div><form className={`composer ${dragging ? "dragging" : ""}`} onSubmit={submit} onDragOver={(event) => { event.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={(event) => { event.preventDefault(); setDragging(false); addFiles(event.dataTransfer.files); }}><input ref={fileInputRef} type="file" accept="image/*" multiple hidden onChange={(event) => { addFiles(event.target.files); event.target.value = ""; }} />{images.length > 0 && <div className="image-previews">{images.map((src, index) => <div className="image-preview" key={`${index}-${src.slice(0, 40)}`}><img src={src} alt={`Attachment ${index + 1}`} /><button type="button" aria-label={`Remove image ${index + 1}`} title="Remove image" onClick={() => setImages(images.filter((_, item) => item !== index))}><X size={13} /></button></div>)}</div>}{imageError && <p className="image-error">{imageError}</p>}<textarea ref={inputRef} value={input} onChange={(event) => setInput(event.target.value)} placeholder={hasActiveProvider ? "Message malim_chat" : "Choose a model from the conversation header"} disabled={!hasActiveProvider || busy || compacting} rows={1} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); send(); } }} onPaste={handlePaste} /><div className="composer-controls"><button type="button" className="attach-button" aria-label="Attach images" title="Attach images" onClick={() => fileInputRef.current?.click()} disabled={!hasActiveProvider || busy || compacting}><ImagePlus size={17} /></button><button type="button" className={searchEnabled ? "search-chip enabled" : "search-chip"} aria-pressed={searchEnabled} onClick={onToggleSearch}><Search size={14} />{searchEnabled ? "Web search on" : "Web search off"}</button><GenerationButton generation={generation} onChange={onGenerationChange} kind={providers.find((item) => item.id === conversation.model_provider_id)?.models.find((item) => item.model === conversation.model)?.kind} model={conversation.model ?? ""} /><button type={streaming ? "button" : "submit"} className={`send-button${streaming ? " stop" : ""}`} aria-label={streaming ? "Stop generating" : "Send message"} title={streaming ? "Stop generating" : "Send"} onClick={streaming ? (event) => { event.preventDefault(); onStop(); } : undefined} disabled={!streaming && ((!input.trim() && images.length === 0) || busy || compacting || !hasActiveProvider)}>{streaming ? <Square size={17} /> : busy ? <LoaderCircle className="spin" size={18} /> : <Check size={18} />}</button></div></form><p className="disclaimer">AI responses may be inaccurate. Review important information.</p></footer></>;
 }
 
 function RightNavigator({ messages }: { messages: Message[] }) {
-  const questions = messages.filter((message) => message.role === "user");
-  return <aside className="right-navigator" aria-label="Conversation navigation"><div className="right-nav-inner"><strong>In this chat</strong>{questions.length === 0 ? <span className="muted">No questions yet</span> : questions.map((message) => <button key={message.id} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}><span className="right-nav-label">{message.content || "[Image]"}</span></button>)}</div></aside>;
+  const innerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const questions = useMemo(() => messages.filter((message) => message.role === "user"), [messages]);
+  const rowHeight = 34;
+  useEffect(() => {
+    const measure = () => setViewportHeight(innerRef.current?.clientHeight ?? 0);
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, [questions.length]);
+  const overscan = 20;
+  const start = viewportHeight ? Math.max(0, Math.floor(scrollTop / rowHeight) - overscan) : 0;
+  const visibleCount = viewportHeight ? Math.ceil(viewportHeight / rowHeight) + overscan * 2 : Math.min(80, questions.length);
+  const visibleQuestions = questions.slice(start, start + visibleCount);
+  return <aside className="right-navigator" aria-label="Conversation navigation"><div className="right-nav-inner" ref={innerRef} onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}><strong>In this chat</strong>{questions.length === 0 ? <span className="muted">No questions yet</span> : <><div style={{ height: start * rowHeight }} />{visibleQuestions.map((message) => <button key={message.id} onClick={() => document.getElementById(`message-${message.id}`)?.scrollIntoView({ behavior: "smooth", block: "center" })}><span className="right-nav-label">{message.content || "[Image]"}</span></button>)}<div style={{ height: Math.max(0, (questions.length - start - visibleQuestions.length) * rowHeight) }} /></>}</div></aside>;
 }
+
+function Markdown({ content, theme }: { content: string; theme: "light" | "dark" }) {
+  return <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <CodeBlock language={language} code={source} theme={theme} /> : <code className={className} {...props}>{children}</code>; } }}>{preprocessLatex(content)}</ReactMarkdown>;
+}
+const MemoMarkdown = memo(Markdown);
+const MemoMessageBubble = memo(MessageBubble);
 
 function GenerationButton({ generation, onChange, kind, model }: { generation: GenerationSettings; onChange: (value: GenerationSettings) => void; kind?: ProviderKind; model: string }) {
   const [open, setOpen] = useState(false);
@@ -450,6 +551,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [draft, setDraft] = useState(message.content);
   const [copied, setCopied] = useState(false);
+  useEffect(() => { setDraft(message.content); }, [message.content]);
   const bodyRef = useRef<HTMLDivElement | null>(null);
   const selectionCaptured = useRef(false);
   const lookupActiveRef = useRef(lookupActive);
@@ -534,7 +636,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
   const content = message.reasoning_content ? message.content : legacy.content;
   const reasoning = message.reasoning_content || legacy.reasoning;
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
-  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning && !message.images?.length ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={{ code({ className, children, ...props }) { const language = /language-(\w+)/.exec(className ?? "")?.[1]; const source = String(children).replace(/\n$/, ""); return language ? <CodeBlock language={language} code={source} theme={theme} /> : <code className={className} {...props}>{children}</code>; } }}>{preprocessLatex(content)}</ReactMarkdown> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></article>;
+  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning && !message.images?.length ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}{message.search_sources?.length > 0 && <div className="sources">{message.search_sources.slice(0, 3).map((source) => <a href={source.url} target="_blank" rel="noreferrer" key={source.url}>{source.title}</a>)}</div>}<div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></article>;
 }
 
 function splitLegacyThinking(value: string) {

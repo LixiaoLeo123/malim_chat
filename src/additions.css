@@ -259,3 +259,8 @@
 @media (hover: none) and (pointer: coarse) {
   .conversation-row .row-action{visibility:visible}
 }
+.message { content-visibility: auto; contain-intrinsic-size: auto 96px; }
+.message:last-child { content-visibility: visible; }
+.load-older { margin-bottom: 18px; border: 1px solid #dce5e2; background: #fff; color: #46545b; border-radius: 6px; padding: 7px 11px; font-size: 12px; }
+.load-older:disabled { opacity: .65; }
+.sidebar-loader { display: grid; place-items: center; min-height: 12px; color: #7f8b93; }
