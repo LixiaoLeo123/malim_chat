@@ -1,4 +1,9 @@
-use std::{env, net::SocketAddr, path::PathBuf, sync::{Arc, Mutex}};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    sync::{Arc, Mutex},
+};
 
 use aes_gcm::{
     Aes256Gcm, Nonce,
@@ -39,11 +44,14 @@ const ACCESS_TOKEN_MINUTES: i64 = 15;
 const REFRESH_TOKEN_DAYS: i64 = 30;
 const DEFAULT_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 100;
+const MAX_WEB_TOOL_ROUNDS: usize = 4;
+const MAX_WEB_SOURCES: usize = 12;
 
 #[derive(Clone)]
 struct AppState {
     db: PgPool,
     http: Client,
+    web_reader: Client,
     jwt_secret: Arc<Vec<u8>>,
     encryption_key: Arc<[u8; 32]>,
     searxng_url: Option<String>,
@@ -303,6 +311,25 @@ struct Message {
     edited_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug)]
+struct ToolCall {
+    id: String,
+    name: String,
+    input: Value,
+}
+
+struct ProviderToolTurn {
+    content: String,
+    assistant_message: Value,
+    tool_calls: Vec<ToolCall>,
+}
+
+struct WebAgentAnswer {
+    answer: String,
+    reasoning: String,
+    sources: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -615,6 +642,10 @@ async fn main() -> anyhow::Result<()> {
         db,
         http: Client::builder()
             .timeout(std::time::Duration::from_secs(300))
+            .build()?,
+        web_reader: Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
             .build()?,
         jwt_secret: Arc::new(config.jwt_secret.into_bytes()),
         encryption_key: Arc::new(key),
@@ -1204,66 +1235,28 @@ async fn respond(
             json!({"role":role,"content":content_part(&kind, supports_images, &strip_thinking(&content), images)})
         })
         .collect();
-    let plain_transcript: Vec<Value> = transcript
-        .iter()
-        .map(|message| {
-            let role = message["role"].as_str().unwrap_or("user").to_string();
-            let content = match &message["content"] {
-                Value::String(text) => text.clone(),
-                Value::Array(parts) => parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join("\n"),
-                _ => String::new(),
-            };
-            json!({"role": role, "content": content})
-        })
-        .collect();
     let explicit_search = content_requests_web_search(&input.content);
     let search_requested = request.search.unwrap_or(false) || explicit_search;
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
-    let (sources, planner_returned_no_queries) = if search_requested && should_search_web(&input.content) {
-        // Search is deliberately a two-call workflow: plan queries, collect sources,
-        // then make the answering call below with those sources as context.
-        let queries = match generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &plain_transcript, &input.content).await {
-            Ok(queries) => queries,
-            Err(cause) => {
-                warn!(conversation_id=%id, error=%cause.message, "search planner failed; using the user question as the query");
-                Vec::new()
-            }
-        };
-        let queries = search_queries_with_fallback(queries, &input.content);
-        info!(conversation_id=%id, planned_queries=queries.len(), "search planner completed");
-        let planner_returned_no_queries = queries.is_empty();
-        let mut merged = Vec::new();
-        for query in queries.into_iter().take(4) {
-            match fetch_search(&state, &query).await {
-                Ok(results) => for mut result in results {
-                result["query"] = json!(query);
-                if !merged.iter().any(|existing: &Value| existing["url"] == result["url"]) { merged.push(result); }
-                },
-                Err(cause) => warn!(conversation_id=%id, error=%cause.message, "search provider request failed"),
-            }
-        }
-        merged.truncate(8);
-        info!(conversation_id=%id, source_count=merged.len(), "search collection completed");
-        (merged, planner_returned_no_queries)
-    } else { (vec![], false) };
     if let Some((summary, _)) = prior_summary {
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
     }
-    if search_requested && !sources.is_empty() {
-        transcript.insert(0,json!({"role":"system","content":format!("Web search is enabled. Answer the latest user question using only relevant sources below. Cite supporting claims with their source URLs. Do not claim that web sources are unavailable when they are listed. Sources: {}",serde_json::to_string(&sources).unwrap_or_default())}));
-    } else if search_requested && planner_returned_no_queries {
-        transcript.insert(0,json!({"role":"system","content":"Web search was enabled. The search planner determined that no external lookup was needed for this request. Do not claim to have searched or cite web sources."}));
-    } else if search_requested {
-        transcript.insert(0,json!({"role":"system","content":"Web search was requested and completed, but the search engine returned no usable sources. State that limitation plainly; do not invent sources or claim the search was not attempted."}));
-    }
     let enable_markdown = request.enable_markdown.unwrap_or(true);
     transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
+    if search_requested && !input.content.trim().is_empty() {
+        if request.stream.unwrap_or(false) {
+            return Ok(stream_web_agent_response(state, id, user_id, kind, p.1, api_key, model, transcript, input.content, request.temperature, request.reasoning_effort, enable_markdown));
+        }
+        let result = run_web_agent(&state, &kind, &p.1, &api_key, &model, transcript, &input.content, request.temperature, request.reasoning_effort.as_deref()).await?;
+        let message = persist_assistant_message(&state, id, user_id, &model, result.answer, result.reasoning, &result.sources, enable_markdown).await?;
+        return Ok(Json(message).into_response());
+    }
     if request.stream.unwrap_or(false) {
         let upstream = call_provider_stream(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
-        return Ok(stream_response(state, upstream, id, user_id, model, sources, enable_markdown));
+        return Ok(stream_response(state, upstream, id, user_id, model, vec![], enable_markdown));
     }
     let (answer, reasoning) = split_thinking(&call_provider(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?);
-    let m = persist_assistant_message(&state, id, user_id, &model, answer, reasoning, &sources, enable_markdown).await?;
+    let m = persist_assistant_message(&state, id, user_id, &model, answer, reasoning, &[], enable_markdown).await?;
     Ok(Json(m).into_response())
 }
 
@@ -1730,71 +1723,9 @@ fn lookup_english_chinese_dictionary(
         .collect())
 }
 
-async fn generate_search_queries(
-    http: &Client,
-    kind: &str,
-    base: &str,
-    key: &str,
-    model: &str,
-    history: &[Value],
-    question: &str,
-) -> Result<Vec<String>, ApiError> {
-    let mut lines: Vec<String> = history
-        .iter()
-        .filter_map(|m| {
-            let role = m["role"].as_str()?;
-            let content = m["content"].as_str()?;
-            Some(format!("{role}: {content}"))
-        })
-        .collect();
-    let question_last = history
-        .last()
-        .is_some_and(|m| m["role"].as_str() == Some("user") && m["content"].as_str() == Some(question));
-    if !question_last {
-        lines.push(format!("user: {question}"));
-    }
-    let messages = vec![
-        json!({"role":"system","content":"You plan web searches for the LATEST user message in a conversation. Use the earlier conversation history for context when choosing queries. Return ONLY a JSON array containing zero to four search-engine queries. Return [] only when an external lookup is not useful. Otherwise, each query must contain a specific named entity or key phrase from the latest question; include dates or versions when relevant. Do not answer the question."}),
-        json!({"role":"user","content":format!("Conversation history (most recent message last):\n{}", lines.join("\n"))}),
-    ];
-    let raw = call_provider(http, kind, base, key, model, &messages, Some(0.0), None).await?;
-    let candidate = raw.trim().trim_start_matches("```json").trim_start_matches("```").trim_end_matches("```").trim();
-    let parsed: Value = serde_json::from_str(candidate).or_else(|_| {
-        let start = candidate.find('[').ok_or(())?;
-        let end = candidate.rfind(']').ok_or(())?;
-        serde_json::from_str(&candidate[start..=end]).map_err(|_| ())
-    }).map_err(|_| ApiError::bad("The provider returned invalid search queries."))?;
-    let queries = parsed.as_array().into_iter().flatten().filter_map(Value::as_str).map(str::trim).filter(|query| is_valid_search_query(query)).take(4).map(ToOwned::to_owned).collect::<Vec<_>>();
-    Ok(queries)
-}
-
 fn is_valid_search_query(query: &str) -> bool {
     let normalized = query.trim();
     normalized.chars().count() >= 2 && normalized.chars().count() <= 180
-}
-
-fn search_queries_with_fallback(planned: Vec<String>, question: &str) -> Vec<String> {
-    let mut queries = Vec::new();
-    for query in planned.into_iter().chain(std::iter::once(question.trim().to_string())) {
-        let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
-        let normalized = normalized.chars().take(180).collect::<String>();
-        if is_valid_search_query(&normalized)
-            && !queries.iter().any(|existing: &String| existing.eq_ignore_ascii_case(&normalized))
-        {
-            queries.push(normalized);
-        }
-        if queries.len() == 4 { break; }
-    }
-    queries
-}
-
-fn should_search_web(question: &str) -> bool {
-    let normalized = question.trim().to_lowercase();
-    !normalized.is_empty()
-        && !matches!(normalized.as_str(), "use web search" | "search the web" | "online search" | "使用网络搜索" | "使用网络")
-        && !normalized.starts_with("answer in ")
-        && !normalized.starts_with("reply in ")
-        && !normalized.starts_with("respond in ")
 }
 
 fn content_requests_web_search(question: &str) -> bool {
@@ -1827,6 +1758,355 @@ async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiEr
     results.truncate(8);
     info!(query_length=query.chars().count(), result_count=results.len(), "search query completed");
     Ok(results)
+}
+
+fn web_tool_definitions(kind: &str) -> Value {
+    let search_schema = json!({
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "A concise, specific search-engine query."}},
+        "required": ["query"],
+        "additionalProperties": false
+    });
+    let open_schema = json!({
+        "type": "object",
+        "properties": {"url": {"type": "string", "description": "An exact http(s) URL returned by web_search."}},
+        "required": ["url"],
+        "additionalProperties": false
+    });
+    if kind == "anthropic" {
+        json!([
+            {"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","input_schema":search_schema},
+            {"name":"open_web_page","description":"Read the text of an exact result URL returned by web_search. Use this to verify details before making consequential claims.","input_schema":open_schema}
+        ])
+    } else {
+        json!([
+            {"type":"function","function":{"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","parameters":search_schema}},
+            {"type":"function","function":{"name":"open_web_page","description":"Read the text of an exact result URL returned by web_search. Use this to verify details before making consequential claims.","parameters":open_schema}}
+        ])
+    }
+}
+
+fn add_search_sources(sources: &mut Vec<Value>, query: &str, results: Vec<Value>) {
+    for mut result in results {
+        result["query"] = json!(query);
+        if !sources.iter().any(|existing| existing["url"] == result["url"]) {
+            sources.push(result);
+        }
+        if sources.len() >= MAX_WEB_SOURCES {
+            break;
+        }
+    }
+}
+
+fn tool_search_results(results: &[Value]) -> Value {
+    Value::Array(
+        results
+            .iter()
+            .take(5)
+            .map(|result| {
+                let mut result = result.clone();
+                if let Some(content) = result["content"].as_str() {
+                    result["content"] = json!(content.chars().take(900).collect::<String>());
+                }
+                result
+            })
+            .collect(),
+    )
+}
+
+fn is_safe_public_url(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(url.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(['[', ']']);
+    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
+        return false;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(ip) => is_safe_public_ip(ip),
+        Err(_) => true,
+    }
+}
+
+fn is_safe_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+        }
+        IpAddr::V6(ip) => {
+            !ip.is_loopback() && !ip.is_unspecified() && !ip.is_unique_local() && !ip.is_unicast_link_local()
+        }
+    }
+}
+
+async fn resolves_to_public_addresses(raw: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(raw) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    let port = url.port_or_known_default().unwrap_or(443);
+    match tokio::net::lookup_host((host, port)).await {
+        Ok(addresses) => {
+            let addresses = addresses.collect::<Vec<_>>();
+            !addresses.is_empty() && addresses.iter().all(|address| is_safe_public_ip(address.ip()))
+        }
+        Err(_) => false,
+    }
+}
+
+fn html_to_text(html: &str) -> String {
+    let mut compact = html.to_string();
+    for tag in ["script", "style", "noscript", "svg"] {
+        let lower = compact.to_ascii_lowercase();
+        let mut cursor = 0;
+        while let Some(start) = lower[cursor..].find(&format!("<{tag}")) {
+            let start = cursor + start;
+            let Some(end) = lower[start..].find(&format!("</{tag}>")) else {
+                compact.replace_range(start..compact.len(), &" ".repeat(compact.len() - start));
+                break;
+            };
+            let end = start + end + tag.len() + 3;
+            compact.replace_range(start..end, &" ".repeat(end - start));
+            cursor = end;
+        }
+    }
+    let mut text = String::with_capacity(compact.len().min(24_000));
+    let mut in_tag = false;
+    for character in compact.chars() {
+        match character {
+            '<' => { in_tag = true; text.push(' '); }
+            '>' => in_tag = false,
+            _ if !in_tag => text.push(character),
+            _ => {}
+        }
+    }
+    text = text
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(12_000).collect()
+}
+
+async fn open_search_result(state: &AppState, url: &str, allowed_urls: &[String]) -> Result<Value, String> {
+    if !allowed_urls.iter().any(|allowed| allowed == url)
+        || !is_safe_public_url(url)
+        || !resolves_to_public_addresses(url).await
+    {
+        return Err("The URL must be an exact public result returned by web_search.".into());
+    }
+    let response = state
+        .web_reader
+        .get(url)
+        .header("Accept", "text/html, text/plain;q=0.9")
+        .send()
+        .await
+        .map_err(|_| "The page could not be retrieved.".to_string())?
+        .error_for_status()
+        .map_err(|_| "The page returned an error response.".to_string())?;
+    let content_type = response
+        .headers()
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !content_type.is_empty() && !content_type.contains("text/") && !content_type.contains("html") && !content_type.contains("xml") {
+        return Err("The result is not a readable text page.".into());
+    }
+    let mut bytes = Vec::new();
+    let mut body = response.bytes_stream();
+    while let Some(next) = body.next().await {
+        let chunk = next.map_err(|_| "The page could not be read.".to_string())?;
+        let remaining = 1_000_000usize.saturating_sub(bytes.len());
+        if remaining == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+    let raw = String::from_utf8_lossy(&bytes);
+    let content = if content_type.contains("html") || raw.contains("<html") {
+        html_to_text(&raw)
+    } else {
+        raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(12_000).collect()
+    };
+    if content.trim().is_empty() {
+        return Err("The page did not contain readable text.".into());
+    }
+    Ok(json!({"url":url,"content":content}))
+}
+
+async fn execute_web_tool(
+    state: &AppState,
+    call: &ToolCall,
+    sources: &mut Vec<Value>,
+    allowed_urls: &mut Vec<String>,
+) -> Value {
+    match call.name.as_str() {
+        "web_search" => {
+            let query = call.input["query"].as_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
+            if !is_valid_search_query(&query) {
+                return json!({"error":"web_search requires a focused query between 2 and 180 characters."});
+            }
+            match fetch_search(state, &query).await {
+                Ok(results) => {
+                    add_search_sources(sources, &query, results);
+                    for result in sources.iter() {
+                        if result["query"] == query {
+                            if let Some(url) = result["url"].as_str() {
+                                if is_safe_public_url(url) && !allowed_urls.iter().any(|allowed| allowed == url) {
+                                    allowed_urls.push(url.to_string());
+                                }
+                            }
+                        }
+                    }
+                    let matching = sources
+                        .iter()
+                        .filter(|result| result["query"] == query)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    json!({"query":query,"results":tool_search_results(&matching)})
+                }
+                Err(error) => json!({"error":error.message}),
+            }
+        }
+        "open_web_page" => {
+            let url = call.input["url"].as_str().unwrap_or("");
+            match open_search_result(state, url, allowed_urls).await {
+                Ok(page) => {
+                    if let Some(source) = sources.iter_mut().find(|source| source["url"] == page["url"]) {
+                        source["content"] = page["content"].clone();
+                    }
+                    page
+                }
+                Err(message) => json!({"error":message}),
+            }
+        }
+        _ => json!({"error":"Unknown tool. Only web_search and open_web_page are available."}),
+    }
+}
+
+async fn call_provider_with_tools(
+    http: &Client,
+    kind: &str,
+    base: &str,
+    key: &str,
+    model: &str,
+    messages: &[Value],
+    temperature: Option<f32>,
+    reasoning_effort: Option<&str>,
+) -> Result<ProviderToolTurn, ApiError> {
+    let url = provider_url(kind, base);
+    let response = if kind == "anthropic" {
+        let system = messages.iter().filter(|message| message["role"] == "system").filter_map(|message| message["content"].as_str()).collect::<Vec<_>>().join("\n\n");
+        let mut body = json!({"model":model,"max_tokens":8192,"messages":messages.iter().filter(|message|message["role"] != "system").collect::<Vec<_>>(),"tools":web_tool_definitions(kind)});
+        if !system.is_empty() { body["system"] = json!(system); }
+        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
+        http.post(url).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body).send().await?
+    } else {
+        let mut body = json!({"model":model,"messages":messages,"stream":false,"tools":web_tool_definitions(kind)});
+        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
+        if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
+        http.post(url).bearer_auth(key).json(&body).send().await?
+    };
+    let body: Value = response.error_for_status()?.json().await?;
+    if kind == "anthropic" {
+        let blocks = body["content"].as_array().cloned().ok_or_else(|| ApiError::bad("The provider returned an unexpected tool response."))?;
+        let tool_calls = blocks.iter().filter(|block| block["type"] == "tool_use").filter_map(|block| Some(ToolCall { id: block["id"].as_str()?.to_string(), name: block["name"].as_str()?.to_string(), input: block["input"].clone() })).collect();
+        Ok(ProviderToolTurn { content: anthropic_content(&body).unwrap_or_default(), assistant_message: json!({"role":"assistant","content":blocks}), tool_calls })
+    } else {
+        let mut message = body["choices"].as_array().and_then(|choices| choices.first()).and_then(|choice| choice.get("message")).cloned().ok_or_else(|| ApiError::bad("The provider returned an unexpected tool response."))?;
+        if message["role"].is_null() {
+            message["role"] = json!("assistant");
+        }
+        let tool_calls = message["tool_calls"].as_array().into_iter().flatten().filter_map(|call| {
+            let arguments = call["function"]["arguments"].as_str().unwrap_or("{}");
+            Some(ToolCall { id: call["id"].as_str()?.to_string(), name: call["function"]["name"].as_str()?.to_string(), input: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})) })
+        }).collect();
+        Ok(ProviderToolTurn { content: openai_content(&json!({"choices":[{"message":message.clone()}]})).unwrap_or_default(), assistant_message: message, tool_calls })
+    }
+}
+
+async fn run_web_agent(
+    state: &AppState,
+    kind: &str,
+    base: &str,
+    key: &str,
+    model: &str,
+    mut transcript: Vec<Value>,
+    question: &str,
+    temperature: Option<f32>,
+    reasoning_effort: Option<&str>,
+) -> Result<WebAgentAnswer, ApiError> {
+    transcript.insert(0, json!({"role":"system","content":"Web tools are available. Use web_search for up-to-date or uncertain factual claims, refine vague searches, and open_web_page before relying on an important source. Do not invent tool results or citations. Give a direct answer after gathering enough evidence, and cite the supporting source URLs."}));
+    let mut sources = Vec::new();
+    let mut allowed_urls = Vec::new();
+    match fetch_search(state, question).await {
+        Ok(results) => {
+            add_search_sources(&mut sources, question, results);
+            allowed_urls.extend(sources.iter().filter_map(|source| source["url"].as_str()).filter(|url| is_safe_public_url(url)).map(str::to_string));
+            transcript.insert(1, json!({"role":"system","content":format!("Initial search evidence for the latest user request follows. It may be incomplete; use the tools to verify or refine it. {}", serde_json::to_string(&tool_search_results(&sources)).unwrap_or_default())}));
+        }
+        Err(error) => {
+            warn!(error=%error.message, "initial web search failed");
+            transcript.insert(1, json!({"role":"system","content":"The initial web search failed. You may still try the web_search tool if the provider supports it; otherwise state the limitation plainly."}));
+        }
+    }
+    for round in 0..MAX_WEB_TOOL_ROUNDS {
+        let turn = match call_provider_with_tools(&state.http, kind, base, key, model, &transcript, temperature, reasoning_effort).await {
+            Ok(turn) => turn,
+            Err(error) => {
+                warn!(round, error=%error.message, "provider rejected native web tools; falling back to retrieved evidence");
+                let (answer, reasoning) = split_thinking(&call_provider(&state.http, kind, base, key, model, &transcript, temperature, reasoning_effort).await?);
+                return Ok(WebAgentAnswer { answer, reasoning, sources });
+            }
+        };
+        if turn.tool_calls.is_empty() {
+            let (answer, reasoning) = split_thinking(&turn.content);
+            if !answer.trim().is_empty() {
+                info!(round, source_count=sources.len(), "web agent completed");
+                return Ok(WebAgentAnswer { answer, reasoning, sources });
+            }
+            break;
+        }
+        info!(round, tool_calls=turn.tool_calls.len(), "web agent requested tools");
+        transcript.push(turn.assistant_message);
+        let mut anthropic_results = Vec::new();
+        for (index, call) in turn.tool_calls.iter().enumerate() {
+            let result = if index < 4 {
+                execute_web_tool(state, call, &mut sources, &mut allowed_urls).await
+            } else {
+                json!({"error":"This tool-call batch exceeded the limit of four calls. Continue using the results already returned."})
+            };
+            if kind == "anthropic" {
+                anthropic_results.push(json!({"type":"tool_result","tool_use_id":call.id,"content":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
+            } else {
+                transcript.push(json!({"role":"tool","tool_call_id":call.id,"content":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
+            }
+        }
+        if kind == "anthropic" && !anthropic_results.is_empty() {
+            transcript.push(json!({"role":"user","content":anthropic_results}));
+        }
+    }
+    transcript.insert(0, json!({"role":"system","content":"Finish now using the collected evidence. Clearly distinguish missing evidence from established facts, and do not call more tools."}));
+    let (answer, reasoning) = split_thinking(&call_provider(&state.http, kind, base, key, model, &transcript, temperature, reasoning_effort).await?);
+    Ok(WebAgentAnswer { answer, reasoning, sources })
 }
 async fn sync(
     State(state): State<AppState>,
@@ -2021,9 +2301,69 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
     response
 }
 
+fn stream_web_agent_response(
+    state: AppState,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    kind: String,
+    base: String,
+    api_key: String,
+    model: String,
+    transcript: Vec<Value>,
+    question: String,
+    temperature: Option<f32>,
+    reasoning_effort: Option<String>,
+    enable_markdown: bool,
+) -> Response {
+    let output = async_stream::stream! {
+        let started = serde_json::to_string(&json!({"type":"tool","tool":{"name":"web_search","status":"running","input":{"query":question}}})).unwrap_or_default();
+        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {started}\n\n")));
+        let result = match run_web_agent(&state, &kind, &base, &api_key, &model, transcript, &question, temperature, reasoning_effort.as_deref()).await {
+            Ok(result) => result,
+            Err(error) => {
+                error!(conversation_id=%conversation_id, error=%error.message, "web agent response failed");
+                let payload = serde_json::to_string(&json!({"type":"error","message":error.message})).unwrap_or_default();
+                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+                return;
+            }
+        };
+        let completed = serde_json::to_string(&json!({"type":"tool","tool":{"name":"web_search","status":"completed","source_count":result.sources.len()}})).unwrap_or_default();
+        yield Ok(Bytes::from(format!("data: {completed}\n\n")));
+        if !result.reasoning.trim().is_empty() {
+            let payload = serde_json::to_string(&json!({"type":"reasoning","delta":result.reasoning})).unwrap_or_default();
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+        }
+        if result.answer.trim().is_empty() {
+            let payload = serde_json::to_string(&json!({"type":"error","message":"The provider returned no final answer."})).unwrap_or_default();
+            yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+            return;
+        }
+        for chunk in result.answer.as_bytes().chunks(1200) {
+            let delta = String::from_utf8_lossy(chunk);
+            let payload = serde_json::to_string(&json!({"type":"delta","delta":delta})).unwrap_or_default();
+            yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+        }
+        match persist_assistant_message(&state, conversation_id, user_id, &model, result.answer, result.reasoning, &result.sources, enable_markdown).await {
+            Ok(message) => {
+                let payload = serde_json::to_string(&json!({"type":"done","message":message})).unwrap_or_default();
+                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+            }
+            Err(error) => {
+                error!(conversation_id=%conversation_id, error=%error.message, "could not persist web-agent response");
+                let payload = serde_json::to_string(&json!({"type":"error","message":"The response could not be saved."})).unwrap_or_default();
+                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
+            }
+        }
+    };
+    let mut response = Body::from_stream(output).into_response();
+    response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+    response.headers_mut().insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{content_part, is_valid_search_query, parse_data_url, plain_text_content, provider_stream_delta, provider_url, search_queries_with_fallback, split_thinking, strip_thinking, ThinkingStream};
+    use super::{content_part, is_safe_public_url, is_valid_search_query, parse_data_url, plain_text_content, provider_stream_delta, provider_url, split_thinking, strip_thinking, web_tool_definitions, ThinkingStream};
 
     #[test]
     fn accepts_generic_planner_queries_without_topic_rules() {
@@ -2048,9 +2388,13 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_the_latest_question_for_web_search() {
-        assert_eq!(search_queries_with_fallback(vec![], "latest rust release notes"), vec!["latest rust release notes"]);
-        assert_eq!(search_queries_with_fallback(vec!["OpenAI news".into()], "OpenAI news"), vec!["OpenAI news"]);
+    fn exposes_provider_native_web_tools_and_rejects_private_urls() {
+        assert!(web_tool_definitions("openai_compatible")[0]["function"]["parameters"]["properties"]["query"].is_object());
+        assert!(web_tool_definitions("anthropic")[0]["input_schema"]["properties"]["query"].is_object());
+        assert!(is_safe_public_url("https://www.example.com/article"));
+        assert!(!is_safe_public_url("http://127.0.0.1:3100/healthz"));
+        assert!(!is_safe_public_url("http://10.0.0.8/admin"));
+        assert!(!is_safe_public_url("http://[::1]/"));
     }
 
     #[test]

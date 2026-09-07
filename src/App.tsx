@@ -10,7 +10,7 @@ import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/pris
 import "./additions.css";
 import { api, setSession, subscribeSession } from "./api";
 import { useAppStore } from "./store";
-import type { Conversation, DictionaryResponse, GenerationSettings, Message, Provider, ProviderKind, ProviderModel, Session } from "./types";
+import type { Conversation, DictionaryResponse, GenerationSettings, Message, Provider, ProviderKind, ProviderModel, Session, ToolActivity } from "./types";
 
 const now = () => new Date().toISOString();
 const defaultGeneration: GenerationSettings = { temperature: 0.7, reasoning_effort: "medium", enable_markdown: true, stream: true };
@@ -34,6 +34,13 @@ async function copyText(text: string) {
     document.execCommand("copy");
     area.remove();
   }
+}
+
+function updateToolEvents(current: ToolActivity[], next?: ToolActivity) {
+  if (!next) return current;
+  const index = current.findIndex((item) => item.name === next.name && item.status === "running");
+  if (index >= 0 && next.status !== "running") return current.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item);
+  return [...current, next];
 }
 
 export function App() {
@@ -193,6 +200,7 @@ function Chat() {
     let pendingId: string | null = null;
     let streamedContent = "";
     let streamedReasoning = "";
+    let toolEvents: ToolActivity[] = [];
     const controller = options.stream ? beginStream() : null;
     state.upsertMessage(conversationId, optimistic);
     state.setBusy(true);
@@ -208,10 +216,10 @@ function Chat() {
       const streamingBase = sent;
       const streamingId = pendingId;
       const streamingSequence = sent.sequence + 0.5;
-      state.upsertMessage(conversationId, { ...sent, id: pendingId, sequence: sent.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
-      const answer = options.stream ? await api.respondStream(conversationId, sent.id, search, options, (event) => { if (event.type === "reasoning") streamedReasoning += event.delta ?? ""; else streamedContent += event.delta ?? ""; state.upsertMessage(conversationId, { ...streamingBase, id: streamingId, sequence: streamingSequence, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [] }); }, controller?.signal) : await api.respond(conversationId, sent.id, search, options);
+      state.upsertMessage(conversationId, { ...sent, id: pendingId, sequence: sent.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: [] });
+      const answer = options.stream ? await api.respondStream(conversationId, sent.id, search, options, (event) => { if (event.type === "tool") toolEvents = updateToolEvents(toolEvents, event.tool); else if (event.type === "reasoning") streamedReasoning += event.delta ?? ""; else streamedContent += event.delta ?? ""; state.upsertMessage(conversationId, { ...streamingBase, id: streamingId, sequence: streamingSequence, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: toolEvents }); }, controller?.signal) : await api.respond(conversationId, sent.id, search, options);
       state.removeMessage(conversationId, pendingId);
-      state.upsertMessage(conversationId, answer);
+      state.upsertMessage(conversationId, { ...answer, tool_events: toolEvents });
       const chats = await api.conversations();
       state.setConversations(chats.items);
       setConversationCursor(chats.next_cursor);
@@ -234,15 +242,16 @@ function Chat() {
     const pendingId = `retry-${target.id}`;
     let streamedContent = "";
     let streamedReasoning = "";
+    let toolEvents: ToolActivity[] = [];
     state.upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
-    state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [] });
+    state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: [] });
     const controller = generation.stream ? beginStream() : null;
     state.setBusy(true);
     try {
-      const answer = generation.stream ? await api.respondStream(activeId, target.id, searchEnabled, generation, (event) => { if (event.type === "reasoning") streamedReasoning += event.delta ?? ""; else streamedContent += event.delta ?? ""; state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [] }); }, controller?.signal) : await api.respond(activeId, target.id, searchEnabled, generation);
+      const answer = generation.stream ? await api.respondStream(activeId, target.id, searchEnabled, generation, (event) => { if (event.type === "tool") toolEvents = updateToolEvents(toolEvents, event.tool); else if (event.type === "reasoning") streamedReasoning += event.delta ?? ""; else streamedContent += event.delta ?? ""; state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: toolEvents }); }, controller?.signal) : await api.respond(activeId, target.id, searchEnabled, generation);
       state.removeMessage(activeId, pendingId);
       state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() });
-      state.upsertMessage(activeId, answer);
+      state.upsertMessage(activeId, { ...answer, tool_events: toolEvents });
     } catch (cause) {
       state.removeMessage(activeId, pendingId);
       if ((cause as Error)?.name === "AbortError") { state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() }); return; }
@@ -557,6 +566,15 @@ function SourceList({ sources }: { sources: Message["search_sources"] }) {
   return <details className="sources"><summary><Search size={14} />{sources.length} web source{sources.length === 1 ? "" : "s"}</summary>{queries.length > 0 && <p className="source-query">Search: {queries.join(" · ")}</p>}<div className="source-list">{sources.map((source, index) => <a href={source.url} target="_blank" rel="noreferrer" key={`${source.url}-${index}`}><span className="source-title">{source.title || sourceHost(source.url)}</span><span className="source-meta">{sourceHost(source.url)} · {source.engine || "SearXNG"}</span>{source.content && <span className="source-snippet">{source.content}</span>}</a>)}</div></details>;
 }
 
+function ToolActivityList({ events }: { events?: ToolActivity[] }) {
+  if (!events?.length) return null;
+  return <div className="tool-activity" aria-live="polite">{events.map((event, index) => {
+    const query = event.input?.query;
+    const label = event.status === "running" ? (query ? `Searching web: ${query}` : "Searching the web") : event.source_count !== undefined ? `Web evidence collected: ${event.source_count} sources` : "Web search complete";
+    return <span key={`${event.name}-${index}`} className={event.status === "running" ? "running" : "complete"}>{event.status === "running" ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}{label}</span>;
+  })}</div>;
+}
+
 function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, onEdit, onDelete, onRetry, onLookup }: { message: Message; markdownEnabled: boolean; theme: "light" | "dark"; isLast: boolean; lookupActive: boolean; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void }) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -647,7 +665,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
   const content = message.reasoning_content ? message.content : legacy.content;
   const reasoning = message.reasoning_content || legacy.reasoning;
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
-  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning && !message.images?.length ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>}</>}{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}<SourceList sources={message.search_sources ?? []} /><div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></article>;
+  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning && !message.images?.length ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>}</>}<ToolActivityList events={message.tool_events} />{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}<SourceList sources={message.search_sources ?? []} /><div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></article>;
 }
 
 function splitLegacyThinking(value: string) {

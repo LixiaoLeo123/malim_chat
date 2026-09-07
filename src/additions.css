@@ -277,4 +277,8 @@
 .source-title{font-size:12px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .source-meta{font-size:10px;color:#607177;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .source-snippet{display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;color:#536369;font-size:11px;line-height:1.4}
+.tool-activity{display:grid;gap:5px;margin-top:11px;color:#52646a;font-size:12px}
+.tool-activity span{display:flex;align-items:center;gap:6px;width:max-content;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool-activity .running{color:#28645c}.tool-activity .complete{color:#58716b}
 .app-shell.dark .sources{background:#292929!important;border-color:#484848!important}.app-shell.dark .sources[open] summary{border-color:#484848!important}.app-shell.dark .sources summary{color:#d5d5d5!important}.app-shell.dark .source-query,.app-shell.dark .source-meta,.app-shell.dark .source-snippet{color:#a8a8a8!important}.app-shell.dark .sources .source-list a{background:#303030!important;border-color:#505050!important;color:#e8e8e8!important}.app-shell.dark .sources .source-list a:hover{background:#383838!important;border-color:#707070!important}
+.app-shell.dark .tool-activity{color:#b0b9b7}.app-shell.dark .tool-activity .running{color:#9ed1c7}.app-shell.dark .tool-activity .complete{color:#b6c9c4}

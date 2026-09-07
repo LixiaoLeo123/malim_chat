@@ -1,4 +1,4 @@
-import type { Conversation, DictionaryResponse, GenerationSettings, Message, Page, Provider, ProviderKind, ProviderModel, SearchResult, Session, User } from "./types";
+import type { Conversation, DictionaryResponse, GenerationSettings, Message, Page, Provider, ProviderKind, ProviderModel, SearchResult, Session, ToolActivity, User } from "./types";
 
 const apiBase = import.meta.env.VITE_API_URL || "/malim_chat_api";
 let session: Session | null = null;
@@ -54,7 +54,7 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   return response.status === 204 ? undefined as T : response.json();
 }
 
-type StreamEvent = { type: string; delta?: string; message?: Message | string };
+type StreamEvent = { type: string; delta?: string; message?: Message | string; tool?: ToolActivity };
 async function requestStream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal): Promise<Message> {
   const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
@@ -69,7 +69,7 @@ async function requestStream(path: string, payload: unknown, onEvent: (event: St
       const frame = buffer.slice(0, boundary); buffer = buffer.slice(boundary + 2); boundary = buffer.indexOf("\n\n");
       const line = frame.split("\n").find((value) => value.startsWith("data:")); if (!line) continue;
       const event = JSON.parse(line.slice(5).trim()) as StreamEvent;
-      if (event.type === "delta" || event.type === "reasoning") onEvent(event);
+      if (event.type === "delta" || event.type === "reasoning" || event.type === "tool") onEvent(event);
       else if (event.type === "done" && event.message && typeof event.message !== "string") return event.message;
       else if (event.type === "error") throw new Error(typeof event.message === "string" ? event.message : "The response stream failed.");
     }
