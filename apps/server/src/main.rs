@@ -46,6 +46,7 @@ const DEFAULT_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 100;
 const MAX_WEB_TOOL_ROUNDS: usize = 4;
 const MAX_WEB_SOURCES: usize = 12;
+const MIN_PREFERRED_SEARCH_RESULTS: usize = 3;
 
 #[derive(Clone)]
 struct AppState {
@@ -55,6 +56,7 @@ struct AppState {
     jwt_secret: Arc<Vec<u8>>,
     encryption_key: Arc<[u8; 32]>,
     searxng_url: Option<String>,
+    searxng_preferred_engines: Option<String>,
     dictionary_dir: Arc<PathBuf>,
     russian_dictionary: Arc<Mutex<Mdx>>,
     allow_signup: bool,
@@ -66,6 +68,7 @@ struct Config {
     jwt_secret: String,
     encryption_key: String,
     searxng_url: Option<String>,
+    searxng_preferred_engines: Option<String>,
     cors_origins: Vec<HeaderValue>,
     dictionary_dir: PathBuf,
     allow_signup: bool,
@@ -102,6 +105,10 @@ impl Config {
             jwt_secret: get("MALIM_JWT_SECRET")?,
             encryption_key: BASE64.encode(raw_key),
             searxng_url: env::var("SEARXNG_URL").ok().filter(|v| !v.is_empty()),
+            searxng_preferred_engines: env::var("SEARXNG_PREFERRED_ENGINES")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| Some("yandex".into())),
             cors_origins,
             dictionary_dir: env::var("MALIM_DICTIONARY_DIR")
                 .map(PathBuf::from)
@@ -650,6 +657,7 @@ async fn main() -> anyhow::Result<()> {
         jwt_secret: Arc::new(config.jwt_secret.into_bytes()),
         encryption_key: Arc::new(key),
         searxng_url: config.searxng_url,
+        searxng_preferred_engines: config.searxng_preferred_engines,
         dictionary_dir: Arc::new(config.dictionary_dir),
         russian_dictionary: Arc::new(Mutex::new(russian_dictionary)),
         allow_signup: config.allow_signup,
@@ -1735,6 +1743,29 @@ fn content_requests_web_search(question: &str) -> bool {
         .any(|phrase| normalized.contains(phrase))
 }
 
+async fn fetch_searxng_response(
+    client: &Client,
+    base: &str,
+    query: &str,
+    language: &str,
+    engines: Option<&str>,
+) -> Result<Value, reqwest::Error> {
+    let mut request = client
+        .get(format!("{}/search", base.trim_end_matches('/')))
+        .query(&[("q", query), ("format", "json"), ("language", language)]);
+    if let Some(engines) = engines {
+        request = request.query(&[("engines", engines)]);
+    }
+    request.send().await?.error_for_status()?.json().await
+}
+
+fn search_results(response: Value) -> Vec<Value> {
+    response.get("results").and_then(Value::as_array).cloned().unwrap_or_default().into_iter()
+        .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
+        .map(|v| json!({"title":v["title"].as_str().unwrap_or_default(),"url":v["url"].as_str().unwrap_or_default(),"content":v["content"].as_str().unwrap_or_default(),"engine":v["engine"].as_str().unwrap_or("SearXNG")}))
+        .collect()
+}
+
 async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiError> {
     let base = state
         .searxng_url
@@ -1742,21 +1773,26 @@ async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiEr
         .ok_or_else(|| ApiError::bad("Online search is not configured."))?;
     let search_query = query.trim();
     let language = if search_query.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { "zh-CN" } else { "en-US" };
-    let response: Value = state
-        .http
-        .get(format!("{}/search", base.trim_end_matches('/')))
-        .query(&[("q", search_query), ("format", "json"), ("language", language)])
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let mut results = response.get("results").and_then(Value::as_array).cloned().unwrap_or_default().into_iter()
-        .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
-        .map(|v| json!({"title":v["title"].as_str().unwrap_or_default(),"url":v["url"].as_str().unwrap_or_default(),"content":v["content"].as_str().unwrap_or_default(),"engine":v["engine"].as_str().unwrap_or("SearXNG")}))
-        .collect::<Vec<_>>();
+    let preferred_engines = state.searxng_preferred_engines.as_deref();
+    let mut results = match preferred_engines {
+        Some(engines) => match fetch_searxng_response(&state.http, base, search_query, language, Some(engines)).await {
+            Ok(response) => search_results(response),
+            Err(error) => {
+                warn!(%engines, error=%error, "preferred web search engines failed; using aggregate search");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    if results.len() < MIN_PREFERRED_SEARCH_RESULTS {
+        for result in search_results(fetch_searxng_response(&state.http, base, search_query, language, None).await?) {
+            if !results.iter().any(|existing| existing["url"] == result["url"]) {
+                results.push(result);
+            }
+        }
+    }
     results.truncate(8);
-    info!(query_length=query.chars().count(), result_count=results.len(), "search query completed");
+    info!(query_length=query.chars().count(), result_count=results.len(), preferred_engines=?preferred_engines, "search query completed");
     Ok(results)
 }
 
