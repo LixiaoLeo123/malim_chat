@@ -14,7 +14,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
-    routing::{delete, get, patch, post},
+    routing::{get, patch, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use chrono::{DateTime, Duration, Utc};
@@ -348,6 +348,7 @@ struct ProviderRequest {
 #[derive(Deserialize)]
 struct UpdateProviderRequest {
     name: Option<String>,
+    kind: Option<String>,
     base_url: Option<String>,
     api_key: Option<String>,
 }
@@ -828,6 +829,10 @@ async fn update_provider(
     let user_id = user_from_headers(&state, &headers)?;
     let current = own_provider(&state.db, user_id, id).await?;
     let name = request.name.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).unwrap_or(current.name);
+    let kind = request.kind.unwrap_or(current.kind);
+    if !matches!(kind.as_str(), "openai_compatible" | "anthropic") {
+        return Err(ApiError::bad("Provider API format must be OpenAI-compatible or Anthropic."));
+    }
     let base_url = request.base_url.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(|value| value.trim_end_matches('/').to_string()).unwrap_or(current.base_url);
     if !base_url.starts_with("https://") {
         return Err(ApiError::bad("Provider base URL must use HTTPS."));
@@ -837,11 +842,11 @@ async fn update_provider(
         None => (None, None),
     };
     let row: ProviderRow = if let (Some(ciphertext), Some(nonce)) = (ciphertext, nonce) {
-        sqlx::query_as("UPDATE providers SET name=$3, base_url=$4, encrypted_api_key=$5, key_nonce=$6 WHERE id=$1 AND user_id=$2 RETURNING id,name,kind,base_url,default_model,created_at,updated_at")
-            .bind(id).bind(user_id).bind(name).bind(base_url).bind(ciphertext).bind(nonce).fetch_one(&state.db).await?
+        sqlx::query_as("UPDATE providers SET name=$3, kind=$4, base_url=$5, encrypted_api_key=$6, key_nonce=$7 WHERE id=$1 AND user_id=$2 RETURNING id,name,kind,base_url,default_model,created_at,updated_at")
+            .bind(id).bind(user_id).bind(name).bind(kind).bind(base_url).bind(ciphertext).bind(nonce).fetch_one(&state.db).await?
     } else {
-        sqlx::query_as("UPDATE providers SET name=$3, base_url=$4 WHERE id=$1 AND user_id=$2 RETURNING id,name,kind,base_url,default_model,created_at,updated_at")
-            .bind(id).bind(user_id).bind(name).bind(base_url).fetch_one(&state.db).await?
+        sqlx::query_as("UPDATE providers SET name=$3, kind=$4, base_url=$5 WHERE id=$1 AND user_id=$2 RETURNING id,name,kind,base_url,default_model,created_at,updated_at")
+            .bind(id).bind(user_id).bind(name).bind(kind).bind(base_url).fetch_one(&state.db).await?
     };
     let provider = provider_with_models(&state.db, row).await?;
     event(&state.db, user_id, "provider", provider.id, "updated", 1).await?;
@@ -1217,7 +1222,14 @@ async fn respond(
     let (sources, planner_returned_no_queries) = if search_requested && should_search_web(&input.content) {
         // Search is deliberately a two-call workflow: plan queries, collect sources,
         // then make the answering call below with those sources as context.
-        let queries = generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &plain_transcript, &input.content).await?;
+        let queries = match generate_search_queries(&state.http, &kind, &p.1, &api_key, &model, &plain_transcript, &input.content).await {
+            Ok(queries) => queries,
+            Err(cause) => {
+                warn!(conversation_id=%id, error=%cause.message, "search planner failed; using the user question as the query");
+                Vec::new()
+            }
+        };
+        let queries = search_queries_with_fallback(queries, &input.content);
         info!(conversation_id=%id, planned_queries=queries.len(), "search planner completed");
         let planner_returned_no_queries = queries.is_empty();
         let mut merged = Vec::new();
@@ -1761,6 +1773,21 @@ fn is_valid_search_query(query: &str) -> bool {
     normalized.chars().count() >= 2 && normalized.chars().count() <= 180
 }
 
+fn search_queries_with_fallback(planned: Vec<String>, question: &str) -> Vec<String> {
+    let mut queries = Vec::new();
+    for query in planned.into_iter().chain(std::iter::once(question.trim().to_string())) {
+        let normalized = query.split_whitespace().collect::<Vec<_>>().join(" ");
+        let normalized = normalized.chars().take(180).collect::<String>();
+        if is_valid_search_query(&normalized)
+            && !queries.iter().any(|existing: &String| existing.eq_ignore_ascii_case(&normalized))
+        {
+            queries.push(normalized);
+        }
+        if queries.len() == 4 { break; }
+    }
+    queries
+}
+
 fn should_search_web(question: &str) -> bool {
     let normalized = question.trim().to_lowercase();
     !normalized.is_empty()
@@ -1795,7 +1822,7 @@ async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiEr
         .await?;
     let mut results = response.get("results").and_then(Value::as_array).cloned().unwrap_or_default().into_iter()
         .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
-        .map(|v| json!({"title":v["title"],"url":v["url"],"content":v["content"],"engine":v["engine"]}))
+        .map(|v| json!({"title":v["title"].as_str().unwrap_or_default(),"url":v["url"].as_str().unwrap_or_default(),"content":v["content"].as_str().unwrap_or_default(),"engine":v["engine"].as_str().unwrap_or("SearXNG")}))
         .collect::<Vec<_>>();
     results.truncate(8);
     info!(query_length=query.chars().count(), result_count=results.len(), "search query completed");
@@ -1828,48 +1855,41 @@ async fn call_provider(
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
 ) -> Result<String, ApiError> {
-    let url = match kind {
-        "anthropic" => format!("{}/v1/messages", base.trim_end_matches('/')),
-        _ => format!("{}/v1/chat/completions", base.trim_end_matches('/')),
-    };
+    let url = provider_url(kind, base);
     let response = if kind == "anthropic" {
         // Anthropic uses a top-level system field. Dropping it made the search planner
         // and the final search-grounding instructions ineffective for Claude providers.
         let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":64000,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
+        let mut body = json!({"model":model,"max_tokens":8192,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
         if !system.is_empty() { body["system"] = json!(system); }
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         http.post(url).header("x-api-key",key).header("anthropic-version","2023-06-01").json(&body).send().await?
     } else {
-        let mut body = json!({"model":model,"max_tokens":32000,"messages":messages,"stream":false});
+        let mut body = json!({"model":model,"messages":messages,"stream":false});
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
         http.post(url).bearer_auth(key).json(&body).send().await?
     };
     let body: Value = response.error_for_status()?.json().await?;
-    let answer = if kind == "anthropic" {
-        body["content"][0]["text"].as_str()
-    } else {
-        body["choices"][0]["message"]["content"].as_str()
-    }
+    let answer = if kind == "anthropic" { anthropic_content(&body) } else { openai_content(&body) }
     .ok_or_else(|| ApiError {
         status: StatusCode::BAD_GATEWAY,
         code: "invalid_provider_response",
         message: "The AI provider returned an unexpected response.".into(),
     })?;
-    Ok(answer.to_string())
+    Ok(answer)
 }
 
 async fn call_provider_stream(http: &Client, kind: &str, base: &str, key: &str, model: &str, messages: &[Value], temperature: Option<f32>, reasoning_effort: Option<&str>) -> Result<reqwest::Response, ApiError> {
-    let url = match kind { "anthropic" => format!("{}/v1/messages", base.trim_end_matches('/')), _ => format!("{}/v1/chat/completions", base.trim_end_matches('/')) };
+    let url = provider_url(kind, base);
     let response = if kind == "anthropic" {
         let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":64000,"stream":true,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
+        let mut body = json!({"model":model,"max_tokens":8192,"stream":true,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
         if !system.is_empty() { body["system"] = json!(system); }
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         http.post(url).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body).send().await?
     } else {
-        let mut body = json!({"model":model,"max_tokens":32000,"messages":messages,"stream":true});
+        let mut body = json!({"model":model,"messages":messages,"stream":true});
         if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
         if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
         http.post(url).bearer_auth(key).json(&body).send().await?
@@ -1877,11 +1897,50 @@ async fn call_provider_stream(http: &Client, kind: &str, base: &str, key: &str, 
     response.error_for_status().map_err(ApiError::from)
 }
 
-fn provider_stream_delta(kind: &str, frame: &str) -> Option<String> {
+fn provider_url(kind: &str, base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    match kind {
+        "anthropic" if base.ends_with("/v1/messages") => base.to_string(),
+        "anthropic" if base.ends_with("/v1") => format!("{base}/messages"),
+        "anthropic" => format!("{base}/v1/messages"),
+        _ if base.ends_with("/chat/completions") => base.to_string(),
+        _ if base.ends_with("/v1") => format!("{base}/chat/completions"),
+        _ => format!("{base}/v1/chat/completions"),
+    }
+}
+
+fn anthropic_content(body: &Value) -> Option<String> {
+    let content = body["content"].as_array()?;
+    let output = content.iter().filter_map(|part| match part["type"].as_str() {
+        Some("text") => part["text"].as_str().map(str::to_string),
+        Some("thinking") => part["thinking"].as_str().map(|text| format!("<think>{text}</think>")),
+        _ => None,
+    }).collect::<String>();
+    (!output.is_empty()).then_some(output)
+}
+
+fn openai_content(body: &Value) -> Option<String> {
+    let message = body["choices"].as_array()?.first()?.get("message")?;
+    let mut output = String::new();
+    for field in ["reasoning_content", "reasoning"] {
+        if let Some(value) = message[field].as_str() {
+            output.push_str("<think>"); output.push_str(value); output.push_str("</think>");
+        }
+    }
+    if let Some(value) = message["content"].as_str() { output.push_str(value); }
+    (!output.is_empty()).then_some(output)
+}
+
+fn provider_stream_delta(kind: &str, frame: &str) -> Option<(bool, String)> {
     let payload = frame.lines().find_map(|line| line.strip_prefix("data:"))?.trim();
     if payload == "[DONE]" { return None; }
     let value: Value = serde_json::from_str(payload).ok()?;
-    if kind == "anthropic" { value["delta"]["text"].as_str().map(str::to_string) } else { value["choices"].as_array()?.first()?["delta"]["content"].as_str().map(str::to_string) }
+    if kind == "anthropic" {
+        value["delta"]["text"].as_str().map(|text| (false, text.to_string())).or_else(|| value["delta"]["thinking"].as_str().map(|text| (true, text.to_string())))
+    } else {
+        let delta = &value["choices"].as_array()?.first()?["delta"];
+        delta["content"].as_str().map(|text| (false, text.to_string())).or_else(|| delta["reasoning_content"].as_str().map(|text| (true, text.to_string()))).or_else(|| delta["reasoning"].as_str().map(|text| (true, text.to_string())))
+    }
 }
 
 fn split_thinking(input: &str) -> (String, String) {
@@ -1945,7 +2004,7 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
         let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new();
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(delta) = provider_stream_delta(&kind, &frame) { for (is_reasoning, text) in thinking.push(&delta) { if text.is_empty() { continue; } if is_reasoning { reasoning.push_str(&text); } else { answer.push_str(&text); } let payload = serde_json::to_string(&json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
+                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some((provider_reasoning, delta)) = provider_stream_delta(&kind, &frame) { let fragments = if provider_reasoning { vec![(true, delta)] } else { thinking.push(&delta) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { reasoning.push_str(&text); } else { answer.push_str(&text); } let payload = serde_json::to_string(&json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
                 Err(error) => { warn!(conversation_id=%conversation_id, %error, "upstream stream interrupted"); let payload = serde_json::to_string(&json!({"type":"error","message":"The provider stream was interrupted."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
             }
         }
@@ -1964,7 +2023,7 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
 
 #[cfg(test)]
 mod tests {
-    use super::{content_part, is_valid_search_query, parse_data_url, plain_text_content, provider_stream_delta, split_thinking, strip_thinking, ThinkingStream};
+    use super::{content_part, is_valid_search_query, parse_data_url, plain_text_content, provider_stream_delta, provider_url, search_queries_with_fallback, split_thinking, strip_thinking, ThinkingStream};
 
     #[test]
     fn accepts_generic_planner_queries_without_topic_rules() {
@@ -1975,7 +2034,23 @@ mod tests {
 
     #[test]
     fn parses_openai_stream_delta() {
-        assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"), Some("hello".into()));
+        assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"), Some((false, "hello".into())));
+        assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}"), Some((true, "plan".into())));
+        assert_eq!(provider_stream_delta("anthropic", "data: {\"delta\":{\"thinking\":\"plan\"}}"), Some((true, "plan".into())));
+    }
+
+    #[test]
+    fn accepts_standard_provider_base_urls() {
+        assert_eq!(provider_url("openai_compatible", "https://api.openai.com"), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(provider_url("openai_compatible", "https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions");
+        assert_eq!(provider_url("anthropic", "https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(provider_url("anthropic", "https://api.anthropic.com/v1"), "https://api.anthropic.com/v1/messages");
+    }
+
+    #[test]
+    fn falls_back_to_the_latest_question_for_web_search() {
+        assert_eq!(search_queries_with_fallback(vec![], "latest rust release notes"), vec!["latest rust release notes"]);
+        assert_eq!(search_queries_with_fallback(vec!["OpenAI news".into()], "OpenAI news"), vec!["OpenAI news"]);
     }
 
     #[test]
