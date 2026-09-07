@@ -40,6 +40,10 @@ use tower_http::{
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+mod agent;
+mod providers;
+mod web_tools;
+
 const ACCESS_TOKEN_MINUTES: i64 = 15;
 const REFRESH_TOKEN_DAYS: i64 = 30;
 const DEFAULT_PAGE_SIZE: i64 = 50;
@@ -162,6 +166,46 @@ impl ApiError {
             message: message.into(),
         }
     }
+
+    fn provider_access_denied() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "provider_access_denied",
+            message: "The AI provider rejected this request. Check the provider key, endpoint, model access, and account balance or allowlist.".into(),
+        }
+    }
+
+    fn provider_rate_limited() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "provider_rate_limited",
+            message: "The AI provider is rate limiting requests. Wait briefly and try again.".into(),
+        }
+    }
+
+    fn provider_rejected() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "provider_rejected_request",
+            message: "The AI provider rejected this request. Check the selected model and provider configuration.".into(),
+        }
+    }
+
+    fn provider_tool_unsupported() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "provider_tool_unsupported",
+            message: "The selected provider or model does not support native tool calling.".into(),
+        }
+    }
+
+    fn provider_unavailable() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "provider_unavailable",
+            message: "The AI provider could not be reached.".into(),
+        }
+    }
 }
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -181,11 +225,7 @@ impl From<sqlx::Error> for ApiError {
 impl From<reqwest::Error> for ApiError {
     fn from(error: reqwest::Error) -> Self {
         error!(%error, "upstream provider failure");
-        Self {
-            status: StatusCode::BAD_GATEWAY,
-            code: "provider_unavailable",
-            message: "The AI provider could not be reached.".into(),
-        }
+        Self::provider_unavailable()
     }
 }
 
@@ -318,25 +358,6 @@ struct Message {
     edited_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug)]
-struct ToolCall {
-    id: String,
-    name: String,
-    input: Value,
-}
-
-struct ProviderToolTurn {
-    content: String,
-    assistant_message: Value,
-    tool_calls: Vec<ToolCall>,
-}
-
-struct WebAgentAnswer {
-    answer: String,
-    reasoning: String,
-    sources: Vec<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1243,7 +1264,7 @@ async fn respond(
             json!({"role":role,"content":content_part(&kind, supports_images, &strip_thinking(&content), images)})
         })
         .collect();
-    let explicit_search = content_requests_web_search(&input.content);
+    let explicit_search = web_tools::content_requests_web_search(&input.content);
     let search_requested = request.search.unwrap_or(false) || explicit_search;
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
     if let Some((summary, _)) = prior_summary {
@@ -1253,22 +1274,26 @@ async fn respond(
     transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
     if search_requested && !input.content.trim().is_empty() {
         if request.stream.unwrap_or(false) {
-            return Ok(stream_web_agent_response(state, id, user_id, kind, p.1, api_key, model, transcript, input.content, request.temperature, request.reasoning_effort, enable_markdown));
+            return Ok(stream_web_agent_response(state, id, user_id, kind, p.1, api_key, model, transcript, request.temperature, request.reasoning_effort, enable_markdown));
         }
-        let result = run_web_agent(&state, &kind, &p.1, &api_key, &model, transcript, &input.content, request.temperature, request.reasoning_effort.as_deref()).await?;
+        let result = agent::run_web_agent(&state, &kind, &p.1, &api_key, &model, transcript, request.temperature, request.reasoning_effort.as_deref(), None).await?;
         let message = persist_assistant_message(&state, id, user_id, &model, result.answer, result.reasoning, &result.sources, enable_markdown).await?;
         return Ok(Json(message).into_response());
     }
     if request.stream.unwrap_or(false) {
-        let upstream = call_provider_stream(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
+        let upstream = providers::call_provider_stream(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
         return Ok(stream_response(state, upstream, id, user_id, model, vec![], enable_markdown));
     }
-    let (answer, reasoning) = split_thinking(&call_provider(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?);
+    let (answer, reasoning) = split_thinking(&providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?);
     let m = persist_assistant_message(&state, id, user_id, &model, answer, reasoning, &[], enable_markdown).await?;
     Ok(Json(m).into_response())
 }
 
 async fn persist_assistant_message(state: &AppState, conversation_id: Uuid, user_id: Uuid, model: &str, answer: String, reasoning: String, sources: &[Value], enable_markdown: bool) -> Result<Message, ApiError> {
+    // Providers sometimes emit thinking tags in normal content. Normalize at the
+    // persistence boundary so private reasoning cannot become visible later.
+    let (answer, leaked_reasoning) = split_thinking(&answer);
+    let reasoning = format!("{reasoning}{leaked_reasoning}");
     let tokens = estimate_tokens(&answer);
     let mut tx = state.db.begin().await?;
     let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(conversation_id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
@@ -1361,7 +1386,7 @@ async fn compact(
         };
         let kind = provider_model_kind(&state.db, provider_id, &model).await?.unwrap_or_else(|| p.0.clone());
         info!(conversation_id=%id, through_sequence=end, source_characters=source.len(), "manual compaction started");
-        call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None).await?
+        providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None).await?
     } else {
         source.chars().take(30_000).collect()
     };
@@ -1389,7 +1414,7 @@ async fn search(
     if query.q.trim().is_empty() {
         return Err(ApiError::bad("Search query cannot be empty."));
     };
-    Ok(Json(fetch_search(&state, &query.q).await?))
+    Ok(Json(web_tools::fetch_search(&state, &query.q).await?))
 }
 
 async fn dictionary_lookup(
@@ -1731,419 +1756,6 @@ fn lookup_english_chinese_dictionary(
         .collect())
 }
 
-fn is_valid_search_query(query: &str) -> bool {
-    let normalized = query.trim();
-    normalized.chars().count() >= 2 && normalized.chars().count() <= 180
-}
-
-fn content_requests_web_search(question: &str) -> bool {
-    let normalized = question.to_lowercase();
-    ["web search", "online search", "search the internet", "联网搜索", "网络搜索", "使用网络搜索", "上网搜索", "可以上网", "帮我搜索", "搜索一下"]
-        .iter()
-        .any(|phrase| normalized.contains(phrase))
-}
-
-async fn fetch_searxng_response(
-    client: &Client,
-    base: &str,
-    query: &str,
-    language: &str,
-    engines: Option<&str>,
-) -> Result<Value, reqwest::Error> {
-    let mut request = client
-        .get(format!("{}/search", base.trim_end_matches('/')))
-        .query(&[("q", query), ("format", "json"), ("language", language)]);
-    if let Some(engines) = engines {
-        request = request.query(&[("engines", engines)]);
-    }
-    request.send().await?.error_for_status()?.json().await
-}
-
-fn search_results(response: Value) -> Vec<Value> {
-    response.get("results").and_then(Value::as_array).cloned().unwrap_or_default().into_iter()
-        .filter(|v| v.get("title").and_then(Value::as_str).is_some_and(|x| !x.trim().is_empty()) && v.get("url").and_then(Value::as_str).is_some_and(|x| x.starts_with("http")))
-        .map(|v| json!({"title":v["title"].as_str().unwrap_or_default(),"url":v["url"].as_str().unwrap_or_default(),"content":v["content"].as_str().unwrap_or_default(),"engine":v["engine"].as_str().unwrap_or("SearXNG")}))
-        .collect()
-}
-
-async fn fetch_search(state: &AppState, query: &str) -> Result<Vec<Value>, ApiError> {
-    let base = state
-        .searxng_url
-        .as_deref()
-        .ok_or_else(|| ApiError::bad("Online search is not configured."))?;
-    let search_query = query.trim();
-    let language = if search_query.chars().any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch)) { "zh-CN" } else { "en-US" };
-    let preferred_engines = state.searxng_preferred_engines.as_deref();
-    let mut results = match preferred_engines {
-        Some(engines) => match fetch_searxng_response(&state.http, base, search_query, language, Some(engines)).await {
-            Ok(response) => search_results(response),
-            Err(error) => {
-                warn!(%engines, error=%error, "preferred web search engines failed; using aggregate search");
-                Vec::new()
-            }
-        },
-        None => Vec::new(),
-    };
-    if results.len() < MIN_PREFERRED_SEARCH_RESULTS {
-        for result in search_results(fetch_searxng_response(&state.http, base, search_query, language, None).await?) {
-            if !results.iter().any(|existing| existing["url"] == result["url"]) {
-                results.push(result);
-            }
-        }
-    }
-    results.truncate(8);
-    info!(query_length=query.chars().count(), result_count=results.len(), preferred_engines=?preferred_engines, "search query completed");
-    Ok(results)
-}
-
-fn web_tool_definitions(kind: &str) -> Value {
-    let search_schema = json!({
-        "type": "object",
-        "properties": {"query": {"type": "string", "description": "A concise, specific search-engine query."}},
-        "required": ["query"],
-        "additionalProperties": false
-    });
-    let open_schema = json!({
-        "type": "object",
-        "properties": {"url": {"type": "string", "description": "An exact http(s) URL returned by web_search."}},
-        "required": ["url"],
-        "additionalProperties": false
-    });
-    if kind == "anthropic" {
-        json!([
-            {"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","input_schema":search_schema},
-            {"name":"open_web_page","description":"Read the text of an exact result URL returned by web_search. Use this to verify details before making consequential claims.","input_schema":open_schema}
-        ])
-    } else {
-        json!([
-            {"type":"function","function":{"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","parameters":search_schema}},
-            {"type":"function","function":{"name":"open_web_page","description":"Read the text of an exact result URL returned by web_search. Use this to verify details before making consequential claims.","parameters":open_schema}}
-        ])
-    }
-}
-
-fn add_search_sources(sources: &mut Vec<Value>, query: &str, results: Vec<Value>) {
-    for mut result in results {
-        result["query"] = json!(query);
-        if !sources.iter().any(|existing| existing["url"] == result["url"]) {
-            sources.push(result);
-        }
-        if sources.len() >= MAX_WEB_SOURCES {
-            break;
-        }
-    }
-}
-
-fn tool_search_results(results: &[Value]) -> Value {
-    Value::Array(
-        results
-            .iter()
-            .take(5)
-            .map(|result| {
-                let mut result = result.clone();
-                if let Some(content) = result["content"].as_str() {
-                    result["content"] = json!(content.chars().take(900).collect::<String>());
-                }
-                result
-            })
-            .collect(),
-    )
-}
-
-fn is_safe_public_url(raw: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(raw) else {
-        return false;
-    };
-    if !matches!(url.scheme(), "http" | "https") {
-        return false;
-    }
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    let host = host.trim_matches(['[', ']']);
-    if host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost") {
-        return false;
-    }
-    match host.parse::<IpAddr>() {
-        Ok(ip) => is_safe_public_ip(ip),
-        Err(_) => true,
-    }
-}
-
-fn is_safe_public_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            !ip.is_private()
-                && !ip.is_loopback()
-                && !ip.is_link_local()
-                && !ip.is_unspecified()
-                && !ip.is_broadcast()
-        }
-        IpAddr::V6(ip) => {
-            !ip.is_loopback() && !ip.is_unspecified() && !ip.is_unique_local() && !ip.is_unicast_link_local()
-        }
-    }
-}
-
-async fn resolves_to_public_addresses(raw: &str) -> bool {
-    let Ok(url) = reqwest::Url::parse(raw) else {
-        return false;
-    };
-    let Some(host) = url.host_str() else {
-        return false;
-    };
-    if host.trim_matches(['[', ']']).parse::<IpAddr>().is_ok() {
-        return true;
-    }
-    let port = url.port_or_known_default().unwrap_or(443);
-    match tokio::net::lookup_host((host, port)).await {
-        Ok(addresses) => {
-            let addresses = addresses.collect::<Vec<_>>();
-            !addresses.is_empty() && addresses.iter().all(|address| is_safe_public_ip(address.ip()))
-        }
-        Err(_) => false,
-    }
-}
-
-fn html_to_text(html: &str) -> String {
-    let mut compact = html.to_string();
-    for tag in ["script", "style", "noscript", "svg"] {
-        let lower = compact.to_ascii_lowercase();
-        let mut cursor = 0;
-        while let Some(start) = lower[cursor..].find(&format!("<{tag}")) {
-            let start = cursor + start;
-            let Some(end) = lower[start..].find(&format!("</{tag}>")) else {
-                compact.replace_range(start..compact.len(), &" ".repeat(compact.len() - start));
-                break;
-            };
-            let end = start + end + tag.len() + 3;
-            compact.replace_range(start..end, &" ".repeat(end - start));
-            cursor = end;
-        }
-    }
-    let mut text = String::with_capacity(compact.len().min(24_000));
-    let mut in_tag = false;
-    for character in compact.chars() {
-        match character {
-            '<' => { in_tag = true; text.push(' '); }
-            '>' => in_tag = false,
-            _ if !in_tag => text.push(character),
-            _ => {}
-        }
-    }
-    text = text
-        .replace("&nbsp;", " ")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'");
-    text.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(12_000).collect()
-}
-
-async fn open_search_result(state: &AppState, url: &str, allowed_urls: &[String]) -> Result<Value, String> {
-    if !allowed_urls.iter().any(|allowed| allowed == url)
-        || !is_safe_public_url(url)
-        || !resolves_to_public_addresses(url).await
-    {
-        return Err("The URL must be an exact public result returned by web_search.".into());
-    }
-    let response = state
-        .web_reader
-        .get(url)
-        .header("Accept", "text/html, text/plain;q=0.9")
-        .send()
-        .await
-        .map_err(|_| "The page could not be retrieved.".to_string())?
-        .error_for_status()
-        .map_err(|_| "The page returned an error response.".to_string())?;
-    let content_type = response
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !content_type.is_empty() && !content_type.contains("text/") && !content_type.contains("html") && !content_type.contains("xml") {
-        return Err("The result is not a readable text page.".into());
-    }
-    let mut bytes = Vec::new();
-    let mut body = response.bytes_stream();
-    while let Some(next) = body.next().await {
-        let chunk = next.map_err(|_| "The page could not be read.".to_string())?;
-        let remaining = 1_000_000usize.saturating_sub(bytes.len());
-        if remaining == 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-    }
-    let raw = String::from_utf8_lossy(&bytes);
-    let content = if content_type.contains("html") || raw.contains("<html") {
-        html_to_text(&raw)
-    } else {
-        raw.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(12_000).collect()
-    };
-    if content.trim().is_empty() {
-        return Err("The page did not contain readable text.".into());
-    }
-    Ok(json!({"url":url,"content":content}))
-}
-
-async fn execute_web_tool(
-    state: &AppState,
-    call: &ToolCall,
-    sources: &mut Vec<Value>,
-    allowed_urls: &mut Vec<String>,
-) -> Value {
-    match call.name.as_str() {
-        "web_search" => {
-            let query = call.input["query"].as_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" ");
-            if !is_valid_search_query(&query) {
-                return json!({"error":"web_search requires a focused query between 2 and 180 characters."});
-            }
-            match fetch_search(state, &query).await {
-                Ok(results) => {
-                    add_search_sources(sources, &query, results);
-                    for result in sources.iter() {
-                        if result["query"] == query {
-                            if let Some(url) = result["url"].as_str() {
-                                if is_safe_public_url(url) && !allowed_urls.iter().any(|allowed| allowed == url) {
-                                    allowed_urls.push(url.to_string());
-                                }
-                            }
-                        }
-                    }
-                    let matching = sources
-                        .iter()
-                        .filter(|result| result["query"] == query)
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    json!({"query":query,"results":tool_search_results(&matching)})
-                }
-                Err(error) => json!({"error":error.message}),
-            }
-        }
-        "open_web_page" => {
-            let url = call.input["url"].as_str().unwrap_or("");
-            match open_search_result(state, url, allowed_urls).await {
-                Ok(page) => {
-                    if let Some(source) = sources.iter_mut().find(|source| source["url"] == page["url"]) {
-                        source["content"] = page["content"].clone();
-                    }
-                    page
-                }
-                Err(message) => json!({"error":message}),
-            }
-        }
-        _ => json!({"error":"Unknown tool. Only web_search and open_web_page are available."}),
-    }
-}
-
-async fn call_provider_with_tools(
-    http: &Client,
-    kind: &str,
-    base: &str,
-    key: &str,
-    model: &str,
-    messages: &[Value],
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
-) -> Result<ProviderToolTurn, ApiError> {
-    let url = provider_url(kind, base);
-    let response = if kind == "anthropic" {
-        let system = messages.iter().filter(|message| message["role"] == "system").filter_map(|message| message["content"].as_str()).collect::<Vec<_>>().join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":8192,"messages":messages.iter().filter(|message|message["role"] != "system").collect::<Vec<_>>(),"tools":web_tool_definitions(kind)});
-        if !system.is_empty() { body["system"] = json!(system); }
-        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
-        http.post(url).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body).send().await?
-    } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":false,"tools":web_tool_definitions(kind)});
-        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
-        if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
-        http.post(url).bearer_auth(key).json(&body).send().await?
-    };
-    let body: Value = response.error_for_status()?.json().await?;
-    if kind == "anthropic" {
-        let blocks = body["content"].as_array().cloned().ok_or_else(|| ApiError::bad("The provider returned an unexpected tool response."))?;
-        let tool_calls = blocks.iter().filter(|block| block["type"] == "tool_use").filter_map(|block| Some(ToolCall { id: block["id"].as_str()?.to_string(), name: block["name"].as_str()?.to_string(), input: block["input"].clone() })).collect();
-        Ok(ProviderToolTurn { content: anthropic_content(&body).unwrap_or_default(), assistant_message: json!({"role":"assistant","content":blocks}), tool_calls })
-    } else {
-        let mut message = body["choices"].as_array().and_then(|choices| choices.first()).and_then(|choice| choice.get("message")).cloned().ok_or_else(|| ApiError::bad("The provider returned an unexpected tool response."))?;
-        if message["role"].is_null() {
-            message["role"] = json!("assistant");
-        }
-        let tool_calls = message["tool_calls"].as_array().into_iter().flatten().filter_map(|call| {
-            let arguments = call["function"]["arguments"].as_str().unwrap_or("{}");
-            Some(ToolCall { id: call["id"].as_str()?.to_string(), name: call["function"]["name"].as_str()?.to_string(), input: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})) })
-        }).collect();
-        Ok(ProviderToolTurn { content: openai_content(&json!({"choices":[{"message":message.clone()}]})).unwrap_or_default(), assistant_message: message, tool_calls })
-    }
-}
-
-async fn run_web_agent(
-    state: &AppState,
-    kind: &str,
-    base: &str,
-    key: &str,
-    model: &str,
-    mut transcript: Vec<Value>,
-    question: &str,
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
-) -> Result<WebAgentAnswer, ApiError> {
-    transcript.insert(0, json!({"role":"system","content":"Web tools are available. Use web_search for up-to-date or uncertain factual claims, refine vague searches, and open_web_page before relying on an important source. Do not invent tool results or citations. Give a direct answer after gathering enough evidence, and cite the supporting source URLs."}));
-    let mut sources = Vec::new();
-    let mut allowed_urls = Vec::new();
-    match fetch_search(state, question).await {
-        Ok(results) => {
-            add_search_sources(&mut sources, question, results);
-            allowed_urls.extend(sources.iter().filter_map(|source| source["url"].as_str()).filter(|url| is_safe_public_url(url)).map(str::to_string));
-            transcript.insert(1, json!({"role":"system","content":format!("Initial search evidence for the latest user request follows. It may be incomplete; use the tools to verify or refine it. {}", serde_json::to_string(&tool_search_results(&sources)).unwrap_or_default())}));
-        }
-        Err(error) => {
-            warn!(error=%error.message, "initial web search failed");
-            transcript.insert(1, json!({"role":"system","content":"The initial web search failed. You may still try the web_search tool if the provider supports it; otherwise state the limitation plainly."}));
-        }
-    }
-    for round in 0..MAX_WEB_TOOL_ROUNDS {
-        let turn = match call_provider_with_tools(&state.http, kind, base, key, model, &transcript, temperature, reasoning_effort).await {
-            Ok(turn) => turn,
-            Err(error) => {
-                warn!(round, error=%error.message, "provider rejected native web tools; falling back to retrieved evidence");
-                let (answer, reasoning) = split_thinking(&call_provider(&state.http, kind, base, key, model, &transcript, temperature, reasoning_effort).await?);
-                return Ok(WebAgentAnswer { answer, reasoning, sources });
-            }
-        };
-        if turn.tool_calls.is_empty() {
-            let (answer, reasoning) = split_thinking(&turn.content);
-            if !answer.trim().is_empty() {
-                info!(round, source_count=sources.len(), "web agent completed");
-                return Ok(WebAgentAnswer { answer, reasoning, sources });
-            }
-            break;
-        }
-        info!(round, tool_calls=turn.tool_calls.len(), "web agent requested tools");
-        transcript.push(turn.assistant_message);
-        let mut anthropic_results = Vec::new();
-        for (index, call) in turn.tool_calls.iter().enumerate() {
-            let result = if index < 4 {
-                execute_web_tool(state, call, &mut sources, &mut allowed_urls).await
-            } else {
-                json!({"error":"This tool-call batch exceeded the limit of four calls. Continue using the results already returned."})
-            };
-            if kind == "anthropic" {
-                anthropic_results.push(json!({"type":"tool_result","tool_use_id":call.id,"content":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
-            } else {
-                transcript.push(json!({"role":"tool","tool_call_id":call.id,"content":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
-            }
-        }
-        if kind == "anthropic" && !anthropic_results.is_empty() {
-            transcript.push(json!({"role":"user","content":anthropic_results}));
-        }
-    }
-    transcript.insert(0, json!({"role":"system","content":"Finish now using the collected evidence. Clearly distinguish missing evidence from established facts, and do not call more tools."}));
-    let (answer, reasoning) = split_thinking(&call_provider(&state.http, kind, base, key, model, &transcript, temperature, reasoning_effort).await?);
-    Ok(WebAgentAnswer { answer, reasoning, sources })
-}
 async fn sync(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2161,103 +1773,6 @@ async fn sync(
         next_cursor: next,
     }))
 }
-async fn call_provider(
-    http: &Client,
-    kind: &str,
-    base: &str,
-    key: &str,
-    model: &str,
-    messages: &[Value],
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
-) -> Result<String, ApiError> {
-    let url = provider_url(kind, base);
-    let response = if kind == "anthropic" {
-        // Anthropic uses a top-level system field. Dropping it made the search planner
-        // and the final search-grounding instructions ineffective for Claude providers.
-        let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":8192,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
-        if !system.is_empty() { body["system"] = json!(system); }
-        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
-        http.post(url).header("x-api-key",key).header("anthropic-version","2023-06-01").json(&body).send().await?
-    } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":false});
-        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
-        if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
-        http.post(url).bearer_auth(key).json(&body).send().await?
-    };
-    let body: Value = response.error_for_status()?.json().await?;
-    let answer = if kind == "anthropic" { anthropic_content(&body) } else { openai_content(&body) }
-    .ok_or_else(|| ApiError {
-        status: StatusCode::BAD_GATEWAY,
-        code: "invalid_provider_response",
-        message: "The AI provider returned an unexpected response.".into(),
-    })?;
-    Ok(answer)
-}
-
-async fn call_provider_stream(http: &Client, kind: &str, base: &str, key: &str, model: &str, messages: &[Value], temperature: Option<f32>, reasoning_effort: Option<&str>) -> Result<reqwest::Response, ApiError> {
-    let url = provider_url(kind, base);
-    let response = if kind == "anthropic" {
-        let system = messages.iter().filter(|m| m["role"] == "system").filter_map(|m| m["content"].as_str()).collect::<Vec<_>>().join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":8192,"stream":true,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
-        if !system.is_empty() { body["system"] = json!(system); }
-        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
-        http.post(url).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&body).send().await?
-    } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":true});
-        if let Some(value) = temperature { body["temperature"] = json!(value.clamp(0.0, 2.0)); }
-        if let Some(value) = reasoning_effort { body["reasoning_effort"] = json!(value); }
-        http.post(url).bearer_auth(key).json(&body).send().await?
-    };
-    response.error_for_status().map_err(ApiError::from)
-}
-
-fn provider_url(kind: &str, base: &str) -> String {
-    let base = base.trim_end_matches('/');
-    match kind {
-        "anthropic" if base.ends_with("/v1/messages") => base.to_string(),
-        "anthropic" if base.ends_with("/v1") => format!("{base}/messages"),
-        "anthropic" => format!("{base}/v1/messages"),
-        _ if base.ends_with("/chat/completions") => base.to_string(),
-        _ if base.ends_with("/v1") => format!("{base}/chat/completions"),
-        _ => format!("{base}/v1/chat/completions"),
-    }
-}
-
-fn anthropic_content(body: &Value) -> Option<String> {
-    let content = body["content"].as_array()?;
-    let output = content.iter().filter_map(|part| match part["type"].as_str() {
-        Some("text") => part["text"].as_str().map(str::to_string),
-        Some("thinking") => part["thinking"].as_str().map(|text| format!("<think>{text}</think>")),
-        _ => None,
-    }).collect::<String>();
-    (!output.is_empty()).then_some(output)
-}
-
-fn openai_content(body: &Value) -> Option<String> {
-    let message = body["choices"].as_array()?.first()?.get("message")?;
-    let mut output = String::new();
-    for field in ["reasoning_content", "reasoning"] {
-        if let Some(value) = message[field].as_str() {
-            output.push_str("<think>"); output.push_str(value); output.push_str("</think>");
-        }
-    }
-    if let Some(value) = message["content"].as_str() { output.push_str(value); }
-    (!output.is_empty()).then_some(output)
-}
-
-fn provider_stream_delta(kind: &str, frame: &str) -> Option<(bool, String)> {
-    let payload = frame.lines().find_map(|line| line.strip_prefix("data:"))?.trim();
-    if payload == "[DONE]" { return None; }
-    let value: Value = serde_json::from_str(payload).ok()?;
-    if kind == "anthropic" {
-        value["delta"]["text"].as_str().map(|text| (false, text.to_string())).or_else(|| value["delta"]["thinking"].as_str().map(|text| (true, text.to_string())))
-    } else {
-        let delta = &value["choices"].as_array()?.first()?["delta"];
-        delta["content"].as_str().map(|text| (false, text.to_string())).or_else(|| delta["reasoning_content"].as_str().map(|text| (true, text.to_string()))).or_else(|| delta["reasoning"].as_str().map(|text| (true, text.to_string())))
-    }
-}
 
 fn split_thinking(input: &str) -> (String, String) {
     let mut answer = String::new();
@@ -2265,11 +1780,10 @@ fn split_thinking(input: &str) -> (String, String) {
     let mut remaining = input;
     let mut in_think = false;
     while !remaining.is_empty() {
-        let marker = if in_think { "</think>" } else { "<think>" };
-        match remaining.find(marker) {
-            Some(index) => {
+        match find_thinking_marker(remaining, in_think) {
+            Some((index, marker_len)) => {
                 if in_think { reasoning.push_str(&remaining[..index]); } else { answer.push_str(&remaining[..index]); }
-                remaining = &remaining[index + marker.len()..];
+                remaining = &remaining[index + marker_len..];
                 in_think = !in_think;
             }
             None => {
@@ -2283,6 +1797,27 @@ fn split_thinking(input: &str) -> (String, String) {
 
 fn strip_thinking(input: &str) -> String { split_thinking(input).0 }
 
+fn thinking_markers(in_think: bool) -> &'static [&'static str] {
+    if in_think { &["</thinking>", "</think>"] } else { &["<thinking>", "<think>"] }
+}
+
+fn find_thinking_marker(input: &str, in_think: bool) -> Option<(usize, usize)> {
+    thinking_markers(in_think)
+        .iter()
+        .filter_map(|marker| input.as_bytes().windows(marker.len()).position(|candidate| candidate.eq_ignore_ascii_case(marker.as_bytes())).map(|index| (index, marker.len())))
+        .min_by_key(|(index, _)| *index)
+}
+
+fn thinking_marker_suffix_len(input: &str, in_think: bool) -> usize {
+    thinking_markers(in_think)
+        .iter()
+        .flat_map(|marker| (1..marker.len()).rev().map(move |size| (marker, size)))
+        .filter(|(marker, size)| input.len() >= *size && input.as_bytes()[input.len() - *size..].eq_ignore_ascii_case(&marker.as_bytes()[..*size]))
+        .map(|(_, size)| size)
+        .max()
+        .unwrap_or(0)
+}
+
 struct ThinkingStream {
     in_think: bool,
     pending: String,
@@ -2293,14 +1828,13 @@ impl ThinkingStream {
         self.pending.push_str(input);
         let mut output = Vec::new();
         loop {
-            let marker = if self.in_think { "</think>" } else { "<think>" };
-            if let Some(index) = self.pending.find(marker) {
+            if let Some((index, marker_len)) = find_thinking_marker(&self.pending, self.in_think) {
                 if index > 0 { output.push((self.in_think, self.pending[..index].to_string())); }
-                self.pending.drain(..index + marker.len());
+                self.pending.drain(..index + marker_len);
                 self.in_think = !self.in_think;
                 continue;
             }
-            let keep = (1..marker.len()).rev().find(|size| self.pending.ends_with(&marker[..*size])).unwrap_or(0);
+            let keep = thinking_marker_suffix_len(&self.pending, self.in_think);
             let safe = self.pending.len().saturating_sub(keep);
             if safe > 0 {
                 output.push((self.in_think, self.pending[..safe].to_string()));
@@ -2320,7 +1854,7 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
         let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new();
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some((provider_reasoning, delta)) = provider_stream_delta(&kind, &frame) { let fragments = if provider_reasoning { vec![(true, delta)] } else { thinking.push(&delta) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { reasoning.push_str(&text); } else { answer.push_str(&text); } let payload = serde_json::to_string(&json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
+                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some((provider_reasoning, delta)) = providers::provider_stream_delta(&kind, &frame) { let fragments = if provider_reasoning { vec![(true, delta)] } else { thinking.push(&delta) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { reasoning.push_str(&text); } else { answer.push_str(&text); } let payload = serde_json::to_string(&json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
                 Err(error) => { warn!(conversation_id=%conversation_id, %error, "upstream stream interrupted"); let payload = serde_json::to_string(&json!({"type":"error","message":"The provider stream was interrupted."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
             }
         }
@@ -2346,15 +1880,30 @@ fn stream_web_agent_response(
     api_key: String,
     model: String,
     transcript: Vec<Value>,
-    question: String,
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
     enable_markdown: bool,
 ) -> Response {
     let output = async_stream::stream! {
-        let started = serde_json::to_string(&json!({"type":"tool","tool":{"name":"web_search","status":"running","input":{"query":question}}})).unwrap_or_default();
-        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {started}\n\n")));
-        let result = match run_web_agent(&state, &kind, &base, &api_key, &model, transcript, &question, temperature, reasoning_effort.as_deref()).await {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let agent = agent::run_web_agent(&state, &kind, &base, &api_key, &model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_tx));
+        tokio::pin!(agent);
+        let result = loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    if let Some(tool) = event {
+                        let payload = serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default();
+                        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                    }
+                }
+                result = &mut agent => break result,
+            }
+        };
+        while let Ok(tool) = event_rx.try_recv() {
+            let payload = serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default();
+            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+        }
+        let result = match result {
             Ok(result) => result,
             Err(error) => {
                 error!(conversation_id=%conversation_id, error=%error.message, "web agent response failed");
@@ -2363,8 +1912,6 @@ fn stream_web_agent_response(
                 return;
             }
         };
-        let completed = serde_json::to_string(&json!({"type":"tool","tool":{"name":"web_search","status":"completed","source_count":result.sources.len()}})).unwrap_or_default();
-        yield Ok(Bytes::from(format!("data: {completed}\n\n")));
         if !result.reasoning.trim().is_empty() {
             let payload = serde_json::to_string(&json!({"type":"reasoning","delta":result.reasoning})).unwrap_or_default();
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
@@ -2399,7 +1946,10 @@ fn stream_web_agent_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{content_part, is_safe_public_url, is_valid_search_query, parse_data_url, plain_text_content, provider_stream_delta, provider_url, split_thinking, strip_thinking, web_tool_definitions, ThinkingStream};
+    use super::{content_part, parse_data_url, plain_text_content, split_thinking, strip_thinking, ThinkingStream};
+    use crate::providers::{provider_error_from_response, provider_stream_delta, provider_url};
+    use crate::web_tools::{is_safe_public_url, is_valid_search_query, web_tool_definitions};
+    use axum::http::StatusCode;
 
     #[test]
     fn accepts_generic_planner_queries_without_topic_rules() {
@@ -2469,8 +2019,19 @@ mod tests {
     fn separates_thinking_from_visible_answer_in_complete_and_streamed_text() {
         assert_eq!(strip_thinking("Before<think>private</think>After"), "BeforeAfter");
         assert_eq!(split_thinking("Before<think>private</think>After"), ("BeforeAfter".into(), "private".into()));
+        assert_eq!(split_thinking("Before<THINKING>private</Thinking>After"), ("BeforeAfter".into(), "private".into()));
         let mut stream = ThinkingStream::new();
         assert_eq!(stream.push("Before<thi"), vec![(false, "Before".into())]);
         assert_eq!(stream.push("nk>private</think>After"), vec![(true, "private".into()), (false, "After".into())]);
+        let mut long_tag_stream = ThinkingStream::new();
+        assert_eq!(long_tag_stream.push("Before<thinkin"), vec![(false, "Before".into())]);
+        assert_eq!(long_tag_stream.push("g>private</thinking>After"), vec![(true, "private".into()), (false, "After".into())]);
+    }
+
+    #[test]
+    fn distinguishes_provider_access_and_tool_schema_failures() {
+        assert_eq!(provider_error_from_response(StatusCode::FORBIDDEN, "tool calling is unsupported", true).code, "provider_access_denied");
+        assert_eq!(provider_error_from_response(StatusCode::BAD_REQUEST, "tool_choice is unsupported", true).code, "provider_tool_unsupported");
+        assert_eq!(provider_error_from_response(StatusCode::TOO_MANY_REQUESTS, "", false).code, "provider_rate_limited");
     }
 }

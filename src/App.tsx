@@ -38,8 +38,8 @@ async function copyText(text: string) {
 
 function updateToolEvents(current: ToolActivity[], next?: ToolActivity) {
   if (!next) return current;
-  const index = current.findIndex((item) => item.name === next.name && item.status === "running");
-  if (index >= 0 && next.status !== "running") return current.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item);
+  const index = current.findIndex((item) => item.id === next.id);
+  if (index >= 0) return current.map((item, itemIndex) => itemIndex === index ? { ...item, ...next } : item);
   return [...current, next];
 }
 
@@ -568,11 +568,20 @@ function SourceList({ sources }: { sources: Message["search_sources"] }) {
 
 function ToolActivityList({ events }: { events?: ToolActivity[] }) {
   if (!events?.length) return null;
-  return <div className="tool-activity" aria-live="polite">{events.map((event, index) => {
+  function label(event: ToolActivity) {
     const query = event.input?.query;
-    const label = event.status === "running" ? (query ? `Searching web: ${query}` : "Searching the web") : event.source_count !== undefined ? `Web evidence collected: ${event.source_count} sources` : "Web search complete";
-    return <span key={`${event.name}-${index}`} className={event.status === "running" ? "running" : "complete"}>{event.status === "running" ? <LoaderCircle className="spin" size={13} /> : <Check size={13} />}{label}</span>;
-  })}</div>;
+    const host = event.input?.url ? sourceHost(event.input.url) : "";
+    if (event.status === "failed") return event.detail || `${event.name.replace(/_/g, " ")} failed`;
+    if (event.name === "planning") return event.status === "running" ? "Planning research" : "Research step planned";
+    if (event.name === "web_search") {
+      if (event.status === "running") return query ? `Searching: ${query}` : "Searching the web";
+      return event.source_count !== undefined ? `Search complete: ${event.source_count} sources` : "Search complete";
+    }
+    if (event.name === "open_web_page") return event.status === "running" ? `Reading: ${host || "source"}` : `Read: ${host || "source"}`;
+    if (event.name === "drafting") return event.status === "running" ? "Drafting answer" : "Answer drafted";
+    return event.status === "running" ? `${event.name.replace(/_/g, " ")} in progress` : `${event.name.replace(/_/g, " ")} complete`;
+  }
+  return <section className="tool-activity" aria-label="Research activity" aria-live="polite">{events.map((event) => <div key={event.id} className={`tool-step ${event.status}`}><span className="tool-step-icon">{event.status === "running" ? <LoaderCircle className="spin" size={13} /> : event.status === "failed" ? <CircleAlert size={13} /> : <Check size={13} />}</span><span className="tool-step-copy">{label(event)}</span></div>)}</section>;
 }
 
 function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, onEdit, onDelete, onRetry, onLookup }: { message: Message; markdownEnabled: boolean; theme: "light" | "dark"; isLast: boolean; lookupActive: boolean; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void }) {
@@ -662,15 +671,19 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
   }
   function captureSelection() { if (lookupActiveRef.current) return; const selected = window.getSelection()?.toString().trim() ?? ""; if (selected && selected.length <= 120) { selectionCaptured.current = true; const range = window.getSelection()?.rangeCount ? window.getSelection()?.getRangeAt(0).getBoundingClientRect() : undefined; onLookup(selected, { x: Math.min(window.innerWidth - 18, Math.max(18, range?.left ?? window.innerWidth / 2)), y: Math.min(window.innerHeight - 18, Math.max(18, range?.bottom ?? window.innerHeight / 2)) }); } }
   const legacy = splitLegacyThinking(message.content);
-  const content = message.reasoning_content ? message.content : legacy.content;
-  const reasoning = message.reasoning_content || legacy.reasoning;
+  const content = legacy.content;
+  const reasoning = [message.reasoning_content, legacy.reasoning].filter(Boolean).join("\n");
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
   return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>{reasoning && <ThinkingBlock reasoning={reasoning} />}{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning && !message.images?.length ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>}</>}<ToolActivityList events={message.tool_events} />{isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}<SourceList sources={message.search_sources ?? []} /><div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></article>;
 }
 
 function splitLegacyThinking(value: string) {
-  const match = /<think>([\s\S]*?)(?:<\/think>|$)/i.exec(value);
-  return match ? { content: value.replace(match[0], "").trimStart(), reasoning: match[1].trim() } : { content: value, reasoning: "" };
+  const reasoning: string[] = [];
+  let content = value.replace(/<(think|thinking)>([\s\S]*?)(?:<\/\1>|$)/gi, (_, _tag, thought: string) => {
+    if (thought.trim()) reasoning.push(thought.trim());
+    return "";
+  });
+  return { content: content.trimStart(), reasoning: reasoning.join("\n") };
 }
 
 function ProviderDialog({ providers, onClose, onChanged }: { providers: Provider[]; onClose: () => void; onChanged: () => Promise<void> }) {
