@@ -400,6 +400,8 @@ struct GenerationSettings {
     reasoning_effort: String,
     enable_markdown: bool,
     stream: bool,
+    #[serde(default)]
+    builtin_tools: bool,
     #[serde(default = "default_context_rounds")]
     context_rounds: Option<u8>,
     #[serde(default = "default_tool_rounds")]
@@ -463,6 +465,7 @@ struct RespondRequest {
     reasoning_effort: Option<String>,
     enable_markdown: Option<bool>,
     stream: Option<bool>,
+    builtin_tools: Option<bool>,
     context_rounds: Option<Option<u8>>,
     tool_rounds: Option<Option<u8>>,
 }
@@ -1560,7 +1563,8 @@ async fn respond(
         transcript = transcript.split_off(start);
     }
     let explicit_search = web_tools::content_requests_web_search(&input.content);
-    let search_requested = request.search.unwrap_or(false) || explicit_search;
+    let search_requested = (request.search.unwrap_or(false) || explicit_search)
+        && !request.builtin_tools.unwrap_or(false);
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
     if let Some((summary, _)) = prior_summary {
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
@@ -1637,6 +1641,7 @@ async fn respond(
             &transcript,
             request.temperature,
             request.reasoning_effort.as_deref(),
+            request.builtin_tools.unwrap_or(false),
         )
         .await?;
         return Ok(stream_response(
@@ -1659,6 +1664,7 @@ async fn respond(
             &transcript,
             request.temperature,
             request.reasoning_effort.as_deref(),
+            request.builtin_tools.unwrap_or(false),
         )
         .await?,
     );
@@ -1808,7 +1814,7 @@ async fn compact(
             .await?
             .unwrap_or_else(|| p.0.clone());
         info!(conversation_id=%id, through_sequence=end, source_characters=source.len(), "manual compaction started");
-        providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None).await?
+        providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None, false).await?
     } else {
         source.chars().take(30_000).collect()
     };

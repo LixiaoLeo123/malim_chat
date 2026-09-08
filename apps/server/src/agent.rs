@@ -110,6 +110,7 @@ pub(super) async fn run_web_agent(
                         &transcript,
                         temperature,
                         reasoning_effort,
+                        false,
                     )
                     .await?,
                 );
@@ -272,6 +273,7 @@ pub(super) async fn run_web_agent(
         &transcript,
         temperature,
         reasoning_effort,
+        false,
     )
     .await;
     let draft = match draft {

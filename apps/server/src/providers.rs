@@ -154,10 +154,14 @@ pub(crate) async fn call_provider(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
+    builtin_tools: bool,
 ) -> Result<String, ApiError> {
     let url = provider_url(kind, base);
     if kind == "openai_responses" {
         let mut body = json!({"model":model,"input":responses_input(messages)});
+        if builtin_tools {
+            body["tools"] = json!([{"type":"web_search_preview"}]);
+        }
         if let Some(value) = temperature {
             body["temperature"] = json!(value.clamp(0.0, 2.0));
         }
@@ -228,10 +232,14 @@ pub(crate) async fn call_provider_stream(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
+    builtin_tools: bool,
 ) -> Result<reqwest::Response, ApiError> {
     let url = provider_url(kind, base);
     if kind == "openai_responses" {
         let mut body = json!({"model":model,"input":responses_input(messages),"stream":true});
+        if builtin_tools {
+            body["tools"] = json!([{"type":"web_search_preview"}]);
+        }
         if let Some(value) = temperature {
             body["temperature"] = json!(value.clamp(0.0, 2.0));
         }
