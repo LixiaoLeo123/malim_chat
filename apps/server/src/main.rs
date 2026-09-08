@@ -2356,10 +2356,10 @@ fn stream_response(
     kind: String,
 ) -> Response {
     let output = async_stream::stream! {
-        let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new();
+        let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new(); let mut reasoning_part: Option<u32> = None;
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some((provider_reasoning, delta)) = providers::provider_stream_delta(&kind, &frame) { let fragments = if provider_reasoning { vec![(true, delta)] } else { thinking.push(&delta) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { reasoning.push_str(&text); } else { answer.push_str(&text); } let payload = serde_json::to_string(&json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
+                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(fragment) = providers::provider_stream_delta(&kind, &frame) { let part = fragment.part; let fragments = if fragment.reasoning { vec![(true, fragment.text)] } else { thinking.push(&fragment.text) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { if let Some(part) = part { if reasoning_part != Some(part) { if !reasoning.is_empty() { reasoning.push_str("\n\n"); } reasoning_part = Some(part); } } reasoning.push_str(&text); } else { answer.push_str(&text); } let mut payload = json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text}); if let (true, Some(part)) = (is_reasoning, part) { payload["round"] = json!(part); } let payload = serde_json::to_string(&payload).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
                 Err(error) => { warn!(conversation_id=%conversation_id, %error, "upstream stream interrupted"); let payload = serde_json::to_string(&json!({"type":"error","message":"The provider stream was interrupted."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
             }
         }
@@ -2454,7 +2454,9 @@ mod tests {
         ThinkingStream, content_part, parse_data_url, plain_text_content, split_thinking,
         strip_thinking,
     };
-    use crate::providers::{provider_error_from_response, provider_stream_delta, provider_url};
+    use crate::providers::{
+        provider_error_from_response, provider_stream_delta, provider_url, StreamFragment,
+    };
     use crate::web_tools::{is_safe_public_url, is_valid_search_query, web_tool_definitions};
     use axum::http::StatusCode;
 
@@ -2466,24 +2468,62 @@ mod tests {
     }
 
     #[test]
+    fn keeps_responses_summary_parts_apart() {
+        assert_eq!(
+            provider_stream_delta(
+                "openai_responses",
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"summary_index\":2,\"delta\":\"**Modeling**\"}"
+            ),
+            Some(StreamFragment {
+                reasoning: true,
+                text: "**Modeling**".into(),
+                part: Some(2),
+            })
+        );
+        assert_eq!(
+            provider_stream_delta(
+                "openai_responses",
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}"
+            ),
+            Some(StreamFragment {
+                reasoning: false,
+                text: "hello".into(),
+                part: None,
+            })
+        );
+    }
+
+    #[test]
     fn parses_openai_stream_delta() {
         assert_eq!(
             provider_stream_delta(
                 "openai_compatible",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"
             ),
-            Some((false, "hello".into()))
+            Some(StreamFragment {
+                reasoning: false,
+                text: "hello".into(),
+                part: None,
+            })
         );
         assert_eq!(
             provider_stream_delta(
                 "openai_compatible",
                 "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}"
             ),
-            Some((true, "plan".into()))
+            Some(StreamFragment {
+                reasoning: true,
+                text: "plan".into(),
+                part: None,
+            })
         );
         assert_eq!(
             provider_stream_delta("anthropic", "data: {\"delta\":{\"thinking\":\"plan\"}}"),
-            Some((true, "plan".into()))
+            Some(StreamFragment {
+                reasoning: true,
+                text: "plan".into(),
+                part: None,
+            })
         );
     }
 

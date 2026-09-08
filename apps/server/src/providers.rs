@@ -141,8 +141,12 @@ pub(crate) async fn call_provider(
             .await?
             .json()
             .await?;
-        return responses_content(&body)
-            .ok_or_else(|| ApiError::bad("The Responses provider returned no text output."));
+        let answer = responses_content(&body)
+            .ok_or_else(|| ApiError::bad("The Responses provider returned no text output."))?;
+        return match responses_reasoning(&body) {
+            Some(reasoning) => Ok(format!("<think>{reasoning}</think>{answer}")),
+            None => Ok(answer),
+        };
     }
     let response = if kind == "anthropic" {
         let system = messages
@@ -354,6 +358,12 @@ fn responses_content(body: &Value) -> Option<String> {
         .filter(|text: &String| !text.is_empty())
 }
 
+/// Reasoning summaries sit in `output[]` items of type `reasoning`, one entry per part.
+fn responses_reasoning(body: &Value) -> Option<String> {
+    let parts = body["output"].as_array()?.iter().filter(|item| item["type"] == "reasoning").flat_map(|item| item["summary"].as_array().cloned().unwrap_or_default()).filter_map(|part| part["text"].as_str().map(str::to_string)).filter(|text| !text.trim().is_empty()).collect::<Vec<String>>();
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
 fn anthropic_content(body: &Value) -> Option<String> {
     let content = body["content"].as_array()?;
     let output = content
@@ -385,7 +395,16 @@ fn openai_content(body: &Value) -> Option<String> {
     (!output.is_empty()).then_some(output)
 }
 
-pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<(bool, String)> {
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StreamFragment {
+    pub(crate) reasoning: bool,
+    pub(crate) text: String,
+    /// Responses returns reasoning as numbered summary parts, so each part can be
+    /// rendered as its own timeline row instead of being glued to its neighbours.
+    pub(crate) part: Option<u32>,
+}
+
+pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFragment> {
     let payload = frame
         .lines()
         .find_map(|line| line.strip_prefix("data:"))?
@@ -395,41 +414,64 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<(bool, St
     }
     let value: Value = serde_json::from_str(payload).ok()?;
     if kind == "openai_responses" {
-        if value["type"] == "response.output_text.delta" {
-            return value["delta"]
-                .as_str()
-                .map(|text| (false, text.to_string()));
-        }
-        if value["type"] == "response.reasoning_summary_text.delta"
-            || value["type"] == "response.reasoning_text.delta"
-        {
-            return value["delta"].as_str().map(|text| (true, text.to_string()));
-        }
-        return None;
+        let delta = value["delta"].as_str()?;
+        return match value["type"].as_str()? {
+            "response.output_text.delta" => Some(StreamFragment {
+                reasoning: false,
+                text: delta.to_string(),
+                part: None,
+            }),
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                Some(StreamFragment {
+                    reasoning: true,
+                    text: delta.to_string(),
+                    part: value["summary_index"]
+                        .as_u64()
+                        .or_else(|| value["content_index"].as_u64())
+                        .map(u32::try_from)
+                        .and_then(Result::ok),
+                })
+            }
+            _ => None,
+        };
     }
     if kind == "anthropic" {
         value["delta"]["text"]
             .as_str()
-            .map(|text| (false, text.to_string()))
+            .map(|text| StreamFragment {
+                reasoning: false,
+                text: text.to_string(),
+                part: None,
+            })
             .or_else(|| {
-                value["delta"]["thinking"]
-                    .as_str()
-                    .map(|text| (true, text.to_string()))
+                value["delta"]["thinking"].as_str().map(|text| StreamFragment {
+                    reasoning: true,
+                    text: text.to_string(),
+                    part: None,
+                })
             })
     } else {
         let delta = &value["choices"].as_array()?.first()?["delta"];
         delta["content"]
             .as_str()
-            .map(|text| (false, text.to_string()))
-            .or_else(|| {
-                delta["reasoning_content"]
-                    .as_str()
-                    .map(|text| (true, text.to_string()))
+            .map(|text| StreamFragment {
+                reasoning: false,
+                text: text.to_string(),
+                part: None,
             })
             .or_else(|| {
-                delta["reasoning"]
-                    .as_str()
-                    .map(|text| (true, text.to_string()))
+                delta["reasoning_content"].as_str().map(|text| StreamFragment {
+                    reasoning: true,
+                    text: text.to_string(),
+                    part: None,
+                })
+            })
+            .or_else(|| {
+                delta["reasoning"].as_str().map(|text| StreamFragment {
+                    reasoning: true,
+                    text: text.to_string(),
+                    part: None,
+                })
             })
     }
 }
