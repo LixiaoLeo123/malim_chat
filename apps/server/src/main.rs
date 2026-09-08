@@ -1652,6 +1652,7 @@ async fn respond(
             model,
             vec![],
             enable_markdown,
+            kind,
         ));
     }
     let (answer, reasoning) = split_thinking(
@@ -2353,12 +2354,8 @@ fn stream_response(
     model: String,
     sources: Vec<Value>,
     enable_markdown: bool,
+    kind: String,
 ) -> Response {
-    let kind = if upstream.url().path().ends_with("/v1/messages") {
-        "anthropic".to_string()
-    } else {
-        "openai_compatible".to_string()
-    };
     let output = async_stream::stream! {
         let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new();
         while let Some(chunk) = upstream.next().await {
