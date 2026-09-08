@@ -1,4 +1,4 @@
-export type ProviderKind = "openai_compatible" | "anthropic";
+export type ProviderKind = "openai_compatible" | "openai_responses" | "anthropic";
 export type Role = "user" | "assistant" | "system" | "tool" | "summary";
 export interface User { id: string; email: string; display_name: string; created_at: string }
 export interface ProviderModel { id: string; provider_id: string; group_name: string; model: string; kind: ProviderKind; sort_order: number; context_window: number; supports_images: boolean; created_at: string; updated_at: string }
@@ -7,7 +7,7 @@ export interface GenerationSettings { temperature: number; reasoning_effort: "lo
 export interface Conversation { id: string; title: string; model_provider_id: string | null; model: string | null; context_window: number; context_tokens: number; is_favorite: boolean; generation_settings: GenerationSettings; revision: number; created_at: string; updated_at: string }
 export interface ToolActivity {
   id: string;
-  name: "planning" | "web_search" | "open_web_page" | "drafting" | string;
+  name: "planning" | "web_search" | "open_web_page" | "drafting" | "reasoning" | string;
   status: "running" | "completed" | "failed";
   input?: { query?: string; url?: string };
   round?: number;

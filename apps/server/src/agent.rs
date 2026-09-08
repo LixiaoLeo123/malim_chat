@@ -1,7 +1,7 @@
 use super::*;
+use crate::agent_events::{self, AgentEventSink};
 use crate::providers::{call_provider, call_provider_with_tools};
 use crate::web_tools::execute_web_tool;
-use tokio::sync::mpsc::UnboundedSender;
 
 pub(super) struct WebAgentAnswer {
     pub(super) answer: String,
@@ -10,7 +10,7 @@ pub(super) struct WebAgentAnswer {
 }
 
 fn emit_tool_event(
-    events: Option<&UnboundedSender<Value>>,
+    events: Option<&AgentEventSink>,
     id: impl Into<String>,
     name: &str,
     status: &str,
@@ -19,17 +19,7 @@ fn emit_tool_event(
     source_count: Option<usize>,
     detail: Option<&str>,
 ) {
-    let Some(events) = events else {
-        return;
-    };
-    let mut event = json!({"id":id.into(),"name":name,"status":status,"input":input,"round":round});
-    if let Some(source_count) = source_count {
-        event["source_count"] = json!(source_count);
-    }
-    if let Some(detail) = detail {
-        event["detail"] = json!(detail);
-    }
-    let _ = events.send(event);
+    agent_events::emit(events, id, name, status, input, round, source_count, detail);
 }
 
 pub(super) async fn run_web_agent(
@@ -41,7 +31,7 @@ pub(super) async fn run_web_agent(
     mut transcript: Vec<Value>,
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
-    events: Option<&UnboundedSender<Value>>,
+    events: Option<&AgentEventSink>,
     tool_rounds: Option<u8>,
     conversation_id: Uuid,
     user_message_id: Uuid,
@@ -53,18 +43,24 @@ pub(super) async fn run_web_agent(
 
     let max_rounds = tool_rounds.map(usize::from);
     let mut round = 0usize;
-    let _ = save_agent_run(
+    if let Err(checkpoint_error) = save_agent_run(
         state,
         conversation_id,
         user_message_id,
         "running",
         &transcript,
         &sources,
-        &[],
+        &events
+            .as_ref()
+            .map(|sink| sink.history())
+            .unwrap_or_default(),
         round,
         None,
     )
-    .await;
+    .await
+    {
+        warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save initial agent checkpoint");
+    }
     loop {
         if max_rounds.is_some_and(|limit| round >= limit) {
             break;
@@ -134,18 +130,24 @@ pub(super) async fn run_web_agent(
                     None,
                     Some(&error.message),
                 );
-                let _ = save_agent_run(
+                if let Err(checkpoint_error) = save_agent_run(
                     state,
                     conversation_id,
                     user_message_id,
                     "failed",
                     &transcript,
                     &sources,
-                    &[],
+                    &events
+                        .as_ref()
+                        .map(|sink| sink.history())
+                        .unwrap_or_default(),
                     round,
                     Some(&error.message),
                 )
-                .await;
+                .await
+                {
+                    warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save failed agent checkpoint");
+                }
                 return Err(error);
             }
         };
@@ -161,10 +163,7 @@ pub(super) async fn run_web_agent(
         );
         let (_, turn_reasoning) = split_thinking(&turn.content);
         if !turn_reasoning.trim().is_empty() {
-            if let Some(events) = events {
-                let _ =
-                    events.send(json!({"type":"reasoning","delta":turn_reasoning,"round":round}));
-            }
+            agent_events::emit_reasoning(events, &turn_reasoning, round);
         }
 
         if turn.tool_calls.is_empty() {
@@ -232,18 +231,24 @@ pub(super) async fn run_web_agent(
         if kind == "anthropic" && !anthropic_results.is_empty() {
             transcript.push(json!({"role":"user","content":anthropic_results}));
         }
-        let _ = save_agent_run(
+        if let Err(checkpoint_error) = save_agent_run(
             state,
             conversation_id,
             user_message_id,
             "running",
             &transcript,
             &sources,
-            &[],
+            &events
+                .as_ref()
+                .map(|sink| sink.history())
+                .unwrap_or_default(),
             round + 1,
             None,
         )
-        .await;
+        .await
+        {
+            warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save agent checkpoint after tool round");
+        }
         round += 1;
     }
 
@@ -258,19 +263,52 @@ pub(super) async fn run_web_agent(
         Some("Writing the answer from gathered evidence"),
     );
     transcript.insert(0, json!({"role":"system","content":"Finish now using the collected evidence. Clearly distinguish missing evidence from established facts, and do not call more tools."}));
-    let (answer, reasoning) = split_thinking(
-        &call_provider(
-            &state.http,
-            kind,
-            base,
-            key,
-            model,
-            &transcript,
-            temperature,
-            reasoning_effort,
-        )
-        .await?,
-    );
+    let draft = call_provider(
+        &state.http,
+        kind,
+        base,
+        key,
+        model,
+        &transcript,
+        temperature,
+        reasoning_effort,
+    )
+    .await;
+    let draft = match draft {
+        Ok(draft) => draft,
+        Err(error) => {
+            emit_tool_event(
+                events,
+                "draft",
+                "drafting",
+                "failed",
+                json!({}),
+                round,
+                None,
+                Some(&error.message),
+            );
+            if let Err(checkpoint_error) = save_agent_run(
+                state,
+                conversation_id,
+                user_message_id,
+                "failed",
+                &transcript,
+                &sources,
+                &events
+                    .as_ref()
+                    .map(|sink| sink.history())
+                    .unwrap_or_default(),
+                round,
+                Some(&error.message),
+            )
+            .await
+            {
+                warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save drafting failure checkpoint");
+            }
+            return Err(error);
+        }
+    };
+    let (answer, reasoning) = split_thinking(&draft);
     emit_tool_event(
         events,
         "draft",
@@ -281,18 +319,24 @@ pub(super) async fn run_web_agent(
         None,
         None,
     );
-    let _ = save_agent_run(
+    if let Err(checkpoint_error) = save_agent_run(
         state,
         conversation_id,
         user_message_id,
         "completed",
         &transcript,
         &sources,
-        &[],
+        &events
+            .as_ref()
+            .map(|sink| sink.history())
+            .unwrap_or_default(),
         round,
         None,
     )
-    .await;
+    .await
+    {
+        warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save completed agent checkpoint");
+    }
     Ok(WebAgentAnswer {
         answer,
         reasoning,

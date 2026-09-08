@@ -41,6 +41,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod agent;
+mod agent_events;
 mod providers;
 mod web_tools;
 
@@ -156,6 +157,13 @@ impl ApiError {
         Self {
             status: StatusCode::FORBIDDEN,
             code: "forbidden",
+            message: message.into(),
+        }
+    }
+    fn conflict(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "active_run",
             message: message.into(),
         }
     }
@@ -468,6 +476,23 @@ async fn load_failed_agent_run(
         .bind(conversation_id).bind(user_message_id).fetch_optional(&state.db).await.map_err(ApiError::from)
 }
 
+async fn agent_run_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((conversation_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_conversation(&state.db, user_id, conversation_id).await?;
+    let run: Option<(String, Value, Value, Value, i32, Option<String>)> = sqlx::query_as("SELECT status,events,sources,transcript,round,error_message FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 ORDER BY updated_at DESC LIMIT 1")
+        .bind(conversation_id).bind(message_id).fetch_optional(&state.db).await?;
+    let Some((status, events, sources, transcript, round, error_message)) = run else {
+        return Err(ApiError::not_found());
+    };
+    Ok(Json(
+        json!({"status":status,"events":events,"sources":sources,"transcript":transcript,"round":round,"error_message":error_message}),
+    ))
+}
+
 async fn save_agent_run(
     state: &AppState,
     conversation_id: Uuid,
@@ -480,7 +505,9 @@ async fn save_agent_run(
     error_message: Option<&str>,
 ) -> Result<(), ApiError> {
     sqlx::query("INSERT INTO agent_runs (id,conversation_id,user_message_id,status,transcript,sources,events,round,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (user_message_id) WHERE status IN ('running','failed') DO UPDATE SET status=EXCLUDED.status,transcript=EXCLUDED.transcript,sources=EXCLUDED.sources,events=EXCLUDED.events,round=EXCLUDED.round,error_message=EXCLUDED.error_message,updated_at=now()")
-        .bind(Uuid::new_v4()).bind(conversation_id).bind(user_message_id).bind(status).bind(json!(transcript)).bind(json!(sources)).bind(json!(events)).bind(round as i32).bind(error_message).execute(&state.db).await?;
+        .bind(Uuid::new_v4()).bind(conversation_id).bind(user_message_id).bind(status).bind(json!(transcript)).bind(json!(sources)).bind(json!(events)).bind(round as i32).bind(error_message).execute(&state.db).await.map_err(|error| {
+            if error.as_database_error().and_then(|db| db.code()).as_deref() == Some("23505") { ApiError::conflict("This conversation already has an active agent run.") } else { ApiError::from(error) }
+        })?;
     Ok(())
 }
 #[derive(Deserialize)]
@@ -779,6 +806,10 @@ async fn main() -> anyhow::Result<()> {
             get(list_messages).post(create_message),
         )
         .route(
+            "/v1/conversations/{conversation_id}/agent-runs/{message_id}",
+            get(agent_run_events),
+        )
+        .route(
             "/v1/conversations/{id}/messages/{message_id}",
             patch(update_message).delete(delete_message),
         )
@@ -929,8 +960,10 @@ async fn create_provider(
 ) -> Result<Json<Provider>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let kind = request.kind.unwrap_or_else(|| "openai_compatible".into());
-    if !matches!(kind.as_str(), "openai_compatible" | "anthropic")
-        || !request.base_url.starts_with("https://")
+    if !matches!(
+        kind.as_str(),
+        "openai_compatible" | "openai_responses" | "anthropic"
+    ) || !request.base_url.starts_with("https://")
         || request.api_key.trim().is_empty()
     {
         return Err(ApiError::bad(
@@ -970,7 +1003,10 @@ async fn update_provider(
         .map(str::to_string)
         .unwrap_or(current.name);
     let kind = request.kind.unwrap_or(current.kind);
-    if !matches!(kind.as_str(), "openai_compatible" | "anthropic") {
+    if !matches!(
+        kind.as_str(),
+        "openai_compatible" | "openai_responses" | "anthropic"
+    ) {
         return Err(ApiError::bad(
             "Provider API format must be OpenAI-compatible or Anthropic.",
         ));
@@ -1094,7 +1130,10 @@ async fn create_provider_model(
     if request.group_name.trim().is_empty() || request.model.trim().is_empty() {
         return Err(ApiError::bad("Model group and model name are required."));
     }
-    if !matches!(request.kind.as_str(), "openai_compatible" | "anthropic") {
+    if !matches!(
+        request.kind.as_str(),
+        "openai_compatible" | "openai_responses" | "anthropic"
+    ) {
         return Err(ApiError::bad(
             "Model API format must be OpenAI-compatible or Anthropic.",
         ));
@@ -1124,7 +1163,7 @@ async fn update_provider_model(
     if request
         .kind
         .as_deref()
-        .is_some_and(|v| !matches!(v, "openai_compatible" | "anthropic"))
+        .is_some_and(|v| !matches!(v, "openai_compatible" | "openai_responses" | "anthropic"))
     {
         return Err(ApiError::bad(
             "Model API format must be OpenAI-compatible or Anthropic.",
@@ -2362,56 +2401,34 @@ fn stream_web_agent_response(
 ) -> Response {
     let output = async_stream::stream! {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        let agent = agent::run_web_agent(&state, &kind, &base, &api_key, &model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_tx), tool_rounds, conversation_id, user_message_id, initial_sources);
-        tokio::pin!(agent);
-        let result = loop {
-            tokio::select! {
-                event = event_rx.recv() => {
-                    if let Some(tool) = event {
-                        let payload = if tool["type"] == "reasoning" { serde_json::to_string(&tool).unwrap_or_default() } else { serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default() };
-                        yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+        let event_sink = agent_events::AgentEventSink::new(event_tx);
+        let worker_state = state.clone();
+        let worker_model = model.clone();
+        tokio::spawn(async move {
+            let result = agent::run_web_agent(&worker_state, &kind, &base, &api_key, &worker_model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_sink), tool_rounds, conversation_id, user_message_id, initial_sources).await;
+            match result {
+                Ok(result) if !result.answer.trim().is_empty() => {
+                    if !result.reasoning.trim().is_empty() { let _ = event_sink.send(json!({"type":"reasoning","delta":result.reasoning})); }
+                    for chunk in result.answer.as_bytes().chunks(1200) {
+                        let _ = event_sink.send(json!({"type":"delta","delta":String::from_utf8_lossy(chunk)}));
                     }
+                    if let Ok(message) = persist_assistant_message(&worker_state, conversation_id, user_id, &worker_model, result.answer, result.reasoning, &result.sources, enable_markdown).await {
+                        let _ = event_sink.send(json!({"type":"done","message":message}));
+                    } else { let _ = event_sink.send(json!({"type":"error","message":"The response could not be saved."})); }
                 }
-                result = &mut agent => break result,
+                Ok(_) => { let _ = event_sink.send(json!({"type":"error","message":"The provider returned no final answer."})); }
+                Err(error) => { error!(conversation_id=%conversation_id, error=%error.message, "web agent response failed"); let _ = event_sink.send(json!({"type":"error","message":error.message})); }
             }
-        };
-        while let Ok(tool) = event_rx.try_recv() {
-            let payload = if tool["type"] == "reasoning" { serde_json::to_string(&tool).unwrap_or_default() } else { serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default() };
+        });
+        while let Some(event) = event_rx.recv().await {
+            let event_type = event["type"].as_str().unwrap_or("tool");
+            if event_type == "done" || event_type == "error" {
+                let payload = serde_json::to_string(&event).unwrap_or_default();
+                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
+                break;
+            }
+            let payload = if event_type == "reasoning" { serde_json::to_string(&event).unwrap_or_default() } else { serde_json::to_string(&json!({"type":"tool","tool":event})).unwrap_or_default() };
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
-        }
-        let result = match result {
-            Ok(result) => result,
-            Err(error) => {
-                error!(conversation_id=%conversation_id, error=%error.message, "web agent response failed");
-                let payload = serde_json::to_string(&json!({"type":"error","message":error.message})).unwrap_or_default();
-                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
-                return;
-            }
-        };
-        if !result.reasoning.trim().is_empty() {
-            let payload = serde_json::to_string(&json!({"type":"reasoning","delta":result.reasoning})).unwrap_or_default();
-            yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
-        }
-        if result.answer.trim().is_empty() {
-            let payload = serde_json::to_string(&json!({"type":"error","message":"The provider returned no final answer."})).unwrap_or_default();
-            yield Ok(Bytes::from(format!("data: {payload}\n\n")));
-            return;
-        }
-        for chunk in result.answer.as_bytes().chunks(1200) {
-            let delta = String::from_utf8_lossy(chunk);
-            let payload = serde_json::to_string(&json!({"type":"delta","delta":delta})).unwrap_or_default();
-            yield Ok(Bytes::from(format!("data: {payload}\n\n")));
-        }
-        match persist_assistant_message(&state, conversation_id, user_id, &model, result.answer, result.reasoning, &result.sources, enable_markdown).await {
-            Ok(message) => {
-                let payload = serde_json::to_string(&json!({"type":"done","message":message})).unwrap_or_default();
-                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
-            }
-            Err(error) => {
-                error!(conversation_id=%conversation_id, error=%error.message, "could not persist web-agent response");
-                let payload = serde_json::to_string(&json!({"type":"error","message":"The response could not be saved."})).unwrap_or_default();
-                yield Ok(Bytes::from(format!("data: {payload}\n\n")));
-            }
         }
     };
     let mut response = Body::from_stream(output).into_response();

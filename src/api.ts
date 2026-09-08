@@ -54,7 +54,7 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   return response.status === 204 ? undefined as T : response.json();
 }
 
-type StreamEvent = { type: string; delta?: string; message?: Message | string; tool?: ToolActivity };
+type StreamEvent = { type: string; delta?: string; round?: number; message?: Message | string; tool?: ToolActivity };
 async function requestStream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal): Promise<Message> {
   const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
@@ -105,6 +105,7 @@ export const api = {
   createMessage: (conversationId: string, content: string, mutationId: string, search: boolean, images: string[] = []) => request<Message>(`/v1/conversations/${conversationId}/messages`, { method: "POST", body: JSON.stringify({ content, client_mutation_id: mutationId, search, images }) }),
   respond: (conversationId: string, messageId: string, search: boolean, options?: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean; context_rounds?: number | null; tool_rounds?: number | null; stream?: boolean }) => request<Message>(`/v1/conversations/${conversationId}/respond`, { method: "POST", body: JSON.stringify({ message_id: messageId, search, ...options }) }),
   respondStream: (conversationId: string, messageId: string, search: boolean, options: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean; context_rounds?: number | null; tool_rounds?: number | null }, onEvent: (event: StreamEvent) => void, signal?: AbortSignal) => requestStream(`/v1/conversations/${conversationId}/respond`, { message_id: messageId, search, ...options, stream: true }, onEvent, signal),
+  agentRun: (conversationId: string, messageId: string) => request<{ status: string; events: ToolActivity[]; sources: SearchResult[]; round: number; error_message: string | null }>(`/v1/conversations/${conversationId}/agent-runs/${messageId}`),
   updateMessage: (conversationId: string, messageId: string, content: string) => request<Message>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "PATCH", body: JSON.stringify({ content }) }),
   deleteMessage: (conversationId: string, messageId: string) => request<void>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "DELETE" }),
   compact: (conversationId: string, force = true) => request<{ compacted: boolean; message: Message; context_tokens: number }>(`/v1/conversations/${conversationId}/compact`, { method: "POST", body: JSON.stringify({ force }) }),
