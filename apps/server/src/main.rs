@@ -1565,7 +1565,7 @@ async fn respond(
     let explicit_search = web_tools::content_requests_web_search(&input.content);
     let search_requested = (request.search.unwrap_or(false) || explicit_search)
         && !request.builtin_tools.unwrap_or(false);
-    info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
+    info!(conversation_id=%id, message_id=%input.id, provider_kind=%kind, search_toggle=request.search.unwrap_or(false), explicit_search, builtin_tools=request.builtin_tools.unwrap_or(false), stream=request.stream.unwrap_or(false), "response request received");
     if let Some((summary, _)) = prior_summary {
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
     }

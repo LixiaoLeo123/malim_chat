@@ -423,6 +423,19 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<(bool, St
         return None;
     }
     let value: Value = serde_json::from_str(payload).ok()?;
+    if kind == "openai_responses" {
+        if value["type"] == "response.output_text.delta" {
+            return value["delta"]
+                .as_str()
+                .map(|text| (false, text.to_string()));
+        }
+        if value["type"] == "response.reasoning_summary_text.delta"
+            || value["type"] == "response.reasoning_text.delta"
+        {
+            return value["delta"].as_str().map(|text| (true, text.to_string()));
+        }
+        return None;
+    }
     if kind == "anthropic" {
         value["delta"]["text"]
             .as_str()
