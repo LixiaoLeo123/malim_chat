@@ -25,39 +25,6 @@ pub(crate) async fn call_provider_with_tools(
     reasoning_effort: Option<&str>,
 ) -> Result<ProviderToolTurn, ApiError> {
     let url = provider_url(kind, base);
-    if kind == "openai_responses" {
-        let mut body =
-            json!({"model":model,"input":responses_input(messages),"tools":responses_tools()});
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        if let Some(value) = reasoning_effort {
-            body["reasoning"] = json!({"effort":value});
-        }
-        let response = http.post(url).bearer_auth(key).json(&body).send().await?;
-        let body: Value = ensure_provider_success(response, true)
-            .await?
-            .json()
-            .await?;
-        let output = body["output"].as_array().cloned().unwrap_or_default();
-        let tool_calls = output
-            .iter()
-            .filter(|item| item["type"] == "function_call")
-            .filter_map(|item| {
-                Some(ToolCall {
-                    id: item["call_id"].as_str()?.to_string(),
-                    name: item["name"].as_str()?.to_string(),
-                    input: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
-                        .unwrap_or_else(|_| json!({})),
-                })
-            })
-            .collect();
-        return Ok(ProviderToolTurn {
-            content: responses_content(&body).unwrap_or_default(),
-            assistant_message: json!({"role":"assistant","content":responses_content(&body).unwrap_or_default()}),
-            tool_calls,
-        });
-    }
     let response = if kind == "anthropic" {
         let system = messages
             .iter()
@@ -154,19 +121,20 @@ pub(crate) async fn call_provider(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
-    builtin_tools: bool,
+    native_tools: bool,
 ) -> Result<String, ApiError> {
     let url = provider_url(kind, base);
     if kind == "openai_responses" {
         let mut body = json!({"model":model,"input":responses_input(messages)});
-        if builtin_tools {
-            body["tools"] = json!([{"type":"web_search_preview"}]);
+        if native_tools {
+            body["tools"] = json!(responses_tools());
         }
         if let Some(value) = temperature {
             body["temperature"] = json!(value.clamp(0.0, 2.0));
         }
         if let Some(value) = reasoning_effort {
-            body["reasoning"] = json!({"effort":value});
+            // Responses has no raw chain-of-thought; the only visible reasoning is the summary.
+            body["reasoning"] = json!({"effort": value, "summary": "auto"});
         }
         let response = http.post(url).bearer_auth(key).json(&body).send().await?;
         let body: Value = ensure_provider_success(response, false)
@@ -232,19 +200,20 @@ pub(crate) async fn call_provider_stream(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
-    builtin_tools: bool,
+    native_tools: bool,
 ) -> Result<reqwest::Response, ApiError> {
     let url = provider_url(kind, base);
     if kind == "openai_responses" {
         let mut body = json!({"model":model,"input":responses_input(messages),"stream":true});
-        if builtin_tools {
-            body["tools"] = json!([{"type":"web_search_preview"}]);
+        if native_tools {
+            body["tools"] = json!(responses_tools());
         }
         if let Some(value) = temperature {
             body["temperature"] = json!(value.clamp(0.0, 2.0));
         }
         if let Some(value) = reasoning_effort {
-            body["reasoning"] = json!({"effort":value});
+            // Responses has no raw chain-of-thought; the only visible reasoning is the summary.
+            body["reasoning"] = json!({"effort": value, "summary": "auto"});
         }
         let response = http.post(url).bearer_auth(key).json(&body).send().await?;
         return ensure_provider_success(response, false).await;
@@ -362,8 +331,10 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
+/// Hosted tools the Responses API runs on OpenAI's side. Chat Completions and Anthropic
+/// providers have no equivalent, so they go through the ReAct loop instead.
 fn responses_tools() -> Vec<Value> {
-    web_tool_definitions("openai_compatible").as_array().cloned().unwrap_or_default().into_iter().map(|tool| json!({"type":"function","name":tool["function"]["name"],"description":tool["function"]["description"],"parameters":tool["function"]["parameters"]})).collect()
+    vec![json!({"type": "web_search_preview"})]
 }
 
 fn responses_content(body: &Value) -> Option<String> {

@@ -17,7 +17,6 @@
 .markdown-content th { background: #f2f7f5; }
 .markdown-content a { color: #0f766e; }
 .markdown-toggle { display: flex !important; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid #e7ecea; padding-top: 9px; }
-.generation-popover .markdown-toggle:first-child { border-top: 0; padding-top: 0; }
 .markdown-toggle input { appearance: none; width: 32px; height: 18px; border: 0; border-radius: 999px; background: #cdd7d4; padding: 0; position: relative; cursor: pointer; }
 .markdown-toggle input::after { content: ""; position: absolute; width: 14px; height: 14px; top: 2px; left: 2px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px rgba(0,0,0,.2); transition: transform .16s ease; }
 .markdown-toggle input:checked { background: #0f766e; }

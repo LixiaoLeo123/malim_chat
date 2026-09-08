@@ -400,8 +400,6 @@ struct GenerationSettings {
     reasoning_effort: String,
     enable_markdown: bool,
     stream: bool,
-    #[serde(default)]
-    builtin_tools: bool,
     #[serde(default = "default_context_rounds")]
     context_rounds: Option<u8>,
     #[serde(default = "default_tool_rounds")]
@@ -465,7 +463,6 @@ struct RespondRequest {
     reasoning_effort: Option<String>,
     enable_markdown: Option<bool>,
     stream: Option<bool>,
-    builtin_tools: Option<bool>,
     context_rounds: Option<Option<u8>>,
     tool_rounds: Option<Option<u8>>,
 }
@@ -1563,9 +1560,11 @@ async fn respond(
         transcript = transcript.split_off(start);
     }
     let explicit_search = web_tools::content_requests_web_search(&input.content);
-    let search_requested = (request.search.unwrap_or(false) || explicit_search)
-        && !request.builtin_tools.unwrap_or(false);
-    info!(conversation_id=%id, message_id=%input.id, provider_kind=%kind, search_toggle=request.search.unwrap_or(false), explicit_search, builtin_tools=request.builtin_tools.unwrap_or(false), stream=request.stream.unwrap_or(false), "response request received");
+    // Responses providers get OpenAI's hosted web_search_preview tool on every call, so
+    // the retrieved-evidence ReAct loop never applies to them.
+    let native_tools = kind == "openai_responses";
+    let search_requested = !native_tools && (request.search.unwrap_or(false) || explicit_search);
+    info!(conversation_id=%id, message_id=%input.id, provider_kind=%kind, search_toggle=request.search.unwrap_or(false), explicit_search, native_tools, stream=request.stream.unwrap_or(false), "response request received");
     if let Some((summary, _)) = prior_summary {
         transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
     }
@@ -1641,7 +1640,7 @@ async fn respond(
             &transcript,
             request.temperature,
             request.reasoning_effort.as_deref(),
-            request.builtin_tools.unwrap_or(false),
+            native_tools,
         )
         .await?;
         return Ok(stream_response(
@@ -1665,7 +1664,7 @@ async fn respond(
             &transcript,
             request.temperature,
             request.reasoning_effort.as_deref(),
-            request.builtin_tools.unwrap_or(false),
+            native_tools,
         )
         .await?,
     );
