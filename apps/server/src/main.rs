@@ -458,6 +458,31 @@ struct RespondRequest {
     context_rounds: Option<Option<u8>>,
     tool_rounds: Option<Option<u8>>,
 }
+
+async fn load_failed_agent_run(
+    state: &AppState,
+    conversation_id: Uuid,
+    user_message_id: Uuid,
+) -> Result<Option<(Vec<Value>, Vec<Value>, Vec<Value>, i32)>, ApiError> {
+    sqlx::query_as("SELECT transcript,sources,events,round FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 AND status='failed' ORDER BY updated_at DESC LIMIT 1")
+        .bind(conversation_id).bind(user_message_id).fetch_optional(&state.db).await.map_err(ApiError::from)
+}
+
+async fn save_agent_run(
+    state: &AppState,
+    conversation_id: Uuid,
+    user_message_id: Uuid,
+    status: &str,
+    transcript: &[Value],
+    sources: &[Value],
+    events: &[Value],
+    round: usize,
+    error_message: Option<&str>,
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO agent_runs (id,conversation_id,user_message_id,status,transcript,sources,events,round,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (user_message_id) WHERE status IN ('running','failed') DO UPDATE SET status=EXCLUDED.status,transcript=EXCLUDED.transcript,sources=EXCLUDED.sources,events=EXCLUDED.events,round=EXCLUDED.round,error_message=EXCLUDED.error_message,updated_at=now()")
+        .bind(Uuid::new_v4()).bind(conversation_id).bind(user_message_id).bind(status).bind(json!(transcript)).bind(json!(sources)).bind(json!(events)).bind(round as i32).bind(error_message).execute(&state.db).await?;
+    Ok(())
+}
 #[derive(Deserialize)]
 struct CompactRequest {
     through_sequence: Option<i64>,
@@ -1503,6 +1528,18 @@ async fn respond(
     }
     let enable_markdown = request.enable_markdown.unwrap_or(true);
     transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
+    let resumed_sources = if search_requested {
+        if let Some((saved_transcript, saved_sources, _, _)) =
+            load_failed_agent_run(&state, id, input.id).await?
+        {
+            transcript = saved_transcript;
+            saved_sources
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
     if search_requested && !input.content.trim().is_empty() {
         if request.stream.unwrap_or(false) {
             return Ok(stream_web_agent_response(
@@ -1514,10 +1551,12 @@ async fn respond(
                 api_key,
                 model,
                 transcript,
+                input.id,
                 request.temperature,
                 request.reasoning_effort,
                 enable_markdown,
                 tool_rounds,
+                resumed_sources.clone(),
             ));
         }
         let result = agent::run_web_agent(
@@ -1531,6 +1570,9 @@ async fn respond(
             request.reasoning_effort.as_deref(),
             None,
             tool_rounds,
+            id,
+            input.id,
+            resumed_sources,
         )
         .await?;
         let message = persist_assistant_message(
@@ -2311,14 +2353,16 @@ fn stream_web_agent_response(
     api_key: String,
     model: String,
     transcript: Vec<Value>,
+    user_message_id: Uuid,
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
     enable_markdown: bool,
     tool_rounds: Option<u8>,
+    initial_sources: Vec<Value>,
 ) -> Response {
     let output = async_stream::stream! {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        let agent = agent::run_web_agent(&state, &kind, &base, &api_key, &model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_tx), tool_rounds);
+        let agent = agent::run_web_agent(&state, &kind, &base, &api_key, &model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_tx), tool_rounds, conversation_id, user_message_id, initial_sources);
         tokio::pin!(agent);
         let result = loop {
             tokio::select! {

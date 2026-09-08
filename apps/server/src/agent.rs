@@ -43,13 +43,28 @@ pub(super) async fn run_web_agent(
     reasoning_effort: Option<&str>,
     events: Option<&UnboundedSender<Value>>,
     tool_rounds: Option<u8>,
+    conversation_id: Uuid,
+    user_message_id: Uuid,
+    initial_sources: Vec<Value>,
 ) -> Result<WebAgentAnswer, ApiError> {
     transcript.insert(0, json!({"role":"system","content":"You are a web research agent. Before answering, use web_search with a concise, specific 3-12 word query derived from the user request. Never copy the full user message verbatim as the initial query. Refine the query when evidence is weak, and use open_web_page on important sources before relying on them. Do not invent tool results or citations. Give a direct answer only after gathering enough evidence, citing the supporting source URLs."}));
-    let mut sources = Vec::new();
+    let mut sources = initial_sources;
     let mut allowed_urls = Vec::new();
 
     let max_rounds = tool_rounds.map(usize::from);
     let mut round = 0usize;
+    let _ = save_agent_run(
+        state,
+        conversation_id,
+        user_message_id,
+        "running",
+        &transcript,
+        &sources,
+        &[],
+        round,
+        None,
+    )
+    .await;
     loop {
         if max_rounds.is_some_and(|limit| round >= limit) {
             break;
@@ -119,6 +134,18 @@ pub(super) async fn run_web_agent(
                     None,
                     Some(&error.message),
                 );
+                let _ = save_agent_run(
+                    state,
+                    conversation_id,
+                    user_message_id,
+                    "failed",
+                    &transcript,
+                    &sources,
+                    &[],
+                    round,
+                    Some(&error.message),
+                )
+                .await;
                 return Err(error);
             }
         };
@@ -178,6 +205,9 @@ pub(super) async fn run_web_agent(
                 json!({"error":"This tool-call batch exceeded the safety limit of sixteen calls. Continue using the results already returned."})
             };
             let detail = result["error"].as_str();
+            let result_preview = serde_json::to_string(&result)
+                .ok()
+                .map(|value| value.chars().take(1200).collect::<String>());
             let source_count = result["results"].as_array().map(Vec::len);
             emit_tool_event(
                 events,
@@ -191,7 +221,7 @@ pub(super) async fn run_web_agent(
                 input,
                 round,
                 source_count,
-                detail,
+                detail.or(result_preview.as_deref()),
             );
             if kind == "anthropic" {
                 anthropic_results.push(json!({"type":"tool_result","tool_use_id":call.id,"content":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
@@ -202,6 +232,18 @@ pub(super) async fn run_web_agent(
         if kind == "anthropic" && !anthropic_results.is_empty() {
             transcript.push(json!({"role":"user","content":anthropic_results}));
         }
+        let _ = save_agent_run(
+            state,
+            conversation_id,
+            user_message_id,
+            "running",
+            &transcript,
+            &sources,
+            &[],
+            round + 1,
+            None,
+        )
+        .await;
         round += 1;
     }
 
@@ -239,6 +281,18 @@ pub(super) async fn run_web_agent(
         None,
         None,
     );
+    let _ = save_agent_run(
+        state,
+        conversation_id,
+        user_message_id,
+        "completed",
+        &transcript,
+        &sources,
+        &[],
+        round,
+        None,
+    )
+    .await;
     Ok(WebAgentAnswer {
         answer,
         reasoning,

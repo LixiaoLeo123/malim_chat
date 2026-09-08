@@ -569,7 +569,10 @@ function SourceList({ sources }: { sources: Message["search_sources"] }) {
 
 function ToolActivityList({ events, reasoning, streaming }: { events?: ToolActivity[]; reasoning?: string; streaming?: boolean }) {
   const [open, setOpen] = useState(Boolean(streaming));
+  const [height, setHeight] = useState(0);
+  const contentRef = useRef<HTMLDivElement>(null);
   useEffect(() => { if (!streaming) setOpen(false); }, [streaming]);
+  useEffect(() => { const node = contentRef.current; if (!node) return; const measure = () => setHeight(node.scrollHeight); measure(); const observer = new ResizeObserver(measure); observer.observe(node); return () => observer.disconnect(); }, [events, reasoning]);
   if (!events?.length && !reasoning) return null;
   function label(event: ToolActivity) {
     const query = event.input?.query;
@@ -584,7 +587,7 @@ function ToolActivityList({ events, reasoning, streaming }: { events?: ToolActiv
     if (event.name === "drafting") return event.status === "running" ? "Drafting answer" : "Answer drafted";
     return event.status === "running" ? `${event.name.replace(/_/g, " ")} in progress` : `${event.name.replace(/_/g, " ")} complete`;
   }
-  return <section className={`agent-timeline ${open ? "open" : "collapsed"}`} aria-label="Agent process" aria-live="polite"><button type="button" className="agent-timeline-toggle" aria-expanded={open} onClick={() => setOpen(!open)}><span>{streaming ? "Agent working" : "Agent process"}</span><small>{open ? "Collapse" : "Expand"}</small></button>{open && <div className="tool-activity">{reasoning && <div className="tool-step completed"><span className="tool-step-icon"><Bot size={12} /></span><span className="tool-step-copy"><strong>Reasoning</strong><br />{reasoning}</span></div>}{events?.map((event) => <div key={event.id} className={`tool-step ${event.status}`}><span className="tool-step-icon">{event.status === "running" ? <LoaderCircle className="spin" size={13} /> : event.status === "failed" ? <CircleAlert size={13} /> : <Check size={13} />}</span><span className="tool-step-copy">{label(event)}</span></div>)}</div>}</section>;
+  return <section className={`agent-timeline ${open ? "open" : "collapsed"}`} aria-label="Agent process" aria-live="polite"><button type="button" className="agent-timeline-toggle" aria-expanded={open} onClick={() => setOpen(!open)}><span>{streaming ? "Agent working" : "Agent process"}</span><small>{open ? "Collapse" : "Expand"}</small></button><div className="agent-timeline-collapse" style={{ maxHeight: open ? height : 0 }}><div ref={contentRef} className="tool-activity">{reasoning && <div className="tool-step completed"><span className="tool-step-icon"><Bot size={12} /></span><span className="tool-step-copy"><strong>Reasoning</strong><br />{reasoning}</span></div>}{events?.map((event) => <div key={event.id} className={`tool-step ${event.status}`}><span className="tool-step-icon">{event.status === "running" ? <LoaderCircle className="spin" size={13} /> : event.status === "failed" ? <CircleAlert size={13} /> : <Check size={13} />}</span><span className="tool-step-copy"><span>{label(event)}</span>{event.detail && event.status !== "failed" && <details className="tool-detail"><summary>Show details</summary><pre>{event.detail}</pre></details>}</span></div>)}</div></div></section>;
 }
 
 function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, onEdit, onDelete, onRetry, onLookup }: { message: Message; markdownEnabled: boolean; theme: "light" | "dark"; isLast: boolean; lookupActive: boolean; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void }) {
