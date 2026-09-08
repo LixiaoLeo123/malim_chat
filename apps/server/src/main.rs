@@ -14,8 +14,8 @@ use argon2::{
     password_hash::{SaltString, rand_core::RngCore},
 };
 use axum::{
-    body::{Body, Bytes},
     Json, Router,
+    body::{Body, Bytes},
     extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -48,7 +48,7 @@ const ACCESS_TOKEN_MINUTES: i64 = 15;
 const REFRESH_TOKEN_DAYS: i64 = 30;
 const DEFAULT_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 100;
-const MAX_WEB_TOOL_ROUNDS: usize = 4;
+const DEFAULT_WEB_TOOL_ROUNDS: usize = 4;
 const MAX_WEB_SOURCES: usize = 12;
 const MIN_PREFERRED_SEARCH_RESULTS: usize = 3;
 
@@ -179,7 +179,8 @@ impl ApiError {
         Self {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "provider_rate_limited",
-            message: "The AI provider is rate limiting requests. Wait briefly and try again.".into(),
+            message: "The AI provider is rate limiting requests. Wait briefly and try again."
+                .into(),
         }
     }
 
@@ -391,6 +392,16 @@ struct GenerationSettings {
     reasoning_effort: String,
     enable_markdown: bool,
     stream: bool,
+    #[serde(default = "default_context_rounds")]
+    context_rounds: Option<u8>,
+    #[serde(default = "default_tool_rounds")]
+    tool_rounds: Option<u8>,
+}
+fn default_context_rounds() -> Option<u8> {
+    Some(8)
+}
+fn default_tool_rounds() -> Option<u8> {
+    Some(DEFAULT_WEB_TOOL_ROUNDS as u8)
 }
 #[derive(Deserialize)]
 struct ProviderRequest {
@@ -444,6 +455,8 @@ struct RespondRequest {
     reasoning_effort: Option<String>,
     enable_markdown: Option<bool>,
     stream: Option<bool>,
+    context_rounds: Option<Option<u8>>,
+    tool_rounds: Option<Option<u8>>,
 }
 #[derive(Deserialize)]
 struct CompactRequest {
@@ -580,7 +593,9 @@ fn plain_text_content(content: &str, images: &[Value]) -> String {
         if !text.is_empty() {
             text.push_str("\n\n");
         }
-        text.push_str("[Image attachment omitted: the selected model does not support image input.]");
+        text.push_str(
+            "[Image attachment omitted: the selected model does not support image input.]",
+        );
     }
     text
 }
@@ -604,7 +619,9 @@ fn content_part(kind: &str, supports_images: bool, content: &str, images: &[Valu
                 parts.push(json!({"type": "image_url", "image_url": {"url": image}}));
             }
         } else {
-            parts.push(json!({"type": "text", "text": "[Image attachment omitted: invalid image data.]"}));
+            parts.push(
+                json!({"type": "text", "text": "[Image attachment omitted: invalid image data.]"}),
+            );
         }
     }
     if parts.is_empty() {
@@ -623,8 +640,27 @@ fn validate_generation_settings(settings: GenerationSettings) -> Result<Value, A
     if !settings.temperature.is_finite() || !(0.0..=2.0).contains(&settings.temperature) {
         return Err(ApiError::bad("Temperature must be between 0 and 2."));
     }
-    if !matches!(settings.reasoning_effort.as_str(), "low" | "medium" | "high") {
-        return Err(ApiError::bad("Reasoning effort must be low, medium, or high."));
+    if !matches!(
+        settings.reasoning_effort.as_str(),
+        "low" | "medium" | "high"
+    ) {
+        return Err(ApiError::bad(
+            "Reasoning effort must be low, medium, or high.",
+        ));
+    }
+    if let Some(rounds) = settings.context_rounds {
+        if rounds > 20 {
+            return Err(ApiError::bad(
+                "Context rounds must be between 0 and 20, or All.",
+            ));
+        }
+    }
+    if let Some(rounds) = settings.tool_rounds {
+        if rounds == 0 || rounds > 20 {
+            return Err(ApiError::bad(
+                "Tool rounds must be between 1 and 20, or Unlimited.",
+            ));
+        }
     }
     Ok(json!(settings))
 }
@@ -694,9 +730,15 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/refresh", post(refresh))
         .route("/v1/me", get(me))
         .route("/v1/providers", get(list_providers).post(create_provider))
-        .route("/v1/providers/{id}", patch(update_provider).delete(delete_provider))
+        .route(
+            "/v1/providers/{id}",
+            patch(update_provider).delete(delete_provider),
+        )
         .route("/v1/providers/{id}/models", post(create_provider_model))
-        .route("/v1/providers/{id}/models/{model_id}", patch(update_provider_model).delete(delete_provider_model))
+        .route(
+            "/v1/providers/{id}/models/{model_id}",
+            patch(update_provider_model).delete(delete_provider_model),
+        )
         .route(
             "/v1/conversations",
             get(list_conversations).post(create_conversation),
@@ -850,7 +892,9 @@ async fn list_providers(
     let rows: Vec<ProviderRow> = sqlx::query_as("SELECT id,name,kind,base_url,default_model,created_at,updated_at FROM providers WHERE user_id=$1 ORDER BY name")
         .bind(user_id).fetch_all(&state.db).await?;
     let mut providers = Vec::with_capacity(rows.len());
-    for row in rows { providers.push(provider_with_models(&state.db, row).await?); }
+    for row in rows {
+        providers.push(provider_with_models(&state.db, row).await?);
+    }
     Ok(Json(providers))
 }
 async fn create_provider(
@@ -872,7 +916,12 @@ async fn create_provider(
         return Err(ApiError::bad("Provider name is required."));
     }
     let (ciphertext, nonce) = encrypt(&state, request.api_key.trim())?;
-    let default_model = request.default_model.as_deref().map(str::trim).unwrap_or("").to_string();
+    let default_model = request
+        .default_model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string();
     let mut tx = state.db.begin().await?;
     let row:ProviderRow=sqlx::query_as("INSERT INTO providers (id,user_id,name,kind,base_url,encrypted_api_key,key_nonce,default_model) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,name,kind,base_url,default_model,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.name.trim()).bind(kind).bind(request.base_url.trim_end_matches('/')).bind(ciphertext).bind(nonce).bind(default_model).fetch_one(&mut *tx).await?;
     tx.commit().await?;
@@ -888,17 +937,39 @@ async fn update_provider(
 ) -> Result<Json<Provider>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let current = own_provider(&state.db, user_id, id).await?;
-    let name = request.name.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(str::to_string).unwrap_or(current.name);
+    let name = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or(current.name);
     let kind = request.kind.unwrap_or(current.kind);
     if !matches!(kind.as_str(), "openai_compatible" | "anthropic") {
-        return Err(ApiError::bad("Provider API format must be OpenAI-compatible or Anthropic."));
+        return Err(ApiError::bad(
+            "Provider API format must be OpenAI-compatible or Anthropic.",
+        ));
     }
-    let base_url = request.base_url.as_deref().map(str::trim).filter(|value| !value.is_empty()).map(|value| value.trim_end_matches('/').to_string()).unwrap_or(current.base_url);
+    let base_url = request
+        .base_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.trim_end_matches('/').to_string())
+        .unwrap_or(current.base_url);
     if !base_url.starts_with("https://") {
         return Err(ApiError::bad("Provider base URL must use HTTPS."));
     }
-    let (ciphertext, nonce): (Option<Vec<u8>>, Option<Vec<u8>>) = match request.api_key.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
-        Some(key) => { let (ciphertext, nonce) = encrypt(&state, key)?; (Some(ciphertext), Some(nonce)) }
+    let (ciphertext, nonce): (Option<Vec<u8>>, Option<Vec<u8>>) = match request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(key) => {
+            let (ciphertext, nonce) = encrypt(&state, key)?;
+            (Some(ciphertext), Some(nonce))
+        }
         None => (None, None),
     };
     let row: ProviderRow = if let (Some(ciphertext), Some(nonce)) = (ciphertext, nonce) {
@@ -916,7 +987,16 @@ async fn update_provider(
 async fn provider_with_models(pool: &PgPool, row: ProviderRow) -> Result<Provider, ApiError> {
     let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
         .bind(row.id).fetch_all(pool).await?;
-    Ok(Provider { id: row.id, name: row.name, kind: row.kind, base_url: row.base_url, default_model: row.default_model, created_at: row.created_at, updated_at: row.updated_at, models })
+    Ok(Provider {
+        id: row.id,
+        name: row.name,
+        kind: row.kind,
+        base_url: row.base_url,
+        default_model: row.default_model,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        models,
+    })
 }
 
 async fn own_provider(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<ProviderRow, ApiError> {
@@ -925,53 +1005,139 @@ async fn own_provider(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<Provider
 }
 
 async fn configured_model(pool: &PgPool, provider_id: Uuid, model: &str) -> Result<bool, ApiError> {
-    Ok(sqlx::query_as::<_, (bool,)>("SELECT EXISTS(SELECT 1 FROM provider_models WHERE provider_id=$1 AND model=$2)")
-        .bind(provider_id).bind(model).fetch_one(pool).await?.0)
+    Ok(sqlx::query_as::<_, (bool,)>(
+        "SELECT EXISTS(SELECT 1 FROM provider_models WHERE provider_id=$1 AND model=$2)",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .fetch_one(pool)
+    .await?
+    .0)
 }
 
-async fn provider_first_model(pool: &PgPool, provider_id: Uuid) -> Result<Option<String>, ApiError> {
-    Ok(sqlx::query_as::<_, (String,)>("SELECT model FROM provider_models WHERE provider_id=$1 ORDER BY sort_order,model LIMIT 1")
-        .bind(provider_id).fetch_optional(pool).await?.map(|value| value.0))
+async fn provider_first_model(
+    pool: &PgPool,
+    provider_id: Uuid,
+) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_as::<_, (String,)>(
+        "SELECT model FROM provider_models WHERE provider_id=$1 ORDER BY sort_order,model LIMIT 1",
+    )
+    .bind(provider_id)
+    .fetch_optional(pool)
+    .await?
+    .map(|value| value.0))
 }
 
-async fn provider_model_kind(pool: &PgPool, provider_id: Uuid, model: &str) -> Result<Option<String>, ApiError> {
-    Ok(sqlx::query_as::<_, (String,)>("SELECT kind FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1")
-        .bind(provider_id).bind(model).fetch_optional(pool).await?.map(|value| value.0))
+async fn provider_model_kind(
+    pool: &PgPool,
+    provider_id: Uuid,
+    model: &str,
+) -> Result<Option<String>, ApiError> {
+    Ok(sqlx::query_as::<_, (String,)>(
+        "SELECT kind FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await?
+    .map(|value| value.0))
 }
 
-async fn provider_model_supports_images(pool: &PgPool, provider_id: Uuid, model: &str) -> Result<Option<bool>, ApiError> {
-    Ok(sqlx::query_as::<_, (bool,)>("SELECT supports_images FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1")
-        .bind(provider_id).bind(model).fetch_optional(pool).await?.map(|value| value.0))
+async fn provider_model_supports_images(
+    pool: &PgPool,
+    provider_id: Uuid,
+    model: &str,
+) -> Result<Option<bool>, ApiError> {
+    Ok(sqlx::query_as::<_, (bool,)>(
+        "SELECT supports_images FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await?
+    .map(|value| value.0))
 }
 
-async fn create_provider_model(State(state): State<AppState>, headers: HeaderMap, Path(id): Path<Uuid>, Json(request): Json<ProviderModelRequest>) -> Result<Json<ProviderModel>, ApiError> {
+async fn create_provider_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<ProviderModelRequest>,
+) -> Result<Json<ProviderModel>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
-    if request.group_name.trim().is_empty() || request.model.trim().is_empty() { return Err(ApiError::bad("Model group and model name are required.")); }
-    if !matches!(request.kind.as_str(), "openai_compatible" | "anthropic") { return Err(ApiError::bad("Model API format must be OpenAI-compatible or Anthropic.")); }
+    if request.group_name.trim().is_empty() || request.model.trim().is_empty() {
+        return Err(ApiError::bad("Model group and model name are required."));
+    }
+    if !matches!(request.kind.as_str(), "openai_compatible" | "anthropic") {
+        return Err(ApiError::bad(
+            "Model API format must be OpenAI-compatible or Anthropic.",
+        ));
+    }
     let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at")
         .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).bind(request.supports_images.unwrap_or(false)).fetch_one(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
 }
 
-async fn update_provider_model(State(state): State<AppState>, headers: HeaderMap, Path((id, model_id)): Path<(Uuid, Uuid)>, Json(request): Json<UpdateProviderModelRequest>) -> Result<Json<ProviderModel>, ApiError> {
+async fn update_provider_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, model_id)): Path<(Uuid, Uuid)>,
+    Json(request): Json<UpdateProviderModelRequest>,
+) -> Result<Json<ProviderModel>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
-    if request.group_name.as_ref().is_some_and(|v| v.trim().is_empty()) || request.model.as_ref().is_some_and(|v| v.trim().is_empty()) { return Err(ApiError::bad("Model group and model name cannot be empty.")); }
-    if request.kind.as_deref().is_some_and(|v| !matches!(v, "openai_compatible" | "anthropic")) { return Err(ApiError::bad("Model API format must be OpenAI-compatible or Anthropic.")); }
-    let previous: (String,) = sqlx::query_as("SELECT model FROM provider_models WHERE id=$1 AND provider_id=$2").bind(model_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    if request
+        .group_name
+        .as_ref()
+        .is_some_and(|v| v.trim().is_empty())
+        || request.model.as_ref().is_some_and(|v| v.trim().is_empty())
+    {
+        return Err(ApiError::bad("Model group and model name cannot be empty."));
+    }
+    if request
+        .kind
+        .as_deref()
+        .is_some_and(|v| !matches!(v, "openai_compatible" | "anthropic"))
+    {
+        return Err(ApiError::bad(
+            "Model API format must be OpenAI-compatible or Anthropic.",
+        ));
+    }
+    let previous: (String,) =
+        sqlx::query_as("SELECT model FROM provider_models WHERE id=$1 AND provider_id=$2")
+            .bind(model_id)
+            .bind(id)
+            .fetch_optional(&state.db)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
     let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window),supports_images=COALESCE($8,supports_images) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at")
         .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).bind(request.supports_images).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
-    sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2").bind(id).bind(previous.0).bind(&item.model).execute(&state.db).await?;
+    sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2")
+        .bind(id)
+        .bind(previous.0)
+        .bind(&item.model)
+        .execute(&state.db)
+        .await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
 }
 
-async fn delete_provider_model(State(state): State<AppState>, headers: HeaderMap, Path((id, model_id)): Path<(Uuid, Uuid)>) -> Result<StatusCode, ApiError> {
+async fn delete_provider_model(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((id, model_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     own_provider(&state.db, user_id, id).await?;
-    let removed: Option<(String,)> = sqlx::query_as("DELETE FROM provider_models WHERE id=$1 AND provider_id=$2 RETURNING model").bind(model_id).bind(id).fetch_optional(&state.db).await?;
+    let removed: Option<(String,)> = sqlx::query_as(
+        "DELETE FROM provider_models WHERE id=$1 AND provider_id=$2 RETURNING model",
+    )
+    .bind(model_id)
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?;
     let removed = removed.ok_or_else(ApiError::not_found)?;
     sqlx::query("UPDATE providers SET default_model=(SELECT model FROM provider_models WHERE provider_id=$1 ORDER BY sort_order,model LIMIT 1) WHERE id=$1 AND default_model=$2").bind(id).bind(removed.0).execute(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
@@ -1023,15 +1189,31 @@ async fn create_conversation(
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let (model, context_window) = if let Some(pid) = request.provider_id {
-        own_provider(&state.db, user_id, pid).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
+        own_provider(&state.db, user_id, pid)
+            .await
+            .map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
         let model = match request.model {
             Some(value) => value,
-            None => provider_first_model(&state.db, pid).await?.ok_or_else(|| ApiError::bad("Add a configured model to this provider before creating a chat."))?,
+            None => provider_first_model(&state.db, pid).await?.ok_or_else(|| {
+                ApiError::bad("Add a configured model to this provider before creating a chat.")
+            })?,
         };
-        if !configured_model(&state.db, pid, &model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
-        let context_window: (i32,) = sqlx::query_as("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(pid).bind(&model).fetch_one(&state.db).await?;
+        if !configured_model(&state.db, pid, &model).await? {
+            return Err(ApiError::bad(
+                "Choose a configured model for this provider.",
+            ));
+        }
+        let context_window: (i32,) = sqlx::query_as(
+            "SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2",
+        )
+        .bind(pid)
+        .bind(&model)
+        .fetch_one(&state.db)
+        .await?;
         (Some(model), context_window.0)
-    } else { (request.model, 128_000) };
+    } else {
+        (request.model, 128_000)
+    };
     let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(context_window).fetch_one(&state.db).await?;
     event(
         &state.db,
@@ -1061,7 +1243,10 @@ async fn update_conversation(
 ) -> Result<Json<Conversation>, ApiError> {
     let user_id = user_from_headers(&state, &headers)?;
     let existing = own_conversation(&state.db, user_id, id).await?;
-    let generation_settings = request.generation_settings.map(validate_generation_settings).transpose()?;
+    let generation_settings = request
+        .generation_settings
+        .map(validate_generation_settings)
+        .transpose()?;
     let model_changed = request.model.is_some();
     let model = request.model.map(|value| value.trim().to_string());
     if model.as_ref().is_some_and(String::is_empty) {
@@ -1071,10 +1256,25 @@ async fn update_conversation(
     let selected_model = model.as_deref().or(existing.model.as_deref());
     let mut selected_context_window = None;
     if let (Some(provider_id), Some(model)) = (provider_id, selected_model) {
-        own_provider(&state.db, user_id, provider_id).await.map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
-        if !configured_model(&state.db, provider_id, model).await? { return Err(ApiError::bad("Choose a configured model for this provider.")); }
+        own_provider(&state.db, user_id, provider_id)
+            .await
+            .map_err(|_| ApiError::bad("Selected provider does not belong to this account."))?;
+        if !configured_model(&state.db, provider_id, model).await? {
+            return Err(ApiError::bad(
+                "Choose a configured model for this provider.",
+            ));
+        }
         if request.provider_id.is_some() || model_changed {
-            selected_context_window = Some(sqlx::query_as::<_, (i32,)>("SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2").bind(provider_id).bind(model).fetch_one(&state.db).await?.0);
+            selected_context_window = Some(
+                sqlx::query_as::<_, (i32,)>(
+                    "SELECT context_window FROM provider_models WHERE provider_id=$1 AND model=$2",
+                )
+                .bind(provider_id)
+                .bind(model)
+                .fetch_one(&state.db)
+                .await?
+                .0,
+            );
         }
     }
     let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),generation_settings=COALESCE($8,generation_settings),is_favorite=COALESCE($9,is_favorite),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).bind(generation_settings).bind(request.is_favorite).fetch_one(&state.db).await?;
@@ -1144,17 +1344,25 @@ async fn create_message(
     }
     for image in &images {
         if !image.starts_with("data:image/") || image.len() > 7_000_000 {
-            return Err(ApiError::bad("Each image must be a data URL of at most 5 MB."));
+            return Err(ApiError::bad(
+                "Each image must be a data URL of at most 5 MB.",
+            ));
         }
         if parse_data_url(image).is_none() {
-            return Err(ApiError::bad("Each image must be a valid base64 image data URL."));
+            return Err(ApiError::bad(
+                "Each image must be a valid base64 image data URL.",
+            ));
         }
     }
     if content.is_empty() && images.is_empty() {
-        return Err(ApiError::bad("Message must contain text or at least one image."));
+        return Err(ApiError::bad(
+            "Message must contain text or at least one image.",
+        ));
     }
     if content.len() > 200_000 {
-        return Err(ApiError::bad("Message text must be at most 200,000 characters."));
+        return Err(ApiError::bad(
+            "Message text must be at most 200,000 characters.",
+        ));
     };
     if let Some(existing)=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND client_mutation_id=$2").bind(id).bind(request.client_mutation_id).fetch_optional(&state.db).await? { return Ok(Json(existing)); }
     let mut tx = state.db.begin().await?;
@@ -1164,8 +1372,18 @@ async fn create_message(
     let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,images,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7,$8) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence).bind(request.client_mutation_id).bind(content).bind(json!(images)).bind(tokens).bind(if request.search.unwrap_or(false){json!([])}else{json!([])}).fetch_one(&mut *tx).await?;
     let mut title_changed = false;
     if is_first_user_message && c.title == "New chat" {
-        let title_source = if content.is_empty() { "[Image]".to_string() } else { content.to_string() };
-        let title: String = title_source.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(40).collect();
+        let title_source = if content.is_empty() {
+            "[Image]".to_string()
+        } else {
+            content.to_string()
+        };
+        let title: String = title_source
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(40)
+            .collect();
         if !title.is_empty() {
             let updated: (i64,) = sqlx::query_as("UPDATE conversations SET title=$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING revision").bind(id).bind(user_id).bind(&title).fetch_one(&mut *tx).await?;
             revision = updated.0;
@@ -1207,10 +1425,7 @@ async fn update_message(
         &state.db, user_id, "message", message_id, "updated", m.sequence,
     )
     .await?;
-    event(
-        &state.db, user_id, "conversation", id, "updated", revision,
-    )
-    .await?;
+    event(&state.db, user_id, "conversation", id, "updated", revision).await?;
     Ok(Json(m))
 }
 async fn delete_message(
@@ -1227,10 +1442,7 @@ async fn delete_message(
     let tokens = recompute_context_tokens(&state.db, id).await?;
     let (revision,): (i64,) = sqlx::query_as("UPDATE conversations SET context_tokens=$2,revision=revision+1 WHERE id=$1 AND user_id=$3 RETURNING revision").bind(id).bind(tokens).bind(user_id).fetch_one(&state.db).await?;
     event(&state.db, user_id, "message", message_id, "deleted", 0).await?;
-    event(
-        &state.db, user_id, "conversation", id, "updated", revision,
-    )
-    .await?;
+    event(&state.db, user_id, "conversation", id, "updated", revision).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1249,12 +1461,22 @@ async fn respond(
     let p:(String,String,String,Vec<u8>,Vec<u8>)=sqlx::query_as("SELECT kind,base_url,default_model,encrypted_api_key,key_nonce FROM providers WHERE id=$1 AND user_id=$2").bind(provider_id).bind(user_id).fetch_optional(&state.db).await?.ok_or_else(||ApiError::bad("The selected provider was removed."))?;
     let prior_summary: Option<(String, i64)> = sqlx::query_as("SELECT content,ends_at_sequence FROM conversation_summaries WHERE conversation_id=$1 ORDER BY ends_at_sequence DESC LIMIT 1").bind(id).fetch_optional(&state.db).await?;
     let api_key = decrypt(&state, &p.3, &p.4)?;
-    let model = match conversation.model.as_deref().filter(|value| !value.trim().is_empty()) {
+    let model = match conversation
+        .model
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         Some(value) => value.to_string(),
-        None => provider_first_model(&state.db, provider_id).await?.unwrap_or_else(|| p.2.clone()),
+        None => provider_first_model(&state.db, provider_id)
+            .await?
+            .unwrap_or_else(|| p.2.clone()),
     };
-    let kind = provider_model_kind(&state.db, provider_id, &model).await?.unwrap_or_else(|| p.0.clone());
-    let supports_images = provider_model_supports_images(&state.db, provider_id, &model).await?.unwrap_or(false);
+    let kind = provider_model_kind(&state.db, provider_id, &model)
+        .await?
+        .unwrap_or_else(|| p.0.clone());
+    let supports_images = provider_model_supports_images(&state.db, provider_id, &model)
+        .await?
+        .unwrap_or(false);
     let messages:Vec<(String,String,Value)>=sqlx::query_as("SELECT role,content,images FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80").bind(id).bind(prior_summary.as_ref().map(|summary| summary.1).unwrap_or(0)).fetch_all(&state.db).await?;
     let mut transcript: Vec<Value> = messages
         .into_iter()
@@ -1264,6 +1486,15 @@ async fn respond(
             json!({"role":role,"content":content_part(&kind, supports_images, &strip_thinking(&content), images)})
         })
         .collect();
+    let context_rounds = request.context_rounds.unwrap_or(Some(8));
+    let tool_rounds = request
+        .tool_rounds
+        .unwrap_or(Some(DEFAULT_WEB_TOOL_ROUNDS as u8));
+    if let Some(rounds) = context_rounds {
+        let keep = usize::from(rounds).saturating_mul(2);
+        let start = transcript.len().saturating_sub(keep);
+        transcript = transcript.split_off(start);
+    }
     let explicit_search = web_tools::content_requests_web_search(&input.content);
     let search_requested = request.search.unwrap_or(false) || explicit_search;
     info!(conversation_id=%id, message_id=%input.id, search_toggle=request.search.unwrap_or(false), explicit_search, stream=request.stream.unwrap_or(false), "response request received");
@@ -1274,22 +1505,106 @@ async fn respond(
     transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
     if search_requested && !input.content.trim().is_empty() {
         if request.stream.unwrap_or(false) {
-            return Ok(stream_web_agent_response(state, id, user_id, kind, p.1, api_key, model, transcript, request.temperature, request.reasoning_effort, enable_markdown));
+            return Ok(stream_web_agent_response(
+                state,
+                id,
+                user_id,
+                kind,
+                p.1,
+                api_key,
+                model,
+                transcript,
+                request.temperature,
+                request.reasoning_effort,
+                enable_markdown,
+                tool_rounds,
+            ));
         }
-        let result = agent::run_web_agent(&state, &kind, &p.1, &api_key, &model, transcript, request.temperature, request.reasoning_effort.as_deref(), None).await?;
-        let message = persist_assistant_message(&state, id, user_id, &model, result.answer, result.reasoning, &result.sources, enable_markdown).await?;
+        let result = agent::run_web_agent(
+            &state,
+            &kind,
+            &p.1,
+            &api_key,
+            &model,
+            transcript,
+            request.temperature,
+            request.reasoning_effort.as_deref(),
+            None,
+            tool_rounds,
+        )
+        .await?;
+        let message = persist_assistant_message(
+            &state,
+            id,
+            user_id,
+            &model,
+            result.answer,
+            result.reasoning,
+            &result.sources,
+            enable_markdown,
+        )
+        .await?;
         return Ok(Json(message).into_response());
     }
     if request.stream.unwrap_or(false) {
-        let upstream = providers::call_provider_stream(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?;
-        return Ok(stream_response(state, upstream, id, user_id, model, vec![], enable_markdown));
+        let upstream = providers::call_provider_stream(
+            &state.http,
+            &kind,
+            &p.1,
+            &api_key,
+            &model,
+            &transcript,
+            request.temperature,
+            request.reasoning_effort.as_deref(),
+        )
+        .await?;
+        return Ok(stream_response(
+            state,
+            upstream,
+            id,
+            user_id,
+            model,
+            vec![],
+            enable_markdown,
+        ));
     }
-    let (answer, reasoning) = split_thinking(&providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &transcript, request.temperature, request.reasoning_effort.as_deref()).await?);
-    let m = persist_assistant_message(&state, id, user_id, &model, answer, reasoning, &[], enable_markdown).await?;
+    let (answer, reasoning) = split_thinking(
+        &providers::call_provider(
+            &state.http,
+            &kind,
+            &p.1,
+            &api_key,
+            &model,
+            &transcript,
+            request.temperature,
+            request.reasoning_effort.as_deref(),
+        )
+        .await?,
+    );
+    let m = persist_assistant_message(
+        &state,
+        id,
+        user_id,
+        &model,
+        answer,
+        reasoning,
+        &[],
+        enable_markdown,
+    )
+    .await?;
     Ok(Json(m).into_response())
 }
 
-async fn persist_assistant_message(state: &AppState, conversation_id: Uuid, user_id: Uuid, model: &str, answer: String, reasoning: String, sources: &[Value], enable_markdown: bool) -> Result<Message, ApiError> {
+async fn persist_assistant_message(
+    state: &AppState,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    model: &str,
+    answer: String,
+    reasoning: String,
+    sources: &[Value],
+    enable_markdown: bool,
+) -> Result<Message, ApiError> {
     // Providers sometimes emit thinking tags in normal content. Normalize at the
     // persistence boundary so private reasoning cannot become visible later.
     let (answer, leaked_reasoning) = split_thinking(&answer);
@@ -1327,8 +1642,19 @@ async fn auto_compact(pool: &PgPool, conversation_id: Uuid) -> Result<(), ApiErr
     let compacted = rows
         .iter()
         .map(|(role, content, images)| {
-            let has_images = images.as_array().map(|items| !items.is_empty()).unwrap_or(false);
-            format!("{role}: {}{}", strip_thinking(content), if has_images { " [image attachments were present in this message]" } else { "" })
+            let has_images = images
+                .as_array()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false);
+            format!(
+                "{role}: {}{}",
+                strip_thinking(content),
+                if has_images {
+                    " [image attachments were present in this message]"
+                } else {
+                    ""
+                }
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1371,8 +1697,19 @@ async fn compact(
     let source = rows
         .iter()
         .map(|(role, content, images)| {
-            let has_images = images.as_array().map(|items| !items.is_empty()).unwrap_or(false);
-            format!("{role}: {}{}", strip_thinking(content), if has_images { " [image attachments were present in this message]" } else { "" })
+            let has_images = images
+                .as_array()
+                .map(|items| !items.is_empty())
+                .unwrap_or(false);
+            format!(
+                "{role}: {}{}",
+                strip_thinking(content),
+                if has_images {
+                    " [image attachments were present in this message]"
+                } else {
+                    ""
+                }
+            )
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -1382,9 +1719,13 @@ async fn compact(
         let api_key = decrypt(&state, &p.3, &p.4)?;
         let model = match c.model.as_deref().filter(|value| !value.trim().is_empty()) {
             Some(value) => value.to_string(),
-            None => provider_first_model(&state.db, provider_id).await?.unwrap_or_else(|| p.2.clone()),
+            None => provider_first_model(&state.db, provider_id)
+                .await?
+                .unwrap_or_else(|| p.2.clone()),
         };
-        let kind = provider_model_kind(&state.db, provider_id, &model).await?.unwrap_or_else(|| p.0.clone());
+        let kind = provider_model_kind(&state.db, provider_id, &model)
+            .await?
+            .unwrap_or_else(|| p.0.clone());
         info!(conversation_id=%id, through_sequence=end, source_characters=source.len(), "manual compaction started");
         providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None).await?
     } else {
@@ -1396,10 +1737,15 @@ async fn compact(
     let mut tx = state.db.begin().await?;
     sqlx::query("INSERT INTO conversation_summaries (id,conversation_id,starts_at_sequence,ends_at_sequence,content,token_count) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (conversation_id,starts_at_sequence,ends_at_sequence) DO UPDATE SET content=EXCLUDED.content,token_count=EXCLUDED.token_count").bind(summary_id).bind(id).bind(prior.as_ref().map(|item| item.1 + 1).unwrap_or(1)).bind(end).bind(&concise).bind(summary_tokens).execute(&mut *tx).await?;
     let sequence:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=$3,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(id).bind(user_id).bind(summary_tokens).fetch_one(&mut *tx).await?;
-    let marker = format!("Context compacted through message {end}. The conversation now uses a durable summary ({summary_tokens} estimated tokens).");
+    let marker = format!(
+        "Context compacted through message {end}. The conversation now uses a durable summary ({summary_tokens} estimated tokens)."
+    );
     let message:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,token_count) VALUES ($1,$2,$3,'summary',$4,'plain',0) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence.0).bind(marker).fetch_one(&mut *tx).await?;
     tx.commit().await?;
-    event(&state.db, user_id, "message", message.id, "created", sequence.0).await?;
+    event(
+        &state.db, user_id, "message", message.id, "created", sequence.0,
+    )
+    .await?;
     info!(conversation_id=%id, through_sequence=end, summary_tokens, "manual compaction completed");
     Ok(Json(
         json!({"compacted":true,"summary_id":summary_id,"through_sequence":end,"estimated_tokens":summary_tokens,"message":message,"context_tokens":summary_tokens}),
@@ -1438,10 +1784,11 @@ async fn dictionary_lookup(
     }
     let directory = (*state.dictionary_dir).clone();
     let russian_dictionary = Arc::clone(&state.russian_dictionary);
-    let response =
-        tokio::task::spawn_blocking(move || lookup_dictionary(&directory, &russian_dictionary, &dictionary, &word))
-            .await
-            .map_err(|_| ApiError::internal("Dictionary worker did not complete."))??;
+    let response = tokio::task::spawn_blocking(move || {
+        lookup_dictionary(&directory, &russian_dictionary, &dictionary, &word)
+    })
+    .await
+    .map_err(|_| ApiError::internal("Dictionary worker did not complete."))??;
     Ok(Json(response))
 }
 
@@ -1492,17 +1839,27 @@ fn lookup_russian_dictionary(
     dictionary: &Mutex<Mdx>,
     word: &str,
 ) -> Result<Vec<DictionaryEntryResponse>, ApiError> {
-    let mut mdx = dictionary.lock().map_err(|_| ApiError::internal("Russian dictionary is unavailable."))?;
+    let mut mdx = dictionary
+        .lock()
+        .map_err(|_| ApiError::internal("Russian dictionary is unavailable."))?;
     let mut terms = vec![word.trim().to_lowercase()];
     let alternate = terms[0].replace('ё', "е");
-    if alternate != terms[0] { terms.push(alternate); }
+    if alternate != terms[0] {
+        terms.push(alternate);
+    }
     for term in terms {
-        if let Some(entry) = russian_entry(&mut mdx, &term, None) { return Ok(vec![entry]); }
+        if let Some(entry) = russian_entry(&mut mdx, &term, None) {
+            return Ok(vec![entry]);
+        }
     }
     Ok(Vec::new())
 }
 
-fn russian_entry(mdx: &mut Mdx, term: &str, linked_from: Option<&str>) -> Option<DictionaryEntryResponse> {
+fn russian_entry(
+    mdx: &mut Mdx,
+    term: &str,
+    linked_from: Option<&str>,
+) -> Option<DictionaryEntryResponse> {
     let normalized = normalize_dictionary_key(term);
     let entries = russian_exact_entries(mdx, &normalized);
     for item in &entries {
@@ -1516,7 +1873,9 @@ fn russian_entry(mdx: &mut Mdx, term: &str, linked_from: Option<&str>) -> Option
     }
     let lookup = mdx.lookup(term)?;
     if let Some(target) = russian_link_target(&lookup.definition) {
-        if normalize_dictionary_key(&target) != normalized { return russian_entry(mdx, &target, Some(&lookup.key_text)); }
+        if normalize_dictionary_key(&target) != normalized {
+            return russian_entry(mdx, &target, Some(&lookup.key_text));
+        }
     }
     russian_response(lookup.key_text, &lookup.definition, linked_from)
 }
@@ -1527,16 +1886,28 @@ fn russian_exact_entries(mdx: &Mdx, target: &str) -> Vec<KeyWordItem> {
     let mut hi = list.len();
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if normalize_dictionary_key(&list[mid].key_text).as_str() < target { lo = mid + 1; } else { hi = mid; }
+        if normalize_dictionary_key(&list[mid].key_text).as_str() < target {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
     }
     let start = lo;
-    while lo < list.len() && normalize_dictionary_key(&list[lo].key_text) == target { lo += 1; }
+    while lo < list.len() && normalize_dictionary_key(&list[lo].key_text) == target {
+        lo += 1;
+    }
     list[start..lo].to_vec()
 }
 
-fn russian_response(headword: String, definition: &str, linked_from: Option<&str>) -> Option<DictionaryEntryResponse> {
+fn russian_response(
+    headword: String,
+    definition: &str,
+    linked_from: Option<&str>,
+) -> Option<DictionaryEntryResponse> {
     let mut labels = vec!["OpenRussian".into()];
-    if let Some(source) = linked_from { labels.push(format!("Lemma for {source}")); }
+    if let Some(source) = linked_from {
+        labels.push(format!("Lemma for {source}"));
+    }
     Some(DictionaryEntryResponse {
         lemma: headword.clone(),
         matched_terms: linked_from.into_iter().map(str::to_string).collect(),
@@ -1560,7 +1931,11 @@ fn russian_link_target(definition: &str) -> Option<String> {
         .next()?
         .split_whitespace()
         .next()
-        .map(|value| value.trim_matches(|ch: char| matches!(ch, '"' | '\'' | '<' | '>')).to_lowercase())
+        .map(|value| {
+            value
+                .trim_matches(|ch: char| matches!(ch, '"' | '\'' | '<' | '>'))
+                .to_lowercase()
+        })
 }
 
 fn german_database_path(directory: &std::path::Path) -> Result<PathBuf, ApiError> {
@@ -1782,12 +2157,20 @@ fn split_thinking(input: &str) -> (String, String) {
     while !remaining.is_empty() {
         match find_thinking_marker(remaining, in_think) {
             Some((index, marker_len)) => {
-                if in_think { reasoning.push_str(&remaining[..index]); } else { answer.push_str(&remaining[..index]); }
+                if in_think {
+                    reasoning.push_str(&remaining[..index]);
+                } else {
+                    answer.push_str(&remaining[..index]);
+                }
                 remaining = &remaining[index + marker_len..];
                 in_think = !in_think;
             }
             None => {
-                if in_think { reasoning.push_str(remaining); } else { answer.push_str(remaining); }
+                if in_think {
+                    reasoning.push_str(remaining);
+                } else {
+                    answer.push_str(remaining);
+                }
                 break;
             }
         }
@@ -1795,16 +2178,28 @@ fn split_thinking(input: &str) -> (String, String) {
     (answer, reasoning)
 }
 
-fn strip_thinking(input: &str) -> String { split_thinking(input).0 }
+fn strip_thinking(input: &str) -> String {
+    split_thinking(input).0
+}
 
 fn thinking_markers(in_think: bool) -> &'static [&'static str] {
-    if in_think { &["</thinking>", "</think>"] } else { &["<thinking>", "<think>"] }
+    if in_think {
+        &["</thinking>", "</think>"]
+    } else {
+        &["<thinking>", "<think>"]
+    }
 }
 
 fn find_thinking_marker(input: &str, in_think: bool) -> Option<(usize, usize)> {
     thinking_markers(in_think)
         .iter()
-        .filter_map(|marker| input.as_bytes().windows(marker.len()).position(|candidate| candidate.eq_ignore_ascii_case(marker.as_bytes())).map(|index| (index, marker.len())))
+        .filter_map(|marker| {
+            input
+                .as_bytes()
+                .windows(marker.len())
+                .position(|candidate| candidate.eq_ignore_ascii_case(marker.as_bytes()))
+                .map(|index| (index, marker.len()))
+        })
         .min_by_key(|(index, _)| *index)
 }
 
@@ -1812,7 +2207,11 @@ fn thinking_marker_suffix_len(input: &str, in_think: bool) -> usize {
     thinking_markers(in_think)
         .iter()
         .flat_map(|marker| (1..marker.len()).rev().map(move |size| (marker, size)))
-        .filter(|(marker, size)| input.len() >= *size && input.as_bytes()[input.len() - *size..].eq_ignore_ascii_case(&marker.as_bytes()[..*size]))
+        .filter(|(marker, size)| {
+            input.len() >= *size
+                && input.as_bytes()[input.len() - *size..]
+                    .eq_ignore_ascii_case(&marker.as_bytes()[..*size])
+        })
         .map(|(_, size)| size)
         .max()
         .unwrap_or(0)
@@ -1823,13 +2222,20 @@ struct ThinkingStream {
     pending: String,
 }
 impl ThinkingStream {
-    fn new() -> Self { Self { in_think: false, pending: String::new() } }
+    fn new() -> Self {
+        Self {
+            in_think: false,
+            pending: String::new(),
+        }
+    }
     fn push(&mut self, input: &str) -> Vec<(bool, String)> {
         self.pending.push_str(input);
         let mut output = Vec::new();
         loop {
             if let Some((index, marker_len)) = find_thinking_marker(&self.pending, self.in_think) {
-                if index > 0 { output.push((self.in_think, self.pending[..index].to_string())); }
+                if index > 0 {
+                    output.push((self.in_think, self.pending[..index].to_string()));
+                }
                 self.pending.drain(..index + marker_len);
                 self.in_think = !self.in_think;
                 continue;
@@ -1844,12 +2250,28 @@ impl ThinkingStream {
         }
     }
     fn finish(&mut self) -> Vec<(bool, String)> {
-        if self.pending.is_empty() { vec![] } else { vec![(self.in_think, std::mem::take(&mut self.pending))] }
+        if self.pending.is_empty() {
+            vec![]
+        } else {
+            vec![(self.in_think, std::mem::take(&mut self.pending))]
+        }
     }
 }
 
-fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id: Uuid, user_id: Uuid, model: String, sources: Vec<Value>, enable_markdown: bool) -> Response {
-    let kind = if upstream.url().path().ends_with("/v1/messages") { "anthropic".to_string() } else { "openai_compatible".to_string() };
+fn stream_response(
+    state: AppState,
+    upstream: reqwest::Response,
+    conversation_id: Uuid,
+    user_id: Uuid,
+    model: String,
+    sources: Vec<Value>,
+    enable_markdown: bool,
+) -> Response {
+    let kind = if upstream.url().path().ends_with("/v1/messages") {
+        "anthropic".to_string()
+    } else {
+        "openai_compatible".to_string()
+    };
     let output = async_stream::stream! {
         let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new();
         while let Some(chunk) = upstream.next().await {
@@ -1866,8 +2288,17 @@ fn stream_response(state: AppState, upstream: reqwest::Response, conversation_id
         }
     };
     let mut response = Body::from_stream(output).into_response();
-    response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-    response.headers_mut().insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
 }
 
@@ -1883,16 +2314,17 @@ fn stream_web_agent_response(
     temperature: Option<f32>,
     reasoning_effort: Option<String>,
     enable_markdown: bool,
+    tool_rounds: Option<u8>,
 ) -> Response {
     let output = async_stream::stream! {
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
-        let agent = agent::run_web_agent(&state, &kind, &base, &api_key, &model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_tx));
+        let agent = agent::run_web_agent(&state, &kind, &base, &api_key, &model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_tx), tool_rounds);
         tokio::pin!(agent);
         let result = loop {
             tokio::select! {
                 event = event_rx.recv() => {
                     if let Some(tool) = event {
-                        let payload = serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default();
+                        let payload = if tool["type"] == "reasoning" { serde_json::to_string(&tool).unwrap_or_default() } else { serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default() };
                         yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
                     }
                 }
@@ -1900,7 +2332,7 @@ fn stream_web_agent_response(
             }
         };
         while let Ok(tool) = event_rx.try_recv() {
-            let payload = serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default();
+            let payload = if tool["type"] == "reasoning" { serde_json::to_string(&tool).unwrap_or_default() } else { serde_json::to_string(&json!({"type":"tool","tool":tool})).unwrap_or_default() };
             yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n")));
         }
         let result = match result {
@@ -1939,14 +2371,26 @@ fn stream_web_agent_response(
         }
     };
     let mut response = Body::from_stream(output).into_response();
-    response.headers_mut().insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-    response.headers_mut().insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
+    response.headers_mut().insert(
+        http::header::CONTENT_TYPE,
+        HeaderValue::from_static("text/event-stream"),
+    );
+    response.headers_mut().insert(
+        http::header::CACHE_CONTROL,
+        HeaderValue::from_static("no-cache"),
+    );
+    response
+        .headers_mut()
+        .insert("x-accel-buffering", HeaderValue::from_static("no"));
     response
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{content_part, parse_data_url, plain_text_content, split_thinking, strip_thinking, ThinkingStream};
+    use super::{
+        ThinkingStream, content_part, parse_data_url, plain_text_content, split_thinking,
+        strip_thinking,
+    };
     use crate::providers::{provider_error_from_response, provider_stream_delta, provider_url};
     use crate::web_tools::{is_safe_public_url, is_valid_search_query, web_tool_definitions};
     use axum::http::StatusCode;
@@ -1960,23 +2404,52 @@ mod tests {
 
     #[test]
     fn parses_openai_stream_delta() {
-        assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"), Some((false, "hello".into())));
-        assert_eq!(provider_stream_delta("openai_compatible", "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}"), Some((true, "plan".into())));
-        assert_eq!(provider_stream_delta("anthropic", "data: {\"delta\":{\"thinking\":\"plan\"}}"), Some((true, "plan".into())));
+        assert_eq!(
+            provider_stream_delta(
+                "openai_compatible",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}"
+            ),
+            Some((false, "hello".into()))
+        );
+        assert_eq!(
+            provider_stream_delta(
+                "openai_compatible",
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"plan\"}}]}"
+            ),
+            Some((true, "plan".into()))
+        );
+        assert_eq!(
+            provider_stream_delta("anthropic", "data: {\"delta\":{\"thinking\":\"plan\"}}"),
+            Some((true, "plan".into()))
+        );
     }
 
     #[test]
     fn accepts_standard_provider_base_urls() {
-        assert_eq!(provider_url("openai_compatible", "https://api.openai.com"), "https://api.openai.com/v1/chat/completions");
-        assert_eq!(provider_url("openai_compatible", "https://api.openai.com/v1"), "https://api.openai.com/v1/chat/completions");
-        assert_eq!(provider_url("anthropic", "https://api.anthropic.com"), "https://api.anthropic.com/v1/messages");
-        assert_eq!(provider_url("anthropic", "https://api.anthropic.com/v1"), "https://api.anthropic.com/v1/messages");
+        assert_eq!(
+            provider_url("openai_compatible", "https://api.openai.com"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            provider_url("openai_compatible", "https://api.openai.com/v1"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            provider_url("anthropic", "https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            provider_url("anthropic", "https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
     }
 
     #[test]
     fn exposes_provider_native_web_tools_and_rejects_private_urls() {
         assert!(web_tool_definitions("openai_compatible")[0]["function"]["parameters"]["properties"]["query"].is_object());
-        assert!(web_tool_definitions("anthropic")[0]["input_schema"]["properties"]["query"].is_object());
+        assert!(
+            web_tool_definitions("anthropic")[0]["input_schema"]["properties"]["query"].is_object()
+        );
         assert!(is_safe_public_url("https://www.example.com/article"));
         assert!(!is_safe_public_url("http://127.0.0.1:3100/healthz"));
         assert!(!is_safe_public_url("http://10.0.0.8/admin"));
@@ -1985,8 +2458,14 @@ mod tests {
 
     #[test]
     fn parses_image_data_urls() {
-        assert_eq!(parse_data_url("data:image/png;base64,AAAA"), Some(("image/png".into(), "AAAA".into())));
-        assert_eq!(parse_data_url("data:image/jpeg;base64,BBBB"), Some(("image/jpeg".into(), "BBBB".into())));
+        assert_eq!(
+            parse_data_url("data:image/png;base64,AAAA"),
+            Some(("image/png".into(), "AAAA".into()))
+        );
+        assert_eq!(
+            parse_data_url("data:image/jpeg;base64,BBBB"),
+            Some(("image/jpeg".into(), "BBBB".into()))
+        );
         assert_eq!(parse_data_url("data:text/plain;base64,AAAA"), None);
         assert_eq!(parse_data_url("data:image/png;base64,"), None);
         assert_eq!(parse_data_url("https://example.com/a.png"), None);
@@ -1996,7 +2475,12 @@ mod tests {
     fn degrades_images_to_placeholder_when_model_has_no_vision() {
         let images = vec![serde_json::json!("data:image/png;base64,AAAA")];
         let content = content_part("openai_compatible", false, "describe this", &images);
-        assert!(content.as_str().unwrap().contains("does not support image input"));
+        assert!(
+            content
+                .as_str()
+                .unwrap()
+                .contains("does not support image input")
+        );
         let text = plain_text_content("describe this", &images);
         assert!(text.contains("does not support image input"));
         assert!(text.starts_with("describe this"));
@@ -2017,21 +2501,58 @@ mod tests {
 
     #[test]
     fn separates_thinking_from_visible_answer_in_complete_and_streamed_text() {
-        assert_eq!(strip_thinking("Before<think>private</think>After"), "BeforeAfter");
-        assert_eq!(split_thinking("Before<think>private</think>After"), ("BeforeAfter".into(), "private".into()));
-        assert_eq!(split_thinking("Before<THINKING>private</Thinking>After"), ("BeforeAfter".into(), "private".into()));
+        assert_eq!(
+            strip_thinking("Before<think>private</think>After"),
+            "BeforeAfter"
+        );
+        assert_eq!(
+            split_thinking("Before<think>private</think>After"),
+            ("BeforeAfter".into(), "private".into())
+        );
+        assert_eq!(
+            split_thinking("Before<THINKING>private</Thinking>After"),
+            ("BeforeAfter".into(), "private".into())
+        );
         let mut stream = ThinkingStream::new();
         assert_eq!(stream.push("Before<thi"), vec![(false, "Before".into())]);
-        assert_eq!(stream.push("nk>private</think>After"), vec![(true, "private".into()), (false, "After".into())]);
+        assert_eq!(
+            stream.push("nk>private</think>After"),
+            vec![(true, "private".into()), (false, "After".into())]
+        );
         let mut long_tag_stream = ThinkingStream::new();
-        assert_eq!(long_tag_stream.push("Before<thinkin"), vec![(false, "Before".into())]);
-        assert_eq!(long_tag_stream.push("g>private</thinking>After"), vec![(true, "private".into()), (false, "After".into())]);
+        assert_eq!(
+            long_tag_stream.push("Before<thinkin"),
+            vec![(false, "Before".into())]
+        );
+        assert_eq!(
+            long_tag_stream.push("g>private</thinking>After"),
+            vec![(true, "private".into()), (false, "After".into())]
+        );
     }
 
     #[test]
     fn distinguishes_provider_access_and_tool_schema_failures() {
-        assert_eq!(provider_error_from_response(StatusCode::FORBIDDEN, "tool calling is unsupported", true).code, "provider_access_denied");
-        assert_eq!(provider_error_from_response(StatusCode::BAD_REQUEST, "tool_choice is unsupported", true).code, "provider_tool_unsupported");
-        assert_eq!(provider_error_from_response(StatusCode::TOO_MANY_REQUESTS, "", false).code, "provider_rate_limited");
+        assert_eq!(
+            provider_error_from_response(
+                StatusCode::FORBIDDEN,
+                "tool calling is unsupported",
+                true
+            )
+            .code,
+            "provider_access_denied"
+        );
+        assert_eq!(
+            provider_error_from_response(
+                StatusCode::BAD_REQUEST,
+                "tool_choice is unsupported",
+                true
+            )
+            .code,
+            "provider_tool_unsupported"
+        );
+        assert_eq!(
+            provider_error_from_response(StatusCode::TOO_MANY_REQUESTS, "", false).code,
+            "provider_rate_limited"
+        );
     }
 }

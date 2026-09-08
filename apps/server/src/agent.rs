@@ -42,12 +42,18 @@ pub(super) async fn run_web_agent(
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
     events: Option<&UnboundedSender<Value>>,
+    tool_rounds: Option<u8>,
 ) -> Result<WebAgentAnswer, ApiError> {
     transcript.insert(0, json!({"role":"system","content":"You are a web research agent. Before answering, use web_search with a concise, specific 3-12 word query derived from the user request. Never copy the full user message verbatim as the initial query. Refine the query when evidence is weak, and use open_web_page on important sources before relying on them. Do not invent tool results or citations. Give a direct answer only after gathering enough evidence, citing the supporting source URLs."}));
     let mut sources = Vec::new();
     let mut allowed_urls = Vec::new();
 
-    for round in 0..MAX_WEB_TOOL_ROUNDS {
+    let max_rounds = tool_rounds.map(usize::from);
+    let mut round = 0usize;
+    loop {
+        if max_rounds.is_some_and(|limit| round >= limit) {
+            break;
+        }
         emit_tool_event(
             events,
             format!("plan-{round}"),
@@ -58,7 +64,6 @@ pub(super) async fn run_web_agent(
             None,
             Some("Choosing the next research step"),
         );
-        let forced_tool = (round == 0).then_some("web_search");
         let turn = match call_provider_with_tools(
             &state.http,
             kind,
@@ -68,7 +73,6 @@ pub(super) async fn run_web_agent(
             &transcript,
             temperature,
             reasoning_effort,
-            forced_tool,
         )
         .await
         {
@@ -128,6 +132,13 @@ pub(super) async fn run_web_agent(
             None,
             None,
         );
+        let (_, turn_reasoning) = split_thinking(&turn.content);
+        if !turn_reasoning.trim().is_empty() {
+            if let Some(events) = events {
+                let _ =
+                    events.send(json!({"type":"reasoning","delta":turn_reasoning,"round":round}));
+            }
+        }
 
         if turn.tool_calls.is_empty() {
             let (answer, reasoning) = split_thinking(&turn.content);
@@ -161,10 +172,10 @@ pub(super) async fn run_web_agent(
                 None,
                 None,
             );
-            let result = if index < 4 {
+            let result = if index < 16 {
                 execute_web_tool(state, call, &mut sources, &mut allowed_urls).await
             } else {
-                json!({"error":"This tool-call batch exceeded the limit of four calls. Continue using the results already returned."})
+                json!({"error":"This tool-call batch exceeded the safety limit of sixteen calls. Continue using the results already returned."})
             };
             let detail = result["error"].as_str();
             let source_count = result["results"].as_array().map(Vec::len);
@@ -191,6 +202,7 @@ pub(super) async fn run_web_agent(
         if kind == "anthropic" && !anthropic_results.is_empty() {
             transcript.push(json!({"role":"user","content":anthropic_results}));
         }
+        round += 1;
     }
 
     emit_tool_event(
@@ -199,7 +211,7 @@ pub(super) async fn run_web_agent(
         "drafting",
         "running",
         json!({}),
-        MAX_WEB_TOOL_ROUNDS,
+        round,
         None,
         Some("Writing the answer from gathered evidence"),
     );
@@ -223,7 +235,7 @@ pub(super) async fn run_web_agent(
         "drafting",
         "completed",
         json!({}),
-        MAX_WEB_TOOL_ROUNDS,
+        round,
         None,
         None,
     );

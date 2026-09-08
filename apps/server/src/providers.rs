@@ -23,7 +23,6 @@ pub(crate) async fn call_provider_with_tools(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
-    forced_tool: Option<&str>,
 ) -> Result<ProviderToolTurn, ApiError> {
     let url = provider_url(kind, base);
     let response = if kind == "anthropic" {
@@ -40,9 +39,6 @@ pub(crate) async fn call_provider_with_tools(
         if let Some(value) = temperature {
             body["temperature"] = json!(value.clamp(0.0, 2.0));
         }
-        if let Some(name) = forced_tool {
-            body["tool_choice"] = json!({"type":"tool","name":name});
-        }
         http.post(url)
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
@@ -56,9 +52,6 @@ pub(crate) async fn call_provider_with_tools(
         }
         if let Some(value) = reasoning_effort {
             body["reasoning_effort"] = json!(value);
-        }
-        if let Some(name) = forced_tool {
-            body["tool_choice"] = json!({"type":"function","function":{"name":name}});
         }
         http.post(url).bearer_auth(key).json(&body).send().await?
     };
