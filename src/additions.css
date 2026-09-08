@@ -286,3 +286,14 @@
 .app-shell.dark .sources{background:#292929!important;border-color:#484848!important}.app-shell.dark .sources[open] summary{border-color:#484848!important}.app-shell.dark .sources summary{color:#d5d5d5!important}.app-shell.dark .source-query,.app-shell.dark .source-meta,.app-shell.dark .source-snippet{color:#a8a8a8!important}.app-shell.dark .sources .source-list a{background:#303030!important;border-color:#505050!important;color:#e8e8e8!important}.app-shell.dark .sources .source-list a:hover{background:#383838!important;border-color:#707070!important}
 .app-shell.dark .tool-activity{border-color:#526762;color:#b0b9b7}.app-shell.dark .tool-step-icon{border-color:#526762;background:#292929;color:#b6c9c4}.app-shell.dark .tool-step.running{color:#9ed1c7}.app-shell.dark .tool-step.running .tool-step-icon{border-color:#79afa4;color:#9ed1c7}.app-shell.dark .tool-step.failed{color:#eea3a3}.app-shell.dark .tool-step.failed .tool-step-icon{border-color:#a46969;color:#eea3a3}.app-shell.dark .tool-step.completed{color:#b6c9c4}
 .app-shell.dark .agent-timeline{background:#292929;border-color:#454545}.app-shell.dark .agent-timeline-toggle{color:#9ed1c7}.app-shell.dark .agent-timeline-toggle small{color:#a8b4b1}
+
+/* Reasoning summaries arrive as Markdown, so the timeline rows reuse the message renderer at a tighter scale. */
+.tool-step-copy.markdown-content h1,.tool-step-copy.markdown-content h2,.tool-step-copy.markdown-content h3,.tool-step-copy.markdown-content h4{font-size:1em;margin:.6em 0 .3em}
+.tool-step-copy.markdown-content p,.tool-step-copy.markdown-content ul,.tool-step-copy.markdown-content ol,.tool-step-copy.markdown-content blockquote,.tool-step-copy.markdown-content pre,.tool-step-copy.markdown-content table{margin:0 0 .45em}
+.tool-step-copy.markdown-content ul,.tool-step-copy.markdown-content ol{padding-left:1.25em}
+.tool-step-copy.markdown-content li{margin:0 0 .2em}
+.tool-step-copy.markdown-content pre{padding:8px 10px;font-size:11.5px}
+.tool-step-copy.markdown-content .katex-display{overflow-x:auto;padding:2px 0}
+.tool-step-copy.markdown-content>:first-child{margin-top:0}
+.tool-step-copy.markdown-content>:last-child{margin-bottom:0}
+.app-shell.dark .markdown-content :not(pre) > code{background:#333;color:#e8e8e8}

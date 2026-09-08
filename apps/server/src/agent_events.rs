@@ -60,7 +60,16 @@ pub(super) fn emit_reasoning(sink: Option<&AgentEventSink>, text: &str, round: u
     if text.trim().is_empty() {
         return;
     }
-    if let Some(sink) = sink {
-        sink.send(json!({"type":"reasoning","delta":text,"round":round}));
-    }
+    // Emitted as a tool event so that the checkpointed history in `agent_runs.events`
+    // holds the same shape the client renders, not a bare delta.
+    emit(
+        sink,
+        format!("reasoning-{round}"),
+        "reasoning",
+        "completed",
+        json!({}),
+        round,
+        None,
+        Some(text),
+    );
 }
