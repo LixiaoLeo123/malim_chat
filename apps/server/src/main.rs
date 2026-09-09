@@ -82,7 +82,6 @@ const ACCESS_TOKEN_MINUTES: i64 = 15;
 const REFRESH_TOKEN_DAYS: i64 = 30;
 const DEFAULT_PAGE_SIZE: i64 = 50;
 const MAX_PAGE_SIZE: i64 = 100;
-const DEFAULT_WEB_TOOL_ROUNDS: usize = 4;
 const MAX_WEB_SOURCES: usize = 12;
 const MIN_PREFERRED_SEARCH_RESULTS: usize = 3;
 
@@ -449,6 +448,22 @@ mod tests {
         assert!(is_valid_search_query("ab"));
         assert!(is_valid_search_query("a specific search query"));
         assert!(!is_valid_search_query("x"));
+    }
+
+    #[test]
+    fn repeats_the_provider_own_error_words() {
+        let error = provider_error_from_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "{\"error\":{\"message\":\"no channel for model gpt-5.6-luna\",\"type\":\"new_api_error\"}}",
+            false,
+            false,
+        );
+        assert_eq!(error.code, "provider_unavailable");
+        assert!(
+            error.message.contains("no channel for model gpt-5.6-luna"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]

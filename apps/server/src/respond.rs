@@ -99,10 +99,8 @@ pub(crate) async fn respond(
     let supports_images = provider_model_supports_images(&state.db, provider_id, &model)
         .await?
         .unwrap_or(false);
-    let context_rounds = request.context_rounds.unwrap_or(Some(8));
-    let tool_rounds = request
-        .tool_rounds
-        .unwrap_or(Some(DEFAULT_WEB_TOOL_ROUNDS as u8));
+    let context_rounds = request.context_rounds.unwrap_or(None);
+let tool_rounds = request.tool_rounds.unwrap_or(None);
     let explicit_search = web_tools::content_requests_web_search(&input.content);
     // Responses providers get OpenAI's hosted web_search_preview tool on every call, so
     // the retrieved-evidence ReAct loop never applies to them.

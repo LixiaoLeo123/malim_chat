@@ -341,13 +341,23 @@ pub(super) async fn run_web_agent(
 }
 
 // --- stored runs: the checkpoint a retry resumes from ---------------------------
+/// Reads the transcript and sources a failed run already collected, so a retry resumes
+/// instead of searching from scratch. The columns are single `jsonb` values, so they are
+/// decoded as `Value` first: sqlx reads a `Vec<Value>` as `jsonb[]` and fails the row.
 pub(crate) async fn load_failed_agent_run(
     state: &AppState,
     conversation_id: Uuid,
     user_message_id: Uuid,
 ) -> Result<Option<(Vec<Value>, Vec<Value>, Vec<Value>, i32)>, ApiError> {
-    sqlx::query_as("SELECT transcript,sources,events,round FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 AND status='failed' ORDER BY updated_at DESC LIMIT 1")
-        .bind(conversation_id).bind(user_message_id).fetch_optional(&state.db).await.map_err(ApiError::from)
+    let row: Option<(Value, Value, Value, i32)> = sqlx::query_as("SELECT transcript,sources,events,round FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 AND status='failed' ORDER BY updated_at DESC LIMIT 1")
+        .bind(conversation_id).bind(user_message_id).fetch_optional(&state.db).await.map_err(ApiError::from)?;
+    Ok(row.map(|(transcript, sources, events, round)| {
+        (json_items(transcript), json_items(sources), json_items(events), round)
+    }))
+}
+
+fn json_items(value: Value) -> Vec<Value> {
+    value.as_array().cloned().unwrap_or_default()
 }
 
 pub(crate) async fn agent_run_events(

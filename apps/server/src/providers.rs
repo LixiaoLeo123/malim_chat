@@ -371,7 +371,56 @@ async fn ensure_provider_success(
     ))
 }
 
+/// The provider's own words, so a failure says what actually happened instead of
+/// "could not be reached". OpenAI-compatible gateways all report under `error.message`.
+fn upstream_detail(body: &str) -> String {
+    let body = body.trim();
+    if body.is_empty() {
+        return String::new();
+    }
+    let candidate = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            let error = value.get("error");
+            error
+                .and_then(|error| error.get("message"))
+                .or_else(|| error.and_then(|error| error.get("err_msg")))
+                .or_else(|| error.filter(|error| error.is_string()))
+                .or_else(|| value.get("message"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| body.to_string());
+    let flattened = candidate.chars().filter(|c| !c.is_control()).collect::<String>();
+    let mut detail = flattened.trim().chars().take(240).collect::<String>();
+    if !detail.is_empty() {
+        if let Some(last) = detail.pop() {
+            if last == ',' || last == ':' {
+                detail.push(':');
+            } else {
+                detail.push(last);
+            }
+        }
+    }
+    detail
+}
+
 pub(crate) fn provider_error_from_response(
+    status: StatusCode,
+    body: &str,
+    tool_request: bool,
+    chained: bool,
+) -> ApiError {
+    let detail = upstream_detail(body);
+    let mut error = provider_error_kind(status, &detail, tool_request, chained);
+    if detail.is_empty() {
+        return error;
+    }
+    error.message = format!("{} {}", error.message, detail);
+    error
+}
+
+fn provider_error_kind(
     status: StatusCode,
     body: &str,
     tool_request: bool,

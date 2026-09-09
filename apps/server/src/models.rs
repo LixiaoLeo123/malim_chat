@@ -122,7 +122,7 @@ pub(crate) fn default_context_rounds() -> Option<u8> {
 }
 
 pub(crate) fn default_tool_rounds() -> Option<u8> {
-    Some(DEFAULT_WEB_TOOL_ROUNDS as u8)
+    None
 }
 
 #[derive(Deserialize)]
