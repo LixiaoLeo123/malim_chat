@@ -4,7 +4,10 @@ set -euo pipefail
 remote="${1:-root@106.53.70.76}"
 target="/opt/malim_chat/web/"
 
-VITE_BASE_PATH=/malim_chat/ npm run build
+# No absolute API URL: the bundle has to call whatever origin served it. A baked-in
+# http:// host is blocked as mixed content from an https:// page, and pins the deploy to
+# one host. .env.local keeps that override for the desktop build, which needs one.
+VITE_API_URL= VITE_BASE_PATH=/malim_chat/ npm run build
 rsync -a "$PWD/dist/" "$remote:$target"
 ssh "$remote" 'nginx -t && systemctl reload nginx'
 
