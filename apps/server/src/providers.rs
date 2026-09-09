@@ -632,9 +632,15 @@ fn sources_from_block(block: &Value) -> Vec<Value> {
 pub(crate) fn host_tool_activity(block: &Value) -> Option<Value> {
     let kind = block["type"].as_str()?;
     if kind == "server_tool_use" {
+        // Code execution announces itself by the sub-tool it reached for, so without this
+        // the same row reads "bash code execution in progress" and then "Code finished".
+        let name = match block["name"].as_str() {
+            Some("bash_code_execution") | Some("text_editor_code_execution") => "code_execution",
+            other => other.unwrap_or_default(),
+        };
         return Some(json!({
             "id": block["id"],
-            "name": block["name"],
+            "name": name,
             "status": "running",
             "input": block["input"],
         }));
