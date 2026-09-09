@@ -1,6 +1,7 @@
 use super::*;
 use crate::agent_events::{self, AgentEventSink};
 use crate::providers::{Tools, call_provider, call_provider_with_tools};
+use crate::thinking::split_thinking;
 use crate::web_tools::execute_web_tool;
 
 pub(super) struct WebAgentAnswer {

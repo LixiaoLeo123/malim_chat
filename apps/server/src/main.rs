@@ -42,8 +42,13 @@ use uuid::Uuid;
 
 mod agent;
 mod agent_events;
+mod content;
 mod dictionary;
 mod providers;
+mod thinking;
+
+use content::{content_part, estimate_image_tokens, estimate_tokens, parse_data_url};
+use thinking::{split_thinking, strip_thinking, ThinkingStream};
 mod web_tools;
 
 const ACCESS_TOKEN_MINUTES: i64 = 15;
@@ -600,79 +605,6 @@ fn decrypt(state: &AppState, encrypted: &[u8], nonce: &[u8]) -> Result<String, A
         .decrypt(Nonce::from_slice(nonce), encrypted)
         .map_err(|_| ApiError::internal("stored credential could not be decrypted"))?;
     String::from_utf8(plain).map_err(|_| ApiError::internal("stored credential is invalid"))
-}
-
-fn estimate_image_tokens(images: &[String]) -> i32 {
-    images
-        .iter()
-        .map(|image| {
-            let bytes = image.split(',').last().map(|part| part.len()).unwrap_or(0);
-            (bytes / 1024).clamp(300, 2400) as i32
-        })
-        .sum()
-}
-
-fn parse_data_url(url: &str) -> Option<(String, String)> {
-    let rest = url.strip_prefix("data:")?;
-    let (meta, data) = rest.split_once(',')?;
-    if !meta.starts_with("image/") || data.is_empty() {
-        return None;
-    }
-    Some((meta.split(';').next()?.to_string(), data.to_string()))
-}
-
-fn plain_text_content(content: &str, images: &[Value]) -> String {
-    if images.is_empty() {
-        return content.to_string();
-    }
-    let mut text = content.to_string();
-    for _ in images {
-        if !text.is_empty() {
-            text.push_str("\n\n");
-        }
-        text.push_str(
-            "[Image attachment omitted: the selected model does not support image input.]",
-        );
-    }
-    text
-}
-
-fn content_part(kind: &str, supports_images: bool, content: &str, images: &[Value]) -> Value {
-    if images.is_empty() {
-        return json!(content);
-    }
-    if !supports_images {
-        return json!(plain_text_content(content, images));
-    }
-    let mut parts: Vec<Value> = Vec::new();
-    if !content.trim().is_empty() {
-        parts.push(json!({"type": "text", "text": content}));
-    }
-    for image in images {
-        if let Some((media_type, data)) = parse_data_url(image.as_str().unwrap_or("")) {
-            match kind {
-                "anthropic" => parts.push(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})),
-                // Responses names its parts after the input item, not the Chat shape.
-                "openai_responses" => parts.push(json!({"type": "input_image", "image_url": image})),
-                _ => parts.push(json!({"type": "image_url", "image_url": {"url": image}})),
-            }
-        } else {
-            parts.push(
-                json!({"type": "text", "text": "[Image attachment omitted: invalid image data.]"}),
-            );
-        }
-    }
-    if parts.is_empty() {
-        return json!(content);
-    }
-    if kind == "anthropic" && !parts.iter().any(|part| part["type"] == "text") {
-        parts.insert(0, json!({"type": "text", "text": ""}));
-    }
-    json!(parts)
-}
-
-fn estimate_tokens(content: &str) -> i32 {
-    ((content.chars().count() as f64 / 3.5).ceil() as i32).max(1)
 }
 fn validate_generation_settings(settings: GenerationSettings) -> Result<Value, ApiError> {
     if !settings.temperature.is_finite() || !(0.0..=2.0).contains(&settings.temperature) {
@@ -1996,116 +1928,6 @@ async fn sync(
         next_cursor: next,
     }))
 }
-
-fn split_thinking(input: &str) -> (String, String) {
-    let mut answer = String::new();
-    let mut reasoning = String::new();
-    let mut remaining = input;
-    let mut in_think = false;
-    while !remaining.is_empty() {
-        match find_thinking_marker(remaining, in_think) {
-            Some((index, marker_len)) => {
-                if in_think {
-                    reasoning.push_str(&remaining[..index]);
-                } else {
-                    answer.push_str(&remaining[..index]);
-                }
-                remaining = &remaining[index + marker_len..];
-                in_think = !in_think;
-            }
-            None => {
-                if in_think {
-                    reasoning.push_str(remaining);
-                } else {
-                    answer.push_str(remaining);
-                }
-                break;
-            }
-        }
-    }
-    (answer, reasoning)
-}
-
-fn strip_thinking(input: &str) -> String {
-    split_thinking(input).0
-}
-
-fn thinking_markers(in_think: bool) -> &'static [&'static str] {
-    if in_think {
-        &["</thinking>", "</think>"]
-    } else {
-        &["<thinking>", "<think>"]
-    }
-}
-
-fn find_thinking_marker(input: &str, in_think: bool) -> Option<(usize, usize)> {
-    thinking_markers(in_think)
-        .iter()
-        .filter_map(|marker| {
-            input
-                .as_bytes()
-                .windows(marker.len())
-                .position(|candidate| candidate.eq_ignore_ascii_case(marker.as_bytes()))
-                .map(|index| (index, marker.len()))
-        })
-        .min_by_key(|(index, _)| *index)
-}
-
-fn thinking_marker_suffix_len(input: &str, in_think: bool) -> usize {
-    thinking_markers(in_think)
-        .iter()
-        .flat_map(|marker| (1..marker.len()).rev().map(move |size| (marker, size)))
-        .filter(|(marker, size)| {
-            input.len() >= *size
-                && input.as_bytes()[input.len() - *size..]
-                    .eq_ignore_ascii_case(&marker.as_bytes()[..*size])
-        })
-        .map(|(_, size)| size)
-        .max()
-        .unwrap_or(0)
-}
-
-struct ThinkingStream {
-    in_think: bool,
-    pending: String,
-}
-impl ThinkingStream {
-    fn new() -> Self {
-        Self {
-            in_think: false,
-            pending: String::new(),
-        }
-    }
-    fn push(&mut self, input: &str) -> Vec<(bool, String)> {
-        self.pending.push_str(input);
-        let mut output = Vec::new();
-        loop {
-            if let Some((index, marker_len)) = find_thinking_marker(&self.pending, self.in_think) {
-                if index > 0 {
-                    output.push((self.in_think, self.pending[..index].to_string()));
-                }
-                self.pending.drain(..index + marker_len);
-                self.in_think = !self.in_think;
-                continue;
-            }
-            let keep = thinking_marker_suffix_len(&self.pending, self.in_think);
-            let safe = self.pending.len().saturating_sub(keep);
-            if safe > 0 {
-                output.push((self.in_think, self.pending[..safe].to_string()));
-                self.pending.drain(..safe);
-            }
-            return output;
-        }
-    }
-    fn finish(&mut self) -> Vec<(bool, String)> {
-        if self.pending.is_empty() {
-            vec![]
-        } else {
-            vec![(self.in_think, std::mem::take(&mut self.pending))]
-        }
-    }
-}
-
 fn stream_response(
     state: AppState,
     upstream: reqwest::Response,
@@ -2211,10 +2033,8 @@ fn stream_web_agent_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ThinkingStream, content_part, parse_data_url, plain_text_content, split_thinking,
-        strip_thinking,
-    };
+    use crate::content::{content_part, parse_data_url, plain_text_content};
+    use crate::thinking::{split_thinking, strip_thinking, ThinkingStream};
     use crate::providers::{
         provider_error_from_response, provider_stream_delta, provider_url, RequestKind, StreamFragment,
     };
