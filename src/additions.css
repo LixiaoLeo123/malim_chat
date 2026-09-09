@@ -297,3 +297,7 @@
 /* One save action for the whole provider page, so model rows cannot be left half-saved. */
 .provider-save { display: flex; align-items: center; justify-content: flex-end; gap: 12px; }
 .provider-models .model-config-row .model-toggle { min-width: 64px; }
+
+/* Streaming already reveals the answer progressively; re-animating when the streamed
+   placeholder is swapped for the saved message reads as the reply jumping. */
+.message-list.stream-output .message.assistant { animation: none; }
