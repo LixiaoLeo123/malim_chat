@@ -47,7 +47,7 @@ pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, ima
     }
     let mut parts: Vec<Value> = Vec::new();
     if !content.trim().is_empty() {
-        parts.push(json!({"type": "text", "text": content}));
+        parts.push(text_part(kind, content));
     }
     for image in images {
         if let Some((media_type, data)) = parse_data_url(image.as_str().unwrap_or("")) {
@@ -58,9 +58,10 @@ pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, ima
                 _ => parts.push(json!({"type": "image_url", "image_url": {"url": image}})),
             }
         } else {
-            parts.push(
-                json!({"type": "text", "text": "[Image attachment omitted: invalid image data.]"}),
-            );
+            parts.push(text_part(
+                kind,
+                "[Image attachment omitted: invalid image data.]",
+            ));
         }
     }
     if parts.is_empty() {
@@ -70,6 +71,12 @@ pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, ima
         parts.insert(0, json!({"type": "text", "text": ""}));
     }
     json!(parts)
+}
+
+/// A text part in the dialect's own spelling: Responses names input parts after the item
+/// (`input_text`), and a `text` part there is rejected as an invalid value.
+fn text_part(kind: &str, content: &str) -> Value {
+    json!({"type": if kind == "openai_responses" { "input_text" } else { "text" }, "text": content})
 }
 
 pub(crate) fn estimate_tokens(content: &str) -> i32 {

@@ -111,7 +111,7 @@ pub(crate) async fn update_provider(
 }
 
 pub(crate) async fn provider_with_models(pool: &PgPool, row: ProviderRow) -> Result<Provider, ApiError> {
-    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
+    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
         .bind(row.id).fetch_all(pool).await?;
     Ok(Provider {
         id: row.id,
@@ -169,22 +169,26 @@ pub(crate) async fn provider_model_kind(
     .map(|value| value.0))
 }
 
-/// Whether this model should be driven with `previous_response_id`. Only meaningful for
-/// Responses endpoints; a proxy that does not implement it can be switched off here.
-pub(crate) async fn provider_model_chain_enabled(
+/// A per-model boolean switch. Both Responses switches live as columns because a gateway
+/// may implement any subset of the dialect, and only the user knows which one they picked.
+pub(crate) async fn provider_model_bool(
     pool: &PgPool,
     provider_id: Uuid,
     model: &str,
+    column: &'static str,
+    fallback: bool,
 ) -> Result<bool, ApiError> {
-    Ok(sqlx::query_as::<_, (bool,)>(
-        "SELECT chain_context FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1",
+    Ok(
+        sqlx::query_as::<_, (bool,)>(&format!(
+            "SELECT {column} FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1"
+        ))
+        .bind(provider_id)
+        .bind(model)
+        .fetch_optional(pool)
+        .await?
+        .map(|value| value.0)
+        .unwrap_or(fallback),
     )
-    .bind(provider_id)
-    .bind(model)
-    .fetch_optional(pool)
-    .await?
-    .map(|value| value.0)
-    .unwrap_or(true))
 }
 
 pub(crate) async fn provider_model_supports_images(
@@ -221,8 +225,8 @@ pub(crate) async fn create_provider_model(
             "Model API format must be OpenAI-compatible or Anthropic.",
         ));
     }
-    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,created_at,updated_at")
-        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).bind(request.supports_images.unwrap_or(false)).bind(request.chain_context.unwrap_or(true)).fetch_one(&state.db).await?;
+    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools,created_at,updated_at")
+        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).bind(request.supports_images.unwrap_or(false)).bind(request.chain_context.unwrap_or(true)).bind(request.hosted_tools.unwrap_or(true)).fetch_one(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
 }
@@ -259,8 +263,8 @@ pub(crate) async fn update_provider_model(
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(ApiError::not_found)?;
-    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window),supports_images=COALESCE($8,supports_images),chain_context=COALESCE($9,chain_context) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,created_at,updated_at")
-        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).bind(request.supports_images).bind(request.chain_context).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window),supports_images=COALESCE($8,supports_images),chain_context=COALESCE($9,chain_context),hosted_tools=COALESCE($10,hosted_tools) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools,created_at,updated_at")
+        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).bind(request.supports_images).bind(request.chain_context).bind(request.hosted_tools).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2")
         .bind(id)
         .bind(previous.0)

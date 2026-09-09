@@ -102,10 +102,14 @@ pub(crate) async fn respond(
     let context_rounds = request.context_rounds.unwrap_or(None);
 let tool_rounds = request.tool_rounds.unwrap_or(None);
     let explicit_search = web_tools::content_requests_web_search(&input.content);
-    // Responses providers get OpenAI's hosted web_search_preview tool on every call, so
-    // the retrieved-evidence ReAct loop never applies to them.
-    let hosted_tools = kind == "openai_responses";
-    let search_requested = !hosted_tools && (request.search.unwrap_or(false) || explicit_search);
+    // Responses providers can run OpenAI's hosted tools on their own side, so the
+    // retrieved-evidence ReAct loop never applies to them: it speaks the Chat and Anthropic
+    // tool dialects only. Both switches are per model because a gateway implements any
+    // subset of the dialect and only the user knows which one their channel serves.
+    let responses_model = kind == "openai_responses";
+    let hosted_tools = responses_model
+        && provider_model_bool(&state.db, provider_id, &model, "hosted_tools", true).await?;
+    let search_requested = !responses_model && (request.search.unwrap_or(false) || explicit_search);
     let tools = if hosted_tools {
         providers::Tools::Hosted
     } else if search_requested {
@@ -116,9 +120,9 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
     let enable_markdown = request.enable_markdown.unwrap_or(true);
     // A Responses endpoint stores the conversation on its own side, so a chained call sends
     // only this turn. Images travel as inlined data URLs and cannot ride along in a chain.
-    let chain_id = if hosted_tools
+    let chain_id = if responses_model
         && input.images.as_array().is_none_or(|images| images.is_empty())
-        && provider_model_chain_enabled(&state.db, provider_id, &model).await?
+        && provider_model_bool(&state.db, provider_id, &model, "chain_context", true).await?
     {
         load_chain(&state.db, id, input.sequence).await?
     } else {

@@ -37,6 +37,7 @@ pub(crate) struct ProviderModel {
     pub(crate) context_window: i32,
     pub(crate) supports_images: bool,
     pub(crate) chain_context: bool,
+    pub(crate) hosted_tools: bool,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
 }
@@ -151,6 +152,7 @@ pub(crate) struct ProviderModelRequest {
     pub(crate) context_window: Option<i32>,
     pub(crate) supports_images: Option<bool>,
     pub(crate) chain_context: Option<bool>,
+    pub(crate) hosted_tools: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -162,6 +164,7 @@ pub(crate) struct UpdateProviderModelRequest {
     pub(crate) context_window: Option<i32>,
     pub(crate) supports_images: Option<bool>,
     pub(crate) chain_context: Option<bool>,
+    pub(crate) hosted_tools: Option<bool>,
 }
 
 #[derive(Deserialize)]

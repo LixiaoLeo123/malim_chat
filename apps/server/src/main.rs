@@ -71,7 +71,7 @@ use models::{
 use provider_config::{
     create_provider, create_provider_model, configured_model, delete_provider,
     delete_provider_model, list_providers, own_provider, provider_first_model,
-    provider_model_chain_enabled, provider_model_kind, provider_model_supports_images,
+    provider_model_bool, provider_model_kind, provider_model_supports_images,
     update_provider, update_provider_model,
 };
 use respond::{clear_chain, respond};
@@ -647,6 +647,10 @@ mod tests {
         assert_eq!(anthropic[1]["type"], "image");
         assert_eq!(anthropic[1]["source"]["media_type"], "image/png");
         assert_eq!(anthropic[1]["source"]["data"], "AAAA");
+        let responses = content_part("openai_responses", true, "describe this", &images);
+        assert_eq!(responses[0]["type"], "input_text");
+        assert_eq!(responses[1]["type"], "input_image");
+        assert_eq!(responses[1]["image_url"], "data:image/png;base64,AAAA");
     }
 
     #[test]

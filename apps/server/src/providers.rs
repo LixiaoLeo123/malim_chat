@@ -267,6 +267,9 @@ fn build_request(
             if stream {
                 body["stream"] = json!(true);
             }
+            // Logged per turn: when the same model answers over Chat but fails here, the
+            // difference between an accepted and a rejected request is exactly this line.
+            info!(model, shape = %responses_shape(&body), "outbound Responses request");
             Outbound {
                 url,
                 body,
@@ -478,6 +481,56 @@ pub(crate) fn provider_url(kind: RequestKind, base: &str) -> String {
 
 /// Responses never runs the ReAct loop (it searches on its own side), so the transcript it
 /// receives is plain role/content turns.
+/// A description of a Responses body that keeps the transcript out of the log: field names,
+/// hosted tool types, the reasoning knob, and the role and shape of each input item.
+fn responses_shape(body: &Value) -> String {
+    let mut fields: Vec<&str> = body
+        .as_object()
+        .map(|object| object.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    fields.sort_unstable();
+    let tools = body["tools"]
+        .as_array()
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| tool["type"].as_str())
+                .collect::<Vec<_>>()
+                .join("+")
+        })
+        .unwrap_or_else(|| "-".into());
+    let input = body["input"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{}:{}",
+                        item["role"].as_str().unwrap_or("?"),
+                        if item["content"].is_string() {
+                            "str"
+                        } else {
+                            "parts"
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    let reasoning = if body["reasoning"].is_null() {
+        "-".to_string()
+    } else {
+        body["reasoning"].to_string()
+    };
+    format!(
+        "fields=[{}] tools=[{tools}] reasoning={reasoning} chain={} input=[{input}]",
+        fields.join(","),
+        body["previous_response_id"].as_str().unwrap_or("-"),
+    )
+}
+
 fn responses_input(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
