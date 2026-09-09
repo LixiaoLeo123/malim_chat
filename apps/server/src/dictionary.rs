@@ -130,7 +130,9 @@ fn russian_entry(
 ) -> Option<DictionaryEntryResponse> {
     let normalized = normalize_dictionary_key(term);
     let entries = russian_exact_entries(mdx, &normalized);
-    for item in &entries {
+    // The exact-match list is ordered by relevance, so the first entry that resolves is
+    // the answer; a leading link just redirects to the term the dictionary points at.
+    if let Some(item) = entries.first() {
         let lookup = mdx.fetch(item)?;
         if let Some(target) = russian_link_target(&lookup.definition) {
             if normalize_dictionary_key(&target) != normalized {
