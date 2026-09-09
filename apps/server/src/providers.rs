@@ -361,7 +361,8 @@ async fn ensure_provider_success(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     let body_hint = body.chars().take(400).collect::<String>();
-    warn!(upstream_status=%status, tool_request, chained, body_length=body.len(), "AI provider returned an error response");
+    let excerpt = body_hint.clone();
+    warn!(upstream_status=%status, tool_request, chained, error_body=%excerpt, "AI provider returned an error response");
     Err(provider_error_from_response(
         status,
         &body_hint,
@@ -438,10 +439,19 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
         .collect()
 }
 
-/// Hosted tools the Responses API runs on OpenAI's side. Chat Completions and Anthropic
-/// providers have no equivalent, so they go through the ReAct loop instead.
+/// Hosted tools the Responses API runs on its own side: no call ever comes back to us, so
+/// these need no executor. Chat Completions and Anthropic providers have no equivalent,
+/// which is why those go through the ReAct loop with our SearXNG functions instead.
+///
+/// Only the tools whose results the pipeline can carry are listed. `file_search` needs a
+/// vector store we never upload to, `computer_use`/`local_shell`/`apply_patch` need an
+/// environment to act in, and `image_generation` returns a picture the transcript has no
+/// place for.
 fn responses_tools() -> Vec<Value> {
-    vec![json!({ "type": "web_search_preview" })]
+    vec![
+        json!({ "type": "web_search" }),
+        json!({ "type": "code_interpreter", "container": { "type": "auto" } }),
+    ]
 }
 
 fn responses_content(body: &Value) -> Option<String> {
