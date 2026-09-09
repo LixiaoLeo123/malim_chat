@@ -347,6 +347,7 @@ struct ProviderModel {
     sort_order: i32,
     context_window: i32,
     supports_images: bool,
+    chain_context: bool,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -449,6 +450,7 @@ struct ProviderModelRequest {
     sort_order: Option<i32>,
     context_window: Option<i32>,
     supports_images: Option<bool>,
+    chain_context: Option<bool>,
 }
 #[derive(Deserialize)]
 struct UpdateProviderModelRequest {
@@ -458,6 +460,7 @@ struct UpdateProviderModelRequest {
     sort_order: Option<i32>,
     context_window: Option<i32>,
     supports_images: Option<bool>,
+    chain_context: Option<bool>,
 }
 #[derive(Deserialize)]
 struct CreateMessage {
@@ -529,24 +532,6 @@ async fn save_agent_run(
 struct CompactRequest {
     through_sequence: Option<i64>,
     force: Option<bool>,
-}
-#[derive(Deserialize)]
-struct SearchQuery {
-    q: String,
-}
-#[derive(Deserialize)]
-struct SyncQuery {
-    cursor: Option<i64>,
-    limit: Option<i64>,
-}
-#[derive(Serialize, FromRow)]
-struct SyncEvent {
-    cursor: i64,
-    entity_type: String,
-    entity_id: Uuid,
-    operation: String,
-    revision: i64,
-    occurred_at: DateTime<Utc>,
 }
 
 fn token_for(state: &AppState, user_id: Uuid) -> Result<String, ApiError> {
@@ -698,7 +683,6 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/auth/signup", post(signup))
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/refresh", post(refresh))
-        .route("/v1/me", get(me))
         .route("/v1/providers", get(list_providers).post(create_provider))
         .route(
             "/v1/providers/{id}",
@@ -715,8 +699,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route(
             "/v1/conversations/{id}",
-            get(get_conversation)
-                .patch(update_conversation)
+            patch(update_conversation)
                 .delete(delete_conversation),
         )
         .route(
@@ -733,9 +716,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .route("/v1/conversations/{id}/respond", post(respond))
         .route("/v1/conversations/{id}/compact", post(compact))
-        .route("/v1/search", get(search))
         .route("/v1/dictionary", get(dictionary::dictionary_lookup))
-        .route("/v1/sync", get(sync))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .layer(RequestBodyLimitLayer::new(64 * 1024 * 1024))
         .layer(SetSensitiveRequestHeadersLayer::new(std::iter::once(
@@ -853,10 +834,6 @@ async fn issue_session(state: &AppState, user: User) -> Result<AuthResponse, Api
         user,
     })
 }
-async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<User>, ApiError> {
-    let id = user_from_headers(&state, &headers)?;
-    Ok(Json(sqlx::query_as("SELECT id,email,display_name,created_at FROM users WHERE id=$1 AND disabled_at IS NULL").bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::unauthorized)?))
-}
 
 async fn list_providers(
     State(state): State<AppState>,
@@ -964,7 +941,7 @@ async fn update_provider(
 }
 
 async fn provider_with_models(pool: &PgPool, row: ProviderRow) -> Result<Provider, ApiError> {
-    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
+    let models = sqlx::query_as("SELECT id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,created_at,updated_at FROM provider_models WHERE provider_id=$1 ORDER BY group_name,sort_order,model")
         .bind(row.id).fetch_all(pool).await?;
     Ok(Provider {
         id: row.id,
@@ -1022,6 +999,24 @@ async fn provider_model_kind(
     .map(|value| value.0))
 }
 
+/// Whether this model should be driven with `previous_response_id`. Only meaningful for
+/// Responses endpoints; a proxy that does not implement it can be switched off here.
+async fn provider_model_chain_enabled(
+    pool: &PgPool,
+    provider_id: Uuid,
+    model: &str,
+) -> Result<bool, ApiError> {
+    Ok(sqlx::query_as::<_, (bool,)>(
+        "SELECT chain_context FROM provider_models WHERE provider_id=$1 AND model=$2 LIMIT 1",
+    )
+    .bind(provider_id)
+    .bind(model)
+    .fetch_optional(pool)
+    .await?
+    .map(|value| value.0)
+    .unwrap_or(true))
+}
+
 async fn provider_model_supports_images(
     pool: &PgPool,
     provider_id: Uuid,
@@ -1056,8 +1051,8 @@ async fn create_provider_model(
             "Model API format must be OpenAI-compatible or Anthropic.",
         ));
     }
-    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at")
-        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).bind(request.supports_images.unwrap_or(false)).fetch_one(&state.db).await?;
+    let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,created_at,updated_at")
+        .bind(Uuid::new_v4()).bind(id).bind(request.group_name.trim()).bind(request.model.trim()).bind(request.kind).bind(request.sort_order.unwrap_or(0)).bind(request.context_window.unwrap_or(128_000).clamp(4096, 2_000_000)).bind(request.supports_images.unwrap_or(false)).bind(request.chain_context.unwrap_or(true)).fetch_one(&state.db).await?;
     event(&state.db, user_id, "provider", id, "updated", 1).await?;
     Ok(Json(item))
 }
@@ -1094,8 +1089,8 @@ async fn update_provider_model(
             .fetch_optional(&state.db)
             .await?
             .ok_or_else(ApiError::not_found)?;
-    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window),supports_images=COALESCE($8,supports_images) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,created_at,updated_at")
-        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).bind(request.supports_images).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let item: ProviderModel = sqlx::query_as("UPDATE provider_models SET group_name=COALESCE($3,group_name),model=COALESCE($4,model),kind=COALESCE($5,kind),sort_order=COALESCE($6,sort_order),context_window=COALESCE($7,context_window),supports_images=COALESCE($8,supports_images),chain_context=COALESCE($9,chain_context) WHERE id=$1 AND provider_id=$2 RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,created_at,updated_at")
+        .bind(model_id).bind(id).bind(request.group_name.map(|v| v.trim().to_string())).bind(request.model.map(|v| v.trim().to_string())).bind(request.kind).bind(request.sort_order).bind(request.context_window.map(|value| value.clamp(4096, 2_000_000))).bind(request.supports_images).bind(request.chain_context).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     sqlx::query("UPDATE providers SET default_model=$3 WHERE id=$1 AND default_model=$2")
         .bind(id)
         .bind(previous.0)
@@ -1207,15 +1202,6 @@ async fn create_conversation(
     )
     .await?;
     Ok(Json(conversation))
-}
-async fn get_conversation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<Uuid>,
-) -> Result<Json<Conversation>, ApiError> {
-    Ok(Json(
-        own_conversation(&state.db, user_from_headers(&state, &headers)?, id).await?,
-    ))
 }
 async fn update_conversation(
     State(state): State<AppState>,
@@ -1546,6 +1532,7 @@ async fn respond(
     // only this turn. Images travel as inlined data URLs and cannot ride along in a chain.
     let chain_id = if hosted_tools
         && input.images.as_array().is_none_or(|images| images.is_empty())
+        && provider_model_chain_enabled(&state.db, provider_id, &model).await?
     {
         load_chain(&state.db, id, input.sequence).await?
     } else {
@@ -1899,35 +1886,7 @@ async fn compact(
         json!({"compacted":true,"summary_id":summary_id,"through_sequence":end,"estimated_tokens":summary_tokens,"message":message,"context_tokens":summary_tokens}),
     ))
 }
-async fn search(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<SearchQuery>,
-) -> Result<Json<Vec<Value>>, ApiError> {
-    user_from_headers(&state, &headers)?;
-    if query.q.trim().is_empty() {
-        return Err(ApiError::bad("Search query cannot be empty."));
-    };
-    Ok(Json(web_tools::fetch_search(&state, &query.q).await?))
-}
 
-async fn sync(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<SyncQuery>,
-) -> Result<Json<Page<SyncEvent>>, ApiError> {
-    let user_id = user_from_headers(&state, &headers)?;
-    let limit = query
-        .limit
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE);
-    let rows=sqlx::query_as::<_,SyncEvent>("SELECT cursor,entity_type,entity_id,operation,revision,occurred_at FROM sync_events WHERE user_id=$1 AND cursor > $2 ORDER BY cursor LIMIT $3").bind(user_id).bind(query.cursor.unwrap_or(0)).bind(limit+1).fetch_all(&state.db).await?;
-    let next = rows.get(limit as usize).map(|e| e.cursor.to_string());
-    Ok(Json(Page {
-        items: rows.into_iter().take(limit as usize).collect(),
-        next_cursor: next,
-    }))
-}
 fn stream_response(
     state: AppState,
     upstream: reqwest::Response,
