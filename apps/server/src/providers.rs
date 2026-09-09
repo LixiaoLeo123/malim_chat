@@ -559,11 +559,13 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
 /// these need no executor. Chat Completions has no equivalent, which is why that dialect
 /// goes through the ReAct loop with our SearXNG functions instead.
 ///
-/// Search only, and the older spelling of it, which is the one these gateways accept.
-/// Declaring `code_interpreter` alongside it failed whole turns for `gpt-5.6-sol` and
-/// `gpt-5.6-terra`, and a chat answer has nowhere to put generated files anyway.
+/// `web_search`, not the `web_search_preview` it grew out of: the preview spelling is kept
+/// only "for legacy integrations", and `gpt-6-astra` fails the whole turn when it is
+/// declared while `gpt-5.6-*` accept it. No `code_interpreter`: declaring it alongside the
+/// search tool failed whole turns for `gpt-5.6-sol` and `gpt-5.6-terra`, and a chat answer
+/// has nowhere to put generated files or sandbox stdout.
 fn responses_tools() -> Vec<Value> {
-    vec![json!({ "type": "web_search_preview" })]
+    vec![json!({ "type": "web_search" })]
 }
 
 /// Tools Anthropic executes on its own side, so these need no executor either. Pinned to

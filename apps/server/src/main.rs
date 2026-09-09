@@ -563,6 +563,24 @@ mod tests {
                 "code_execution_20250825"
             ]
         );
+
+        // Responses: the GA search tool, and no code interpreter. `web_search_preview`
+        // breaks newer models.
+        let responses = crate::providers::build_request(
+            "openai_responses",
+            "https://api.openai.com/v1",
+            "gpt-6-astra",
+            &[crate::respond::instruction_message(true)],
+            None,
+            None,
+            crate::providers::Tools::Hosted,
+            false,
+            None,
+        );
+        assert_eq!(
+            responses.body["tools"],
+            serde_json::json!([{ "type": "web_search" }])
+        );
         assert_eq!(hosted.body["messages"], serde_json::json!([]));
         assert!(hosted.anthropic);
 
