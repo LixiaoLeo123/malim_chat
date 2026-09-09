@@ -563,6 +563,8 @@ pub(crate) struct StreamFragment {
     pub(crate) response_id: Option<String>,
     /// Gateways report failures inside the stream body while still answering 200.
     pub(crate) error: Option<String>,
+    /// Why a response ended without producing text: token limit, filtering, and so on.
+    pub(crate) incomplete: Option<String>,
 }
 
 pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFragment> {
@@ -574,17 +576,32 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         return None;
     }
     let value: Value = serde_json::from_str(payload).ok()?;
-    if value.get("error").is_some() {
-        let detail = upstream_detail(payload);
+    let fragment = |error: Option<String>, incomplete: Option<String>| StreamFragment {
+        reasoning: false,
+        text: String::new(),
+        part: None,
+        response_id: None,
+        error,
+        incomplete,
+    };
+    // A gateway can fail the turn inside the stream while still answering 200, and it
+    // reports that several ways: a bare `error`, a nested `response.error`, or a
+    // `response` whose status is `failed`.
+    let nested = value.get("response").filter(|response| {
+        response.get("error").is_some() || response["status"].as_str() == Some("failed")
+    });
+    if value.get("error").is_some() || nested.is_some() {
+        let source = nested.unwrap_or(&value);
+        let detail = upstream_detail(&source.to_string());
         if !detail.is_empty() {
-            return Some(StreamFragment {
-                reasoning: false,
-                text: String::new(),
-                part: None,
-                response_id: None,
-                error: Some(detail),
-            });
+            return Some(fragment(Some(detail), None));
         }
+    }
+    if let Some(reason) = value["response"]["incomplete_details"]["reason"]
+        .as_str()
+        .or_else(|| value["incomplete_details"]["reason"].as_str())
+    {
+        return Some(fragment(None, Some(reason.to_string())));
     }
     let kind = RequestKind::parse(kind);
     if kind == RequestKind::OpenAiResponses {
@@ -599,7 +616,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                 text: value["delta"].as_str()?.to_string(),
                 part: None,
                 response_id,
-                error: None,
+                error: None,                incomplete: None,
             },
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 StreamFragment {
@@ -615,7 +632,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                         format!("{output_index}:{index}")
                     }),
                     response_id,
-                    error: None,
+                    error: None,                incomplete: None,
                 }
             }
             _ => StreamFragment {
@@ -623,7 +640,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                 text: String::new(),
                 part: None,
                 response_id,
-                error: None,
+                error: None,                incomplete: None,
             },
         };
         if fragment.text.is_empty() && fragment.response_id.is_none() {
@@ -637,14 +654,14 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
             text: text.to_string(),
             part: None,
             response_id: None,
-            error: None,
+            error: None,                incomplete: None,
         }).or_else(|| {
             value["delta"]["thinking"].as_str().map(|text| StreamFragment {
                 reasoning: true,
                 text: text.to_string(),
                 part: None,
                 response_id: None,
-                error: None,
+                error: None,                incomplete: None,
             })
         });
     }
@@ -654,7 +671,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         text: value.to_string(),
         part: None,
         response_id: None,
-        error: None,
+        error: None,                incomplete: None,
     };
     delta["content"]
         .as_str()

@@ -467,6 +467,25 @@ mod tests {
     }
 
     #[test]
+    fn reports_failures_nested_inside_a_response_stream() {
+        // A gateway can answer 200 and still fail the turn inside the stream body.
+        let failed = provider_stream_delta(
+            "openai_responses",
+            "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_1\",\"status\":\"failed\",\"error\":{\"message\":\"no channel for model\"}}}",
+        )
+        .expect("nested failure should surface");
+        assert_eq!(failed.error.as_deref(), Some("no channel for model"));
+
+        let incomplete = provider_stream_delta(
+            "openai_responses",
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"id\":\"resp_2\",\"status\":\"incomplete\",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}",
+        )
+        .expect("incomplete should surface");
+        assert_eq!(incomplete.error, None);
+        assert_eq!(incomplete.incomplete.as_deref(), Some("max_output_tokens"));
+    }
+
+    #[test]
     fn keeps_responses_summary_parts_apart() {
         assert_eq!(
             provider_stream_delta(
@@ -479,6 +498,7 @@ mod tests {
                 part: Some("1:2".into()),
                 response_id: None,
                 error: None,
+                incomplete: None,
             })
         );
         assert_eq!(
@@ -492,6 +512,7 @@ mod tests {
                 part: Some("2:2".into()),
                 response_id: None,
                 error: None,
+                incomplete: None,
             })
         );
         assert_eq!(
@@ -505,6 +526,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
+                incomplete: None,
             })
         );
     }
@@ -522,6 +544,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
+                incomplete: None,
             })
         );
         assert_eq!(
@@ -535,6 +558,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
+                incomplete: None,
             })
         );
         assert_eq!(
@@ -545,6 +569,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
+                incomplete: None,
             })
         );
     }
