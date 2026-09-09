@@ -1,6 +1,44 @@
 use super::*;
 use crate::web_tools::web_tool_definitions;
 
+/// Which wire dialect a provider endpoint speaks. Parsed once per call so the request
+/// builder has a single place to branch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RequestKind {
+    OpenAiChat,
+    OpenAiResponses,
+    Anthropic,
+}
+
+impl RequestKind {
+    pub(crate) fn parse(kind: &str) -> Self {
+        match kind {
+            "anthropic" => Self::Anthropic,
+            "openai_responses" => Self::OpenAiResponses,
+            _ => Self::OpenAiChat,
+        }
+    }
+}
+
+/// Who does the searching: the ReAct loop hands the model our SearXNG functions, while
+/// Responses providers run OpenAI's hosted search on their side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Tools {
+    None,
+    Retrieved,
+    Hosted,
+}
+
+/// A completed non-streaming turn. Reasoning is carried separately instead of being
+/// smuggled through the answer inside `<think>` markers.
+#[derive(Debug, Default)]
+pub(crate) struct Reply {
+    pub(crate) text: String,
+    pub(crate) reasoning: String,
+    /// Responses ids can be referenced by the next turn; other dialects return none.
+    pub(crate) response_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct ToolCall {
     pub(crate) id: String,
@@ -8,8 +46,8 @@ pub(crate) struct ToolCall {
     pub(crate) input: Value,
 }
 
-pub(crate) struct ProviderToolTurn {
-    pub(crate) content: String,
+pub(crate) struct ToolTurn {
+    pub(crate) reply: Reply,
     pub(crate) assistant_message: Value,
     pub(crate) tool_calls: Vec<ToolCall>,
 }
@@ -23,50 +61,29 @@ pub(crate) async fn call_provider_with_tools(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
-) -> Result<ProviderToolTurn, ApiError> {
-    let url = provider_url(kind, base);
-    let response = if kind == "anthropic" {
-        let system = messages
-            .iter()
-            .filter(|message| message["role"] == "system")
-            .filter_map(|message| message["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":8192,"messages":messages.iter().filter(|message|message["role"] != "system").collect::<Vec<_>>(),"tools":web_tool_definitions(kind)});
-        if !system.is_empty() {
-            body["system"] = json!(system);
-        }
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        http.post(url)
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await?
-    } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":false,"tools":web_tool_definitions(kind)});
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        if let Some(value) = reasoning_effort {
-            body["reasoning_effort"] = json!(value);
-        }
-        http.post(url).bearer_auth(key).json(&body).send().await?
-    };
-    let body: Value = ensure_provider_success(response, true)
+) -> Result<ToolTurn, ApiError> {
+    let request = build_request(
+        kind,
+        base,
+        model,
+        messages,
+        temperature,
+        reasoning_effort,
+        Tools::Retrieved,
+        false,
+        None,
+    );
+    let body: Value = send(http, &request, key, true, false)
         .await?
         .json()
         .await?;
-    if kind == "anthropic" {
+    if request.anthropic {
         let blocks = body["content"]
             .as_array()
             .cloned()
             .ok_or_else(|| ApiError::bad("The provider returned an unexpected tool response."))?;
         let tool_calls = blocks
             .iter()
-            .filter(|block| block["type"] == "tool_use")
             .filter_map(|block| {
                 Some(ToolCall {
                     id: block["id"].as_str()?.to_string(),
@@ -75,41 +92,47 @@ pub(crate) async fn call_provider_with_tools(
                 })
             })
             .collect();
-        Ok(ProviderToolTurn {
-            content: anthropic_content(&body).unwrap_or_default(),
-            assistant_message: json!({"role":"assistant","content":blocks}),
+        let (text, reasoning) = anthropic_parts(&body);
+        return Ok(ToolTurn {
+            reply: Reply {
+                text,
+                reasoning,
+                response_id: None,
+            },
+            assistant_message: json!({ "role": "assistant", "content": blocks }),
             tool_calls,
-        })
-    } else {
-        let mut message = body["choices"]
-            .as_array()
-            .and_then(|choices| choices.first())
-            .and_then(|choice| choice.get("message"))
-            .cloned()
-            .ok_or_else(|| ApiError::bad("The provider returned an unexpected tool response."))?;
-        if message["role"].is_null() {
-            message["role"] = json!("assistant");
-        }
-        let tool_calls = message["tool_calls"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|call| {
-                let arguments = call["function"]["arguments"].as_str().unwrap_or("{}");
-                Some(ToolCall {
-                    id: call["id"].as_str()?.to_string(),
-                    name: call["function"]["name"].as_str()?.to_string(),
-                    input: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
-                })
-            })
-            .collect();
-        Ok(ProviderToolTurn {
-            content: openai_content(&json!({"choices":[{"message":message.clone()}]}))
-                .unwrap_or_default(),
-            assistant_message: message,
-            tool_calls,
-        })
+        });
     }
+    let message = body["choices"]
+        .as_array()
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .cloned()
+        .filter(|message| message.is_object())
+        .unwrap_or_else(|| json!({ "role": "assistant" }));
+    let tool_calls = message["tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|call| {
+            let arguments = call["function"]["arguments"].as_str().unwrap_or("{}");
+            Some(ToolCall {
+                id: call["id"].as_str()?.to_string(),
+                name: call["function"]["name"].as_str()?.to_string(),
+                input: serde_json::from_str(arguments).unwrap_or_else(|_| json!({})),
+            })
+        })
+        .collect();
+    let (text, reasoning) = openai_message_parts(&message);
+    Ok(ToolTurn {
+        reply: Reply {
+            text,
+            reasoning,
+            response_id: None,
+        },
+        assistant_message: message,
+        tool_calls,
+    })
 }
 
 pub(crate) async fn call_provider(
@@ -121,78 +144,61 @@ pub(crate) async fn call_provider(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
-    native_tools: bool,
-) -> Result<String, ApiError> {
-    let url = provider_url(kind, base);
-    if kind == "openai_responses" {
-        let mut body = json!({"model":model,"input":responses_input(messages)});
-        if native_tools {
-            body["tools"] = json!(responses_tools());
-        }
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        if let Some(value) = reasoning_effort {
-            // Responses has no raw chain-of-thought; the only visible reasoning is the summary.
-            body["reasoning"] = json!({"effort": value, "summary": "auto"});
-        }
-        let response = http.post(url).bearer_auth(key).json(&body).send().await?;
-        let body: Value = ensure_provider_success(response, false)
-            .await?
-            .json()
-            .await?;
-        let answer = responses_content(&body)
-            .ok_or_else(|| ApiError::bad("The Responses provider returned no text output."))?;
-        return match responses_reasoning(&body) {
-            Some(reasoning) => Ok(format!("<think>{reasoning}</think>{answer}")),
-            None => Ok(answer),
-        };
-    }
-    let response = if kind == "anthropic" {
-        let system = messages
-            .iter()
-            .filter(|m| m["role"] == "system")
-            .filter_map(|m| m["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":8192,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
-        if !system.is_empty() {
-            body["system"] = json!(system);
-        }
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        http.post(url)
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&body)
-            .send()
-            .await?
-    } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":false});
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        if let Some(value) = reasoning_effort {
-            body["reasoning_effort"] = json!(value);
-        }
-        http.post(url).bearer_auth(key).json(&body).send().await?
-    };
-    let body: Value = ensure_provider_success(response, false)
+    tools: Tools,
+    chain: Option<&str>,
+) -> Result<Reply, ApiError> {
+    let request = build_request(
+        kind,
+        base,
+        model,
+        messages,
+        temperature,
+        reasoning_effort,
+        tools,
+        false,
+        chain,
+    );
+    let body: Value = send(http, &request, key, false, chain.is_some())
         .await?
         .json()
         .await?;
-    let answer = if kind == "anthropic" {
-        anthropic_content(&body)
-    } else {
-        openai_content(&body)
-    }
-    .ok_or_else(|| ApiError {
-        status: StatusCode::BAD_GATEWAY,
-        code: "invalid_provider_response",
-        message: "The AI provider returned an unexpected response.".into(),
-    })?;
-    Ok(answer)
+    Ok(match RequestKind::parse(kind) {
+        RequestKind::OpenAiResponses => Reply {
+            text: responses_content(&body).ok_or_else(|| {
+                ApiError::bad("The Responses provider returned no text output.")
+            })?,
+            reasoning: responses_reasoning(&body).unwrap_or_default(),
+            response_id: body["id"].as_str().map(str::to_string),
+        },
+        RequestKind::Anthropic => {
+            let (text, reasoning) = anthropic_parts(&body);
+            if text.is_empty() && reasoning.is_empty() {
+                return Err(invalid_provider_response());
+            }
+            Reply {
+                text,
+                reasoning,
+                response_id: None,
+            }
+        }
+        RequestKind::OpenAiChat => {
+            let (text, reasoning) = openai_message_parts(
+                body["choices"]
+                    .as_array()
+                    .and_then(|choices| choices.first())
+                    .and_then(|choice| choice.get("message"))
+                    .unwrap_or(&Value::Null),
+            );
+            if text.is_empty() && reasoning.is_empty() {
+                return Err(invalid_provider_response());
+            }
+            Reply {
+                text,
+                reasoning,
+                response_id: None,
+            }
+        }
+    })
 }
 
 pub(crate) async fn call_provider_stream(
@@ -204,60 +210,150 @@ pub(crate) async fn call_provider_stream(
     messages: &[Value],
     temperature: Option<f32>,
     reasoning_effort: Option<&str>,
-    native_tools: bool,
+    tools: Tools,
+    chain: Option<&str>,
 ) -> Result<reqwest::Response, ApiError> {
+    let request = build_request(
+        kind,
+        base,
+        model,
+        messages,
+        temperature,
+        reasoning_effort,
+        tools,
+        true,
+        chain,
+    );
+    send(http, &request, key, false, chain.is_some()).await
+}
+
+/// A provider request, already shaped for its dialect.
+struct Outbound {
+    url: String,
+    body: Value,
+    anthropic: bool,
+}
+
+fn build_request(
+    kind: &str,
+    base: &str,
+    model: &str,
+    messages: &[Value],
+    temperature: Option<f32>,
+    reasoning_effort: Option<&str>,
+    tools: Tools,
+    stream: bool,
+    chain: Option<&str>,
+) -> Outbound {
+    let kind = RequestKind::parse(kind);
     let url = provider_url(kind, base);
-    if kind == "openai_responses" {
-        let mut body = json!({"model":model,"input":responses_input(messages),"stream":true});
-        if native_tools {
-            body["tools"] = json!(responses_tools());
-        }
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        if let Some(value) = reasoning_effort {
-            // Responses has no raw chain-of-thought; the only visible reasoning is the summary.
-            body["reasoning"] = json!({"effort": value, "summary": "auto"});
-        }
-        let response = http.post(url).bearer_auth(key).json(&body).send().await?;
-        return ensure_provider_success(response, false).await;
+    let mut body = json!({ "model": model });
+    if let Some(value) = temperature {
+        body["temperature"] = json!(value.clamp(0.0, 2.0));
     }
-    let response = if kind == "anthropic" {
-        let system = messages
-            .iter()
-            .filter(|m| m["role"] == "system")
-            .filter_map(|m| m["content"].as_str())
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        let mut body = json!({"model":model,"max_tokens":8192,"stream":true,"messages":messages.iter().filter(|m|m["role"] != "system").collect::<Vec<_>>()});
-        if !system.is_empty() {
-            body["system"] = json!(system);
+    match kind {
+        RequestKind::OpenAiResponses => {
+            body["input"] = json!(responses_input(messages));
+            if let Some(id) = chain {
+                body["previous_response_id"] = json!(id);
+            }
+            if tools == Tools::Hosted {
+                body["tools"] = json!(responses_tools());
+            }
+            if let Some(value) = reasoning_effort {
+                // Responses exposes no raw chain of thought; the summary is all there is.
+                body["reasoning"] = json!({"effort": value, "summary": "auto"});
+            }
+            if stream {
+                body["stream"] = json!(true);
+            }
+            Outbound {
+                url,
+                body,
+                anthropic: false,
+            }
         }
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
+        RequestKind::Anthropic => {
+            let system = messages
+                .iter()
+                .filter(|message| message["role"] == "system")
+                .filter_map(|message| message["content"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            body["max_tokens"] = json!(8192);
+            body["messages"] = json!(messages
+                .iter()
+                .filter(|message| message["role"] != "system")
+                .collect::<Vec<_>>());
+            if !system.is_empty() {
+                body["system"] = json!(system);
+            }
+            if tools == Tools::Retrieved {
+                body["tools"] = json!(web_tool_definitions("anthropic"));
+            }
+            if stream {
+                body["stream"] = json!(true);
+            }
+            Outbound {
+                url,
+                body,
+                anthropic: true,
+            }
         }
-        http.post(url)
+        RequestKind::OpenAiChat => {
+            body["messages"] = json!(messages);
+            body["stream"] = json!(stream);
+            if tools == Tools::Retrieved {
+                body["tools"] = json!(web_tool_definitions("openai_compatible"));
+            }
+            if let Some(value) = reasoning_effort {
+                body["reasoning_effort"] = json!(value);
+            }
+            Outbound {
+                url,
+                body,
+                anthropic: false,
+            }
+        }
+    }
+}
+
+async fn send(
+    http: &Client,
+    request: &Outbound,
+    key: &str,
+    tool_request: bool,
+    chained: bool,
+) -> Result<reqwest::Response, ApiError> {
+    let response = if request.anthropic {
+        http.post(&request.url)
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01")
-            .json(&body)
+            .json(&request.body)
             .send()
             .await?
     } else {
-        let mut body = json!({"model":model,"messages":messages,"stream":true});
-        if let Some(value) = temperature {
-            body["temperature"] = json!(value.clamp(0.0, 2.0));
-        }
-        if let Some(value) = reasoning_effort {
-            body["reasoning_effort"] = json!(value);
-        }
-        http.post(url).bearer_auth(key).json(&body).send().await?
+        http.post(&request.url)
+            .bearer_auth(key)
+            .json(&request.body)
+            .send()
+            .await?
     };
-    ensure_provider_success(response, false).await
+    ensure_provider_success(response, tool_request, chained).await
+}
+
+fn invalid_provider_response() -> ApiError {
+    ApiError {
+        status: StatusCode::BAD_GATEWAY,
+        code: "invalid_provider_response",
+        message: "The AI provider returned an unexpected response.".into(),
+    }
 }
 
 async fn ensure_provider_success(
     response: reqwest::Response,
     tool_request: bool,
+    chained: bool,
 ) -> Result<reqwest::Response, ApiError> {
     if response.status().is_success() {
         return Ok(response);
@@ -265,11 +361,12 @@ async fn ensure_provider_success(
     let status = response.status();
     let body = response.text().await.unwrap_or_default();
     let body_hint = body.chars().take(400).collect::<String>();
-    warn!(upstream_status=%status, tool_request, body_length=body.len(), "AI provider returned an error response");
+    warn!(upstream_status=%status, tool_request, chained, body_length=body.len(), "AI provider returned an error response");
     Err(provider_error_from_response(
         status,
         &body_hint,
         tool_request,
+        chained,
     ))
 }
 
@@ -277,6 +374,7 @@ pub(crate) fn provider_error_from_response(
     status: StatusCode,
     body: &str,
     tool_request: bool,
+    chained: bool,
 ) -> ApiError {
     if matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
         return ApiError::provider_access_denied();
@@ -301,36 +399,41 @@ pub(crate) fn provider_error_from_response(
     {
         return ApiError::provider_tool_unsupported();
     }
+    // A rejected `previous_response_id` is recoverable: the caller rebuilds the context
+    // from the transcript and starts a new chain. Providers word this differently, so
+    // any client error on a chained request is treated as a broken chain.
+    if chained && status.is_client_error() {
+        return ApiError::provider_chain_stale();
+    }
     if status.is_client_error() {
         return ApiError::provider_rejected();
     }
     ApiError::provider_unavailable()
 }
 
-pub(crate) fn provider_url(kind: &str, base: &str) -> String {
+pub(crate) fn provider_url(kind: RequestKind, base: &str) -> String {
     let base = base.trim_end_matches('/');
     match kind {
-        "anthropic" if base.ends_with("/v1/messages") => base.to_string(),
-        "anthropic" if base.ends_with("/v1") => format!("{base}/messages"),
-        "anthropic" => format!("{base}/v1/messages"),
-        "openai_responses" if base.ends_with("/responses") => base.to_string(),
-        "openai_responses" if base.ends_with("/v1") => format!("{base}/responses"),
-        "openai_responses" => format!("{base}/v1/responses"),
-        _ if base.ends_with("/chat/completions") => base.to_string(),
-        _ if base.ends_with("/v1") => format!("{base}/chat/completions"),
-        _ => format!("{base}/v1/chat/completions"),
+        RequestKind::Anthropic if base.ends_with("/v1/messages") => base.to_string(),
+        RequestKind::Anthropic if base.ends_with("/v1") => format!("{base}/messages"),
+        RequestKind::Anthropic => format!("{base}/v1/messages"),
+        RequestKind::OpenAiResponses if base.ends_with("/responses") => base.to_string(),
+        RequestKind::OpenAiResponses if base.ends_with("/v1") => format!("{base}/responses"),
+        RequestKind::OpenAiResponses => format!("{base}/v1/responses"),
+        RequestKind::OpenAiChat if base.ends_with("/chat/completions") => base.to_string(),
+        RequestKind::OpenAiChat if base.ends_with("/v1") => format!("{base}/chat/completions"),
+        RequestKind::OpenAiChat => format!("{base}/v1/chat/completions"),
     }
 }
 
+/// Responses never runs the ReAct loop (it searches on its own side), so the transcript it
+/// receives is plain role/content turns.
 fn responses_input(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
         .filter_map(|message| {
             let role = message["role"].as_str()?;
-            if role == "tool" { return Some(json!({"type":"function_call_output","call_id":message["tool_call_id"],"output":message["content"]})); }
-            if role == "assistant" { if let Some(call) = message["tool_calls"].as_array().and_then(|calls| calls.first()) { return Some(json!({"type":"function_call","call_id":call["id"],"name":call["function"]["name"],"arguments":call["function"]["arguments"]})); } }
-            let content = message["content"].clone();
-            Some(json!({"role":role,"content":content}))
+            Some(json!({ "role": role, "content": message["content"].clone() }))
         })
         .collect()
 }
@@ -338,7 +441,7 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
 /// Hosted tools the Responses API runs on OpenAI's side. Chat Completions and Anthropic
 /// providers have no equivalent, so they go through the ReAct loop instead.
 fn responses_tools() -> Vec<Value> {
-    vec![json!({"type": "web_search_preview"})]
+    vec![json!({ "type": "web_search_preview" })]
 }
 
 fn responses_content(body: &Value) -> Option<String> {
@@ -350,6 +453,7 @@ fn responses_content(body: &Value) -> Option<String> {
         .map(|items| {
             items
                 .iter()
+                .filter(|item| item["type"] != "reasoning")
                 .filter_map(|item| item["content"].as_array())
                 .flatten()
                 .filter_map(|part| part["text"].as_str())
@@ -364,37 +468,33 @@ fn responses_reasoning(body: &Value) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
-fn anthropic_content(body: &Value) -> Option<String> {
-    let content = body["content"].as_array()?;
-    let output = content
-        .iter()
-        .filter_map(|part| match part["type"].as_str() {
-            Some("text") => part["text"].as_str().map(str::to_string),
-            Some("thinking") => part["thinking"]
-                .as_str()
-                .map(|text| format!("<think>{text}</think>")),
-            _ => None,
-        })
-        .collect::<String>();
-    (!output.is_empty()).then_some(output)
+/// Splits an Anthropic reply into its answer and any thinking blocks.
+fn anthropic_parts(body: &Value) -> (String, String) {
+    let blocks = body["content"].as_array().cloned().unwrap_or_default();
+    let text = blocks.iter().filter(|block| block["type"] == "text").filter_map(|block| block["text"].as_str()).collect::<String>();
+    let reasoning = blocks.iter().filter(|block| block["type"] == "thinking").filter_map(|block| block["thinking"].as_str()).collect::<Vec<_>>().join("\n\n");
+    (text, reasoning)
 }
 
-fn openai_content(body: &Value) -> Option<String> {
-    let message = body["choices"].as_array()?.first()?.get("message")?;
-    let mut output = String::new();
+/// Chat Completions reasoning models report their thinking in `reasoning_content`
+/// (or `reasoning`), separate from the answer.
+fn openai_message_parts(message: &Value) -> (String, String) {
+    let mut reasoning = String::new();
     for field in ["reasoning_content", "reasoning"] {
         if let Some(value) = message[field].as_str() {
-            output.push_str("<think>");
-            output.push_str(value);
-            output.push_str("</think>");
+            if !reasoning.is_empty() {
+                reasoning.push('\n');
+            }
+            reasoning.push_str(value);
         }
     }
-    if let Some(value) = message["content"].as_str() {
-        output.push_str(value);
-    }
-    (!output.is_empty()).then_some(output)
+    (
+        message["content"].as_str().unwrap_or_default().to_string(),
+        reasoning,
+    )
 }
 
+/// One decoded frame from a provider stream.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct StreamFragment {
     pub(crate) reasoning: bool,
@@ -402,6 +502,8 @@ pub(crate) struct StreamFragment {
     /// Responses returns reasoning as summary parts, so each part can be rendered as
     /// its own timeline row instead of being glued to its neighbours.
     pub(crate) part: Option<String>,
+    /// Responses ids arrive on the lifecycle frames, not the text deltas.
+    pub(crate) response_id: Option<String>,
 }
 
 pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFragment> {
@@ -413,71 +515,73 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         return None;
     }
     let value: Value = serde_json::from_str(payload).ok()?;
-    if kind == "openai_responses" {
-        let delta = value["delta"].as_str()?;
-        return match value["type"].as_str()? {
-            "response.output_text.delta" => Some(StreamFragment {
+    let kind = RequestKind::parse(kind);
+    if kind == RequestKind::OpenAiResponses {
+        let response_id = value["response"]["id"]
+            .as_str()
+            .or_else(|| value["id"].as_str().filter(|_| value["type"].as_str() == Some("response.created")))
+            .map(str::to_string);
+        let event_type = value["type"].as_str()?;
+        let fragment = match event_type {
+            "response.output_text.delta" => StreamFragment {
                 reasoning: false,
-                text: delta.to_string(),
+                text: value["delta"].as_str()?.to_string(),
                 part: None,
-            }),
+                response_id,
+            },
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-                Some(StreamFragment {
+                StreamFragment {
                     reasoning: true,
-                    text: delta.to_string(),
+                    text: value["delta"].as_str()?.to_string(),
                     // `summary_index` restarts at zero for every reasoning item, so a
                     // response with several items would otherwise collide into one row.
-                    part: value["output_index"]
-                        .as_u64()
-                        .map(|output_index| {
-                            let index = value["summary_index"]
-                                .as_u64()
-                                .or_else(|| value["content_index"].as_u64())
-                                .unwrap_or_default();
-                            format!("{output_index}:{index}")
-                        }),
-                })
+                    part: value["output_index"].as_u64().map(|output_index| {
+                        let index = value["summary_index"]
+                            .as_u64()
+                            .or_else(|| value["content_index"].as_u64())
+                            .unwrap_or_default();
+                        format!("{output_index}:{index}")
+                    }),
+                    response_id,
+                }
             }
-            _ => None,
+            _ => StreamFragment {
+                reasoning: false,
+                text: String::new(),
+                part: None,
+                response_id,
+            },
         };
+        if fragment.text.is_empty() && fragment.response_id.is_none() {
+            return None;
+        }
+        return Some(fragment);
     }
-    if kind == "anthropic" {
-        value["delta"]["text"]
-            .as_str()
-            .map(|text| StreamFragment {
-                reasoning: false,
+    if kind == RequestKind::Anthropic {
+        return value["delta"]["text"].as_str().map(|text| StreamFragment {
+            reasoning: false,
+            text: text.to_string(),
+            part: None,
+            response_id: None,
+        }).or_else(|| {
+            value["delta"]["thinking"].as_str().map(|text| StreamFragment {
+                reasoning: true,
                 text: text.to_string(),
                 part: None,
+                response_id: None,
             })
-            .or_else(|| {
-                value["delta"]["thinking"].as_str().map(|text| StreamFragment {
-                    reasoning: true,
-                    text: text.to_string(),
-                    part: None,
-                })
-            })
-    } else {
-        let delta = &value["choices"].as_array()?.first()?["delta"];
-        delta["content"]
-            .as_str()
-            .map(|text| StreamFragment {
-                reasoning: false,
-                text: text.to_string(),
-                part: None,
-            })
-            .or_else(|| {
-                delta["reasoning_content"].as_str().map(|text| StreamFragment {
-                    reasoning: true,
-                    text: text.to_string(),
-                    part: None,
-                })
-            })
-            .or_else(|| {
-                delta["reasoning"].as_str().map(|text| StreamFragment {
-                    reasoning: true,
-                    text: text.to_string(),
-                    part: None,
-                })
-            })
+        });
     }
+    let delta = &value["choices"].as_array()?.first()?["delta"];
+    let text = |reasoning: bool, value: &str| StreamFragment {
+        reasoning,
+        text: value.to_string(),
+        part: None,
+        response_id: None,
+    };
+    delta["content"]
+        .as_str()
+        .map(|value| text(false, value))
+        .or_else(|| delta["reasoning_content"].as_str().map(|value| text(true, value)))
+        .or_else(|| delta["reasoning"].as_str().map(|value| text(true, value)))
 }

@@ -208,6 +208,15 @@ impl ApiError {
         }
     }
 
+    /// Never surfaced: the caller recovers by resending the whole conversation.
+    fn provider_chain_stale() -> Self {
+        Self {
+            status: StatusCode::BAD_GATEWAY,
+            code: "provider_chain_stale",
+            message: "The provider no longer recognises the stored conversation chain.".into(),
+        }
+    }
+
     fn provider_unavailable() -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
@@ -665,10 +674,11 @@ fn content_part(kind: &str, supports_images: bool, content: &str, images: &[Valu
     }
     for image in images {
         if let Some((media_type, data)) = parse_data_url(image.as_str().unwrap_or("")) {
-            if kind == "anthropic" {
-                parts.push(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}}));
-            } else {
-                parts.push(json!({"type": "image_url", "image_url": {"url": image}}));
+            match kind {
+                "anthropic" => parts.push(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})),
+                // Responses names its parts after the input item, not the Chat shape.
+                "openai_responses" => parts.push(json!({"type": "input_image", "image_url": image})),
+                _ => parts.push(json!({"type": "image_url", "image_url": {"url": image}})),
             }
         } else {
             parts.push(
@@ -1341,7 +1351,7 @@ async fn update_conversation(
             );
         }
     }
-    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),generation_settings=COALESCE($8,generation_settings),is_favorite=COALESCE($9,is_favorite),revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).bind(generation_settings).bind(request.is_favorite).fetch_one(&state.db).await?;
+    let c:Conversation=sqlx::query_as("UPDATE conversations SET title=COALESCE($3,title),archived_at=CASE WHEN $4::boolean IS TRUE THEN now() WHEN $4::boolean IS FALSE THEN NULL ELSE archived_at END,model_provider_id=COALESCE($5,model_provider_id),model=COALESCE($6,model),context_window=COALESCE($7,context_window),generation_settings=COALESCE($8,generation_settings),is_favorite=COALESCE($9,is_favorite),chain_response_id=CASE WHEN $5::uuid IS DISTINCT FROM model_provider_id OR $6::text IS DISTINCT FROM model THEN NULL ELSE chain_response_id END,chain_sequence=CASE WHEN $5::uuid IS DISTINCT FROM model_provider_id OR $6::text IS DISTINCT FROM model THEN 0 ELSE chain_sequence END,revision=revision+1 WHERE id=$1 AND user_id=$2 RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(id).bind(user_id).bind(request.title.map(|v|v.trim().to_string())).bind(request.archived).bind(request.provider_id).bind(model).bind(selected_context_window).bind(generation_settings).bind(request.is_favorite).fetch_one(&state.db).await?;
     event(
         &state.db,
         user_id,
@@ -1485,6 +1495,7 @@ async fn update_message(
     let m:Message=sqlx::query_as("UPDATE messages SET content=$3,token_count=$4,edited_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(message_id).bind(id).bind(content).bind(estimate_tokens(content)).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     let tokens = recompute_context_tokens(&state.db, id).await?;
     let (revision,): (i64,) = sqlx::query_as("UPDATE conversations SET context_tokens=$2,revision=revision+1 WHERE id=$1 AND user_id=$3 RETURNING revision").bind(id).bind(tokens).bind(user_id).fetch_one(&state.db).await?;
+    clear_chain(&state.db, id).await?;
     event(
         &state.db, user_id, "message", message_id, "updated", m.sequence,
     )
@@ -1505,9 +1516,74 @@ async fn delete_message(
     };
     let tokens = recompute_context_tokens(&state.db, id).await?;
     let (revision,): (i64,) = sqlx::query_as("UPDATE conversations SET context_tokens=$2,revision=revision+1 WHERE id=$1 AND user_id=$3 RETURNING revision").bind(id).bind(tokens).bind(user_id).fetch_one(&state.db).await?;
+    clear_chain(&state.db, id).await?;
     event(&state.db, user_id, "message", message_id, "deleted", 0).await?;
     event(&state.db, user_id, "conversation", id, "updated", revision).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// The formatting instruction is re-sent per turn; it is not part of the stored chain.
+fn instruction_message(enable_markdown: bool) -> Value {
+    json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }})
+}
+
+async fn build_transcript(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    kind: &str,
+    supports_images: bool,
+    prior_summary: Option<&(String, i64)>,
+    context_rounds: Option<u8>,
+    enable_markdown: bool,
+) -> Result<Vec<Value>, ApiError> {
+    let rows: Vec<(String, String, Value)> = sqlx::query_as("SELECT role,content,images FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80")
+        .bind(conversation_id)
+        .bind(prior_summary.map(|summary| summary.1).unwrap_or(0))
+        .fetch_all(pool)
+        .await?;
+    let mut transcript: Vec<Value> = rows
+        .into_iter()
+        .rev()
+        .map(|(role, content, images)| {
+            let images = images.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            json!({"role":role,"content":content_part(kind, supports_images, &strip_thinking(&content), images)})
+        })
+        .collect();
+    if let Some(rounds) = context_rounds {
+        let keep = usize::from(rounds).saturating_mul(2);
+        let start = transcript.len().saturating_sub(keep);
+        transcript = transcript.split_off(start);
+    }
+    if let Some((summary, _)) = prior_summary {
+        transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
+    }
+    transcript.insert(0, instruction_message(enable_markdown));
+    Ok(transcript)
+}
+
+/// The stored Responses chain is only usable when it ends at the message directly
+/// before the one being answered; anything else means the conversation branched.
+async fn load_chain(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    user_sequence: i64,
+) -> Result<Option<String>, ApiError> {
+    let chain: Option<(Option<String>, i64)> =
+        sqlx::query_as("SELECT chain_response_id, chain_sequence FROM conversations WHERE id=$1")
+            .bind(conversation_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(chain
+        .filter(|(_, sequence)| *sequence == user_sequence - 1)
+        .and_then(|(response_id, _)| response_id))
+}
+
+async fn clear_chain(pool: &PgPool, conversation_id: Uuid) -> Result<(), ApiError> {
+    sqlx::query("UPDATE conversations SET chain_response_id=NULL, chain_sequence=0 WHERE id=$1")
+        .bind(conversation_id)
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 async fn respond(
@@ -1541,35 +1617,51 @@ async fn respond(
     let supports_images = provider_model_supports_images(&state.db, provider_id, &model)
         .await?
         .unwrap_or(false);
-    let messages:Vec<(String,String,Value)>=sqlx::query_as("SELECT role,content,images FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80").bind(id).bind(prior_summary.as_ref().map(|summary| summary.1).unwrap_or(0)).fetch_all(&state.db).await?;
-    let mut transcript: Vec<Value> = messages
-        .into_iter()
-        .rev()
-        .map(|(role, content, images)| {
-            let images = images.as_array().map(Vec::as_slice).unwrap_or(&[]);
-            json!({"role":role,"content":content_part(&kind, supports_images, &strip_thinking(&content), images)})
-        })
-        .collect();
     let context_rounds = request.context_rounds.unwrap_or(Some(8));
     let tool_rounds = request
         .tool_rounds
         .unwrap_or(Some(DEFAULT_WEB_TOOL_ROUNDS as u8));
-    if let Some(rounds) = context_rounds {
-        let keep = usize::from(rounds).saturating_mul(2);
-        let start = transcript.len().saturating_sub(keep);
-        transcript = transcript.split_off(start);
-    }
     let explicit_search = web_tools::content_requests_web_search(&input.content);
     // Responses providers get OpenAI's hosted web_search_preview tool on every call, so
     // the retrieved-evidence ReAct loop never applies to them.
-    let native_tools = kind == "openai_responses";
-    let search_requested = !native_tools && (request.search.unwrap_or(false) || explicit_search);
-    info!(conversation_id=%id, message_id=%input.id, provider_kind=%kind, search_toggle=request.search.unwrap_or(false), explicit_search, native_tools, stream=request.stream.unwrap_or(false), "response request received");
-    if let Some((summary, _)) = prior_summary {
-        transcript.insert(0, json!({"role":"system","content":format!("Previous conversation context, compressed by malim_chat:\n{summary}")}));
-    }
+    let hosted_tools = kind == "openai_responses";
+    let search_requested = !hosted_tools && (request.search.unwrap_or(false) || explicit_search);
+    let tools = if hosted_tools {
+        providers::Tools::Hosted
+    } else if search_requested {
+        providers::Tools::Retrieved
+    } else {
+        providers::Tools::None
+    };
     let enable_markdown = request.enable_markdown.unwrap_or(true);
-    transcript.insert(0, json!({"role":"system","content": if enable_markdown { "Format the answer with GitHub-flavored Markdown when it improves readability. Use fenced code blocks with a language label for code." } else { "Respond in plain text only. Do not use Markdown syntax, headings, lists, tables, fenced code blocks, or inline formatting markers." }}));
+    // A Responses endpoint stores the conversation on its own side, so a chained call sends
+    // only this turn. Images travel as inlined data URLs and cannot ride along in a chain.
+    let chain_id = if hosted_tools
+        && input.images.as_array().is_none_or(|images| images.is_empty())
+    {
+        load_chain(&state.db, id, input.sequence).await?
+    } else {
+        None
+    };
+    let mut transcript = match &chain_id {
+        Some(_) => vec![
+            instruction_message(enable_markdown),
+            json!({"role":"user","content":content_part(&kind, supports_images, &input.content, &[])}),
+        ],
+        None => {
+            build_transcript(
+                &state.db,
+                id,
+                &kind,
+                supports_images,
+                prior_summary.as_ref(),
+                context_rounds,
+                enable_markdown,
+            )
+            .await?
+        }
+    };
+    info!(conversation_id=%id, message_id=%input.id, provider_kind=%kind, search_toggle=request.search.unwrap_or(false), explicit_search, hosted_tools, chained=chain_id.is_some(), stream=request.stream.unwrap_or(false), "response request received");
     let resumed_sources = if search_requested {
         if let Some((saved_transcript, saved_sources, _, _)) =
             load_failed_agent_run(&state, id, input.id).await?
@@ -1626,12 +1718,13 @@ async fn respond(
             result.reasoning,
             &result.sources,
             enable_markdown,
+            None,
         )
         .await?;
         return Ok(Json(message).into_response());
     }
     if request.stream.unwrap_or(false) {
-        let upstream = providers::call_provider_stream(
+        let upstream = match providers::call_provider_stream(
             &state.http,
             &kind,
             &p.1,
@@ -1640,9 +1733,32 @@ async fn respond(
             &transcript,
             request.temperature,
             request.reasoning_effort.as_deref(),
-            native_tools,
+            tools,
+            chain_id.as_deref(),
         )
-        .await?;
+        .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) if error.code == "provider_chain_stale" => {
+                warn!(conversation_id=%id, "Responses rejected the stored chain; resending the full conversation");
+                clear_chain(&state.db, id).await?;
+                transcript = build_transcript(&state.db, id, &kind, supports_images, prior_summary.as_ref(), context_rounds, enable_markdown).await?;
+                providers::call_provider_stream(
+                    &state.http,
+                    &kind,
+                    &p.1,
+                    &api_key,
+                    &model,
+                    &transcript,
+                    request.temperature,
+                    request.reasoning_effort.as_deref(),
+                    tools,
+                    None,
+                )
+                .await?
+            }
+            Err(error) => return Err(error),
+        };
         return Ok(stream_response(
             state,
             upstream,
@@ -1654,20 +1770,43 @@ async fn respond(
             kind,
         ));
     }
-    let (answer, reasoning) = split_thinking(
-        &providers::call_provider(
-            &state.http,
-            &kind,
-            &p.1,
-            &api_key,
-            &model,
-            &transcript,
-            request.temperature,
-            request.reasoning_effort.as_deref(),
-            native_tools,
-        )
-        .await?,
-    );
+    let reply = match providers::call_provider(
+        &state.http,
+        &kind,
+        &p.1,
+        &api_key,
+        &model,
+        &transcript,
+        request.temperature,
+        request.reasoning_effort.as_deref(),
+        tools,
+        chain_id.as_deref(),
+    )
+    .await
+    {
+        Ok(reply) => reply,
+        Err(error) if error.code == "provider_chain_stale" => {
+            warn!(conversation_id=%id, "Responses rejected the stored chain; resending the full conversation");
+            clear_chain(&state.db, id).await?;
+            transcript = build_transcript(&state.db, id, &kind, supports_images, prior_summary.as_ref(), context_rounds, enable_markdown).await?;
+            providers::call_provider(
+                &state.http,
+                &kind,
+                &p.1,
+                &api_key,
+                &model,
+                &transcript,
+                request.temperature,
+                request.reasoning_effort.as_deref(),
+                tools,
+                None,
+            )
+            .await?
+        }
+        Err(error) => return Err(error),
+    };
+    let (answer, reasoning) = split_thinking(&reply.text);
+    let reasoning = format!("{}{}", reply.reasoning, reasoning);
     let m = persist_assistant_message(
         &state,
         id,
@@ -1677,6 +1816,7 @@ async fn respond(
         reasoning,
         &[],
         enable_markdown,
+        reply.response_id.as_deref(),
     )
     .await?;
     Ok(Json(m).into_response())
@@ -1691,6 +1831,7 @@ async fn persist_assistant_message(
     reasoning: String,
     sources: &[Value],
     enable_markdown: bool,
+    chain_response_id: Option<&str>,
 ) -> Result<Message, ApiError> {
     // Providers sometimes emit thinking tags in normal content. Normalize at the
     // persistence boundary so private reasoning cannot become visible later.
@@ -1700,6 +1841,14 @@ async fn persist_assistant_message(
     let mut tx = state.db.begin().await?;
     let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(conversation_id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
     let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,reasoning_content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8,$9) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(conversation_id).bind(seq.0).bind(answer).bind(reasoning).bind(if enable_markdown { "markdown" } else { "plain" }).bind(model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
+    if let Some(response_id) = chain_response_id {
+        sqlx::query("UPDATE conversations SET chain_response_id=$2, chain_sequence=$3 WHERE id=$1")
+            .bind(conversation_id)
+            .bind(response_id)
+            .bind(seq.0)
+            .execute(&mut *tx)
+            .await?;
+    }
     tx.commit().await?;
     event(&state.db, user_id, "message", m.id, "created", seq.0).await?;
     let _ = auto_compact(&state.db, conversation_id).await;
@@ -1759,6 +1908,9 @@ async fn auto_compact(pool: &PgPool, conversation_id: Uuid) -> Result<(), ApiErr
         .bind(estimate_tokens(&content))
         .execute(pool)
         .await?;
+    // The provider still holds the whole chain it was fed; the summary replaced it here,
+    // so the next turn has to re-seed from the transcript.
+    clear_chain(pool, conversation_id).await?;
     Ok(())
 }
 async fn compact(
@@ -1814,7 +1966,7 @@ async fn compact(
             .await?
             .unwrap_or_else(|| p.0.clone());
         info!(conversation_id=%id, through_sequence=end, source_characters=source.len(), "manual compaction started");
-        providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None, false).await?
+        providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None, providers::Tools::None, None).await?.text
     } else {
         source.chars().take(30_000).collect()
     };
@@ -1829,6 +1981,7 @@ async fn compact(
     );
     let message:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,content_format,token_count) VALUES ($1,$2,$3,'summary',$4,'plain',0) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence.0).bind(marker).fetch_one(&mut *tx).await?;
     tx.commit().await?;
+    clear_chain(&state.db, id).await?;
     event(
         &state.db, user_id, "message", message.id, "created", sequence.0,
     )
@@ -2356,16 +2509,16 @@ fn stream_response(
     kind: String,
 ) -> Response {
     let output = async_stream::stream! {
-        let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new(); let mut reasoning_part: Option<String> = None; let mut reasoning_row = 0_u32;
+        let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new(); let mut reasoning_part: Option<String> = None; let mut reasoning_row = 0_u32; let mut provider_response_id: Option<String> = None;
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(fragment) = providers::provider_stream_delta(&kind, &frame) { let part = fragment.part; let fragments = if fragment.reasoning { vec![(true, fragment.text)] } else { thinking.push(&fragment.text) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { if let Some(part) = &part { if reasoning_part.as_deref() != Some(part.as_str()) { reasoning_row += 1; if !reasoning.is_empty() { reasoning.push_str("\n\n"); } reasoning_part = Some(part.clone()); } } reasoning.push_str(&text); } else { answer.push_str(&text); } let mut payload = json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text}); if is_reasoning && part.is_some() { payload["round"] = json!(reasoning_row); } let payload = serde_json::to_string(&payload).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
+                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(fragment) = providers::provider_stream_delta(&kind, &frame) { let part = fragment.part; if fragment.response_id.is_some() { provider_response_id = fragment.response_id; } let fragments = if fragment.reasoning { vec![(true, fragment.text)] } else { thinking.push(&fragment.text) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { if let Some(part) = &part { if reasoning_part.as_deref() != Some(part.as_str()) { reasoning_row += 1; if !reasoning.is_empty() { reasoning.push_str("\n\n"); } reasoning_part = Some(part.clone()); } } reasoning.push_str(&text); } else { answer.push_str(&text); } let mut payload = json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text}); if is_reasoning && part.is_some() { payload["round"] = json!(reasoning_row); } let payload = serde_json::to_string(&payload).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
                 Err(error) => { warn!(conversation_id=%conversation_id, %error, "upstream stream interrupted"); let payload = serde_json::to_string(&json!({"type":"error","message":"The provider stream was interrupted."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
             }
         }
         for (is_reasoning, text) in thinking.finish() { if is_reasoning { reasoning.push_str(&text); } else { answer.push_str(&text); } let payload = serde_json::to_string(&json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text})).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); }
         if answer.trim().is_empty() { let payload = serde_json::to_string(&json!({"type":"error","message":"The provider returned no final answer."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
-        match persist_assistant_message(&state, conversation_id, user_id, &model, answer, reasoning, &sources, enable_markdown).await {
+        match persist_assistant_message(&state, conversation_id, user_id, &model, answer, reasoning, &sources, enable_markdown, provider_response_id.as_deref()).await {
             Ok(message) => { let payload = serde_json::to_string(&json!({"type":"done","message":message})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); }
             Err(error) => { error!(conversation_id=%conversation_id, error=%error.message, "could not persist streamed response"); let payload = serde_json::to_string(&json!({"type":"error","message":"The streamed response could not be saved."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); }
         }
@@ -2414,7 +2567,7 @@ fn stream_web_agent_response(
                     for chunk in result.answer.as_bytes().chunks(1200) {
                         let _ = event_sink.send(json!({"type":"delta","delta":String::from_utf8_lossy(chunk)}));
                     }
-                    if let Ok(message) = persist_assistant_message(&worker_state, conversation_id, user_id, &worker_model, result.answer, result.reasoning, &result.sources, enable_markdown).await {
+                    if let Ok(message) = persist_assistant_message(&worker_state, conversation_id, user_id, &worker_model, result.answer, result.reasoning, &result.sources, enable_markdown, None).await {
                         let _ = event_sink.send(json!({"type":"done","message":message}));
                     } else { let _ = event_sink.send(json!({"type":"error","message":"The response could not be saved."})); }
                 }
@@ -2455,7 +2608,7 @@ mod tests {
         strip_thinking,
     };
     use crate::providers::{
-        provider_error_from_response, provider_stream_delta, provider_url, StreamFragment,
+        provider_error_from_response, provider_stream_delta, provider_url, RequestKind, StreamFragment,
     };
     use crate::web_tools::{is_safe_public_url, is_valid_search_query, web_tool_definitions};
     use axum::http::StatusCode;
@@ -2478,6 +2631,7 @@ mod tests {
                 reasoning: true,
                 text: "**Modeling**".into(),
                 part: Some("1:2".into()),
+                response_id: None,
             })
         );
         assert_eq!(
@@ -2489,6 +2643,7 @@ mod tests {
                 reasoning: true,
                 text: "**Again**".into(),
                 part: Some("2:2".into()),
+                response_id: None,
             })
         );
         assert_eq!(
@@ -2500,6 +2655,7 @@ mod tests {
                 reasoning: false,
                 text: "hello".into(),
                 part: None,
+                response_id: None,
             })
         );
     }
@@ -2515,6 +2671,7 @@ mod tests {
                 reasoning: false,
                 text: "hello".into(),
                 part: None,
+                response_id: None,
             })
         );
         assert_eq!(
@@ -2526,6 +2683,7 @@ mod tests {
                 reasoning: true,
                 text: "plan".into(),
                 part: None,
+                response_id: None,
             })
         );
         assert_eq!(
@@ -2534,6 +2692,7 @@ mod tests {
                 reasoning: true,
                 text: "plan".into(),
                 part: None,
+                response_id: None,
             })
         );
     }
@@ -2541,19 +2700,19 @@ mod tests {
     #[test]
     fn accepts_standard_provider_base_urls() {
         assert_eq!(
-            provider_url("openai_compatible", "https://api.openai.com"),
+            provider_url(RequestKind::OpenAiChat, "https://api.openai.com"),
             "https://api.openai.com/v1/chat/completions"
         );
         assert_eq!(
-            provider_url("openai_compatible", "https://api.openai.com/v1"),
+            provider_url(RequestKind::OpenAiChat, "https://api.openai.com/v1"),
             "https://api.openai.com/v1/chat/completions"
         );
         assert_eq!(
-            provider_url("anthropic", "https://api.anthropic.com"),
+            provider_url(RequestKind::Anthropic, "https://api.anthropic.com"),
             "https://api.anthropic.com/v1/messages"
         );
         assert_eq!(
-            provider_url("anthropic", "https://api.anthropic.com/v1"),
+            provider_url(RequestKind::Anthropic, "https://api.anthropic.com/v1"),
             "https://api.anthropic.com/v1/messages"
         );
     }
@@ -2650,7 +2809,7 @@ mod tests {
             provider_error_from_response(
                 StatusCode::FORBIDDEN,
                 "tool calling is unsupported",
-                true
+                true, false
             )
             .code,
             "provider_access_denied"
@@ -2659,13 +2818,13 @@ mod tests {
             provider_error_from_response(
                 StatusCode::BAD_REQUEST,
                 "tool_choice is unsupported",
-                true
+                true, false
             )
             .code,
             "provider_tool_unsupported"
         );
         assert_eq!(
-            provider_error_from_response(StatusCode::TOO_MANY_REQUESTS, "", false).code,
+            provider_error_from_response(StatusCode::TOO_MANY_REQUESTS, "", false, false).code,
             "provider_rate_limited"
         );
     }

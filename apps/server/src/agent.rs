@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent_events::{self, AgentEventSink};
-use crate::providers::{call_provider, call_provider_with_tools};
+use crate::providers::{Tools, call_provider, call_provider_with_tools};
 use crate::web_tools::execute_web_tool;
 
 pub(super) struct WebAgentAnswer {
@@ -100,23 +100,23 @@ pub(super) async fn run_web_agent(
                     Some("This provider does not accept native tools"),
                 );
                 warn!(round, error=%error.message, "provider rejected native web tools; falling back to a normal answer");
-                let (answer, reasoning) = split_thinking(
-                    &call_provider(
-                        &state.http,
-                        kind,
-                        base,
-                        key,
-                        model,
-                        &transcript,
-                        temperature,
-                        reasoning_effort,
-                        false,
-                    )
-                    .await?,
-                );
+                let reply = call_provider(
+                    &state.http,
+                    kind,
+                    base,
+                    key,
+                    model,
+                    &transcript,
+                    temperature,
+                    reasoning_effort,
+                    Tools::None,
+                    None,
+                )
+                .await?;
+                let (answer, inline_reasoning) = split_thinking(&reply.text);
                 return Ok(WebAgentAnswer {
                     answer,
-                    reasoning,
+                    reasoning: format!("{}{}", reply.reasoning, inline_reasoning),
                     sources,
                 });
             }
@@ -162,13 +162,13 @@ pub(super) async fn run_web_agent(
             None,
             None,
         );
-        let (_, turn_reasoning) = split_thinking(&turn.content);
-        if !turn_reasoning.trim().is_empty() {
-            agent_events::emit_reasoning(events, &turn_reasoning, round);
+        if !turn.reply.reasoning.trim().is_empty() {
+            agent_events::emit_reasoning(events, &turn.reply.reasoning, round);
         }
 
         if turn.tool_calls.is_empty() {
-            let (answer, reasoning) = split_thinking(&turn.content);
+            let (answer, inline_reasoning) = split_thinking(&turn.reply.text);
+            let reasoning = format!("{}{}", turn.reply.reasoning, inline_reasoning);
             if !answer.trim().is_empty() {
                 info!(round, source_count = sources.len(), "web agent completed");
                 return Ok(WebAgentAnswer {
@@ -273,7 +273,8 @@ pub(super) async fn run_web_agent(
         &transcript,
         temperature,
         reasoning_effort,
-        false,
+        Tools::None,
+        None,
     )
     .await;
     let draft = match draft {
@@ -310,7 +311,8 @@ pub(super) async fn run_web_agent(
             return Err(error);
         }
     };
-    let (answer, reasoning) = split_thinking(&draft);
+    let (answer, inline_reasoning) = split_thinking(&draft.text);
+    let reasoning = format!("{}{}", draft.reasoning, inline_reasoning);
     emit_tool_event(
         events,
         "draft",
