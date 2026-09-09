@@ -8,6 +8,7 @@ pub(crate) struct DictionaryQuery {
     word: String,
     dictionary: String,
 }
+
 #[derive(Serialize)]
 pub(crate) struct DictionaryEntryResponse {
     headword: String,
@@ -22,6 +23,7 @@ pub(crate) struct DictionaryEntryResponse {
     definition_html: String,
     matched_terms: Vec<String>,
 }
+
 #[derive(Serialize)]
 pub(crate) struct DictionaryResponse {
     word: String,
