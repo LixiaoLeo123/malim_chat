@@ -13,8 +13,6 @@
     "tauri:build": "tauri build --config apps/client/src-tauri/tauri.conf.json"
   },
   "dependencies": {
-    "@tauri-apps/api": "^2.9.1",
-    "@tauri-apps/plugin-store": "^2.4.0",
     "@types/react-syntax-highlighter": "^15.5.13",
     "dompurify": "^3.4.13",
     "katex": "^0.18.4",
