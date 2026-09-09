@@ -399,9 +399,9 @@ fn openai_content(body: &Value) -> Option<String> {
 pub(crate) struct StreamFragment {
     pub(crate) reasoning: bool,
     pub(crate) text: String,
-    /// Responses returns reasoning as numbered summary parts, so each part can be
-    /// rendered as its own timeline row instead of being glued to its neighbours.
-    pub(crate) part: Option<u32>,
+    /// Responses returns reasoning as summary parts, so each part can be rendered as
+    /// its own timeline row instead of being glued to its neighbours.
+    pub(crate) part: Option<String>,
 }
 
 pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFragment> {
@@ -425,11 +425,17 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                 Some(StreamFragment {
                     reasoning: true,
                     text: delta.to_string(),
-                    part: value["summary_index"]
+                    // `summary_index` restarts at zero for every reasoning item, so a
+                    // response with several items would otherwise collide into one row.
+                    part: value["output_index"]
                         .as_u64()
-                        .or_else(|| value["content_index"].as_u64())
-                        .map(u32::try_from)
-                        .and_then(Result::ok),
+                        .map(|output_index| {
+                            let index = value["summary_index"]
+                                .as_u64()
+                                .or_else(|| value["content_index"].as_u64())
+                                .unwrap_or_default();
+                            format!("{output_index}:{index}")
+                        }),
                 })
             }
             _ => None,

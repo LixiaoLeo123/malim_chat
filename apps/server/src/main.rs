@@ -2356,10 +2356,10 @@ fn stream_response(
     kind: String,
 ) -> Response {
     let output = async_stream::stream! {
-        let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new(); let mut reasoning_part: Option<u32> = None;
+        let mut answer = String::new(); let mut reasoning = String::new(); let mut buffer = String::new(); let mut upstream = upstream.bytes_stream(); let mut thinking = ThinkingStream::new(); let mut reasoning_part: Option<String> = None; let mut reasoning_row = 0_u32;
         while let Some(chunk) = upstream.next().await {
             match chunk {
-                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(fragment) = providers::provider_stream_delta(&kind, &frame) { let part = fragment.part; let fragments = if fragment.reasoning { vec![(true, fragment.text)] } else { thinking.push(&fragment.text) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { if let Some(part) = part { if reasoning_part != Some(part) { if !reasoning.is_empty() { reasoning.push_str("\n\n"); } reasoning_part = Some(part); } } reasoning.push_str(&text); } else { answer.push_str(&text); } let mut payload = json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text}); if let (true, Some(part)) = (is_reasoning, part) { payload["round"] = json!(part); } let payload = serde_json::to_string(&payload).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
+                Ok(chunk) => { buffer.push_str(&String::from_utf8_lossy(&chunk)); buffer = buffer.replace("\r\n", "\n"); while let Some(boundary) = buffer.find("\n\n") { let frame = buffer[..boundary].to_string(); buffer.drain(..boundary + 2); if let Some(fragment) = providers::provider_stream_delta(&kind, &frame) { let part = fragment.part; let fragments = if fragment.reasoning { vec![(true, fragment.text)] } else { thinking.push(&fragment.text) }; for (is_reasoning, text) in fragments { if text.is_empty() { continue; } if is_reasoning { if let Some(part) = &part { if reasoning_part.as_deref() != Some(part.as_str()) { reasoning_row += 1; if !reasoning.is_empty() { reasoning.push_str("\n\n"); } reasoning_part = Some(part.clone()); } } reasoning.push_str(&text); } else { answer.push_str(&text); } let mut payload = json!({"type":if is_reasoning { "reasoning" } else { "delta" },"delta":text}); if is_reasoning && part.is_some() { payload["round"] = json!(reasoning_row); } let payload = serde_json::to_string(&payload).unwrap_or_default(); yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(format!("data: {payload}\n\n"))); } } } }
                 Err(error) => { warn!(conversation_id=%conversation_id, %error, "upstream stream interrupted"); let payload = serde_json::to_string(&json!({"type":"error","message":"The provider stream was interrupted."})).unwrap_or_default(); yield Ok(Bytes::from(format!("data: {payload}\n\n"))); return; }
             }
         }
@@ -2472,12 +2472,23 @@ mod tests {
         assert_eq!(
             provider_stream_delta(
                 "openai_responses",
-                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"summary_index\":2,\"delta\":\"**Modeling**\"}"
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":1,\"summary_index\":2,\"delta\":\"**Modeling**\"}"
             ),
             Some(StreamFragment {
                 reasoning: true,
                 text: "**Modeling**".into(),
-                part: Some(2),
+                part: Some("1:2".into()),
+            })
+        );
+        assert_eq!(
+            provider_stream_delta(
+                "openai_responses",
+                "data: {\"type\":\"response.reasoning_summary_text.delta\",\"output_index\":2,\"summary_index\":2,\"delta\":\"**Again**\"}"
+            ),
+            Some(StreamFragment {
+                reasoning: true,
+                text: "**Again**".into(),
+                part: Some("2:2".into()),
             })
         );
         assert_eq!(
