@@ -8,7 +8,7 @@ import rehypeKatex from "rehype-katex";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import "./additions.css";
-import { api, setSession, subscribeSession } from "./api";
+import { api, setSession, subscribeSession, type StreamEvent } from "./api";
 import { useAppStore } from "./store";
 import type { Conversation, DictionaryResponse, GenerationSettings, Message, Provider, ProviderKind, ProviderModel, Session, ToolActivity } from "./types";
 
@@ -164,13 +164,6 @@ function Chat() {
       setSidebarCollapsed(false);
     } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to create a conversation."); }
   }
-  async function archive(id: string) {
-    const before = useAppStore.getState().conversations;
-    state.setConversations(before.filter((item) => item.id !== id));
-    if (activeId === id) state.setActiveId(before.find((item) => item.id !== id)?.id ?? null);
-    try { await api.updateConversation(id, { archived: true }); }
-    catch (cause) { state.setConversations(before); state.setError(cause instanceof Error ? cause.message : "Unable to archive conversation."); }
-  }
   async function changeModel(providerId: string, model: string) {
     if (!activeConversation || !model.trim()) return;
     setModelChanging(true);
@@ -198,9 +191,6 @@ function Chat() {
     const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, images, reasoning_content: "", content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
     let sent: Message | null = null;
     let pendingId: string | null = null;
-    let streamedContent = "";
-    let streamedReasoning = "";
-    let toolEvents: ToolActivity[] = [];
     const controller = options.stream ? beginStream() : null;
     state.upsertMessage(conversationId, optimistic);
     state.setBusy(true);
@@ -213,13 +203,9 @@ function Chat() {
         if (item) state.setConversations([{ ...item, updated_at: now() }, ...list.filter((conversation) => conversation.id !== conversationId)]);
       }
       pendingId = `assistant-${mutationId}`;
-      const streamingBase = sent;
-      const streamingId = pendingId;
-      const streamingSequence = sent.sequence + 0.5;
-      state.upsertMessage(conversationId, { ...sent, id: pendingId, sequence: sent.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: [] });
-      const answer = options.stream ? await api.respondStream(conversationId, sent.id, search, options, (event) => { if (event.type === "tool") toolEvents = updateToolEvents(toolEvents, event.tool); else if (event.type === "reasoning") { const delta = event.delta ?? ""; streamedReasoning += delta; const id = `reasoning-${event.round ?? 0}`; const previous = toolEvents.find((item) => item.id === id); toolEvents = updateToolEvents(toolEvents, { id, name: "reasoning", status: "completed", round: event.round, detail: `${previous?.detail ?? ""}${delta}` }); } else streamedContent += event.delta ?? ""; state.upsertMessage(conversationId, { ...streamingBase, id: streamingId, sequence: streamingSequence, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: toolEvents }); }, controller?.signal) : await api.respond(conversationId, sent.id, search, options);
+      const turn = await runTurn(conversationId, sent, options, search, pendingId, [], controller?.signal);
       state.removeMessage(conversationId, pendingId);
-      state.upsertMessage(conversationId, { ...answer, tool_events: toolEvents });
+      state.upsertMessage(conversationId, { ...turn.answer, tool_events: turn.toolEvents });
       const chats = await api.conversations();
       state.setConversations(chats.items);
       setConversationCursor(chats.next_cursor);
@@ -234,25 +220,47 @@ function Chat() {
   const handleEditMessage = useCallback(editMessage, [activeId]);
   const handleDeleteMessage = useCallback(deleteMessage, [activeId]);
   const handleRetryMessage = useCallback(retryMessage, [activeId, searchEnabled, generation]);
+  /**
+   * Streams one assistant turn over a user message: placeholder row, live tool and
+   * reasoning events, then the server's final message. Shared by send and retry.
+   */
+  async function runTurn(conversationId: string, base: Message, options: GenerationSettings, search: boolean, pendingId: string, seed: ToolActivity[], signal?: AbortSignal) {
+    let streamedContent = "";
+    let streamedReasoning = "";
+    let toolEvents = seed;
+    const sequence = base.sequence + 0.5;
+    const render = () => ({ ...base, id: pendingId, sequence, client_mutation_id: null, role: "assistant" as const, content: streamedContent, images: [] as string[], reasoning_content: streamedReasoning, status: "streaming" as const, model: null, token_count: 0, search_sources: [], tool_events: toolEvents });
+    state.upsertMessage(conversationId, render());
+    const onEvent = (event: StreamEvent) => {
+      if (event.type === "tool") toolEvents = updateToolEvents(toolEvents, event.tool);
+      else if (event.type === "reasoning") {
+        const delta = event.delta ?? "";
+        streamedReasoning += delta;
+        const id = `reasoning-${event.round ?? 0}`;
+        const previous = toolEvents.find((item) => item.id === id);
+        toolEvents = updateToolEvents(toolEvents, { id, name: "reasoning", status: "completed", round: event.round, detail: `${previous?.detail ?? ""}${delta}` });
+      } else streamedContent += event.delta ?? "";
+      state.upsertMessage(conversationId, render());
+    };
+    const answer = options.stream ? await api.respondStream(conversationId, base.id, search, options, onEvent, signal) : await api.respond(conversationId, base.id, search, options);
+    return { answer, toolEvents };
+  }
   async function retryMessage(message: Message) {
     if (!activeId) return;
     const target = message.retry_message_id ? (useAppStore.getState().messages[activeId]?.find((item) => item.id === message.retry_message_id) ?? message) : message;
     if (message.retry_message_id) state.removeMessage(activeId, message.id);
     if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled, generation, target.images ?? []); return; }
     const pendingId = `retry-${target.id}`;
-    let streamedContent = "";
-    let streamedReasoning = "";
-    let toolEvents: ToolActivity[] = [];
-    try { const saved = await api.agentRun(activeId, target.id); toolEvents = saved.events ?? []; } catch { /* no previous run */ }
+    let seed: ToolActivity[] = [];
+    try { seed = (await api.agentRun(activeId, target.id)).events ?? []; } catch { /* no previous run */ }
     state.upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
-    state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: "", images: [], reasoning_content: "", status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: [] });
     const controller = generation.stream ? beginStream() : null;
     state.setBusy(true);
     try {
-      const answer = generation.stream ? await api.respondStream(activeId, target.id, searchEnabled, generation, (event) => { if (event.type === "tool") toolEvents = updateToolEvents(toolEvents, event.tool); else if (event.type === "reasoning") { const delta = event.delta ?? ""; streamedReasoning += delta; const id = `reasoning-${event.round ?? 0}`; const previous = toolEvents.find((item) => item.id === id); toolEvents = updateToolEvents(toolEvents, { id, name: "reasoning", status: "completed", round: event.round, detail: `${previous?.detail ?? ""}${delta}` }); } else streamedContent += event.delta ?? ""; state.upsertMessage(activeId, { ...target, id: pendingId, sequence: target.sequence + 0.5, client_mutation_id: null, role: "assistant", content: streamedContent, images: [], reasoning_content: streamedReasoning, status: "streaming", model: null, token_count: 0, search_sources: [], tool_events: toolEvents }); }, controller?.signal) : await api.respond(activeId, target.id, searchEnabled, generation);
+      const turn = await runTurn(activeId, target, generation, searchEnabled, pendingId, seed, controller?.signal);
       state.removeMessage(activeId, pendingId);
       state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() });
-      state.upsertMessage(activeId, { ...answer, tool_events: toolEvents });
+      state.upsertMessage(activeId, { ...turn.answer, tool_events: turn.toolEvents });
     } catch (cause) {
       state.removeMessage(activeId, pendingId);
       if ((cause as Error)?.name === "AbortError") { state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() }); return; }
@@ -371,7 +379,7 @@ function ModelSelector({ conversation, providers, open, busy, onToggle, onChange
   useEffect(() => { setProviderId(conversation.model_provider_id ?? providers[0]?.id ?? ""); setModel(conversation.model ?? activeProvider?.models[0]?.model ?? ""); }, [conversation.id, conversation.model_provider_id, conversation.model, activeProvider?.models, providers]);
   const selectedProvider = providers.find((provider) => provider.id === providerId);
   const groups = (selectedProvider?.models ?? []).reduce<Record<string, ProviderModel[]>>((all, item) => { (all[item.group_name] ??= []).push(item); return all; }, {});
-  return <div className="model-selector"><button type="button" className="model-button" aria-expanded={open} onClick={onToggle}><span>{model || "Choose model"}</span><ChevronsUpDown size={15} /></button>{open && <div className="model-popover"><div className="model-picker-heading">Provider</div><div className="provider-options">{providers.map((provider) => <button type="button" key={provider.id} className={provider.id === providerId ? "selected" : ""} onClick={() => { setProviderId(provider.id); setModel(provider.models[0]?.model ?? ""); }}>{provider.name}</button>)}</div><div className="model-picker-heading">Model</div><div className="configured-models">{Object.entries(groups).map(([group, items]) => <section key={group}><h4>{group}</h4>{items.map((item) => <button type="button" key={item.id} className={item.model === model ? "selected" : ""} onClick={() => { setModel(item.model); void onChange(providerId, item.model); }}>{item.model}</button>)}</section>)}</div></div>}</div>;
+  return <div className="model-selector"><button type="button" className="model-button" aria-expanded={open} disabled={busy} onClick={onToggle}><span>{model || "Choose model"}</span>{busy ? <LoaderCircle className="spin" size={15} /> : <ChevronsUpDown size={15} />}</button>{open && <div className="model-popover"><div className="model-picker-heading">Provider</div><div className="provider-options">{providers.map((provider) => <button type="button" key={provider.id} disabled={busy} className={provider.id === providerId ? "selected" : ""} onClick={() => { setProviderId(provider.id); setModel(provider.models[0]?.model ?? ""); }}>{provider.name}</button>)}</div><div className="model-picker-heading">Model</div><div className="configured-models">{Object.entries(groups).map(([group, items]) => <section key={group}><h4>{group}</h4>{items.map((item) => <button type="button" key={item.id} disabled={busy} className={item.model === model ? "selected" : ""} onClick={() => { setModel(item.model); void onChange(providerId, item.model); }}>{item.model}</button>)}</section>)}</div></div>}</div>;
 }
 
 function ConversationView({ conversation, messages, hasOlder, loadingOlder, onLoadOlder, providers, searchEnabled, busy, compacting, theme, lookupActive, streaming, onStop, generation, onGenerationChange, onToggleSearch, onSend, onEdit, onDelete, onRetry, onLookup, onCompact }: { conversation: Conversation | null; messages: Message[]; hasOlder: boolean; loadingOlder: boolean; onLoadOlder: (id: string) => Promise<void>; providers: Provider[]; searchEnabled: boolean; busy: boolean; compacting: boolean; theme: "light" | "dark"; lookupActive: boolean; streaming: boolean; onStop: () => void; generation: GenerationSettings; onGenerationChange: (value: GenerationSettings) => void; onToggleSearch: () => void; onSend: (content: string, images?: string[]) => Promise<void>; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void; onCompact: () => Promise<void> }) {
@@ -508,21 +516,6 @@ function GenerationButton({ generation, onChange, kind, model }: { generation: G
   return <div ref={controlRef} className="generation-control"><button type="button" className="search-chip" onClick={() => setOpen(!open)} title="Generation parameters"><Settings2 size={14} />Parameters</button>{open && <div className="generation-popover"><label><span>Temperature <b>{generation.temperature.toFixed(1)}</b></span><input type="range" min="0" max="2" step="0.1" value={generation.temperature} onChange={(event) => onChange({ ...generation, temperature: Number(event.target.value) })} /></label>{supportsReasoning && <label><span>Reasoning effort <b>{generation.reasoning_effort}</b></span><input type="range" min="0" max="2" step="1" value={effort.indexOf(generation.reasoning_effort as typeof effort[number])} onChange={(event) => onChange({ ...generation, reasoning_effort: effort[Number(event.target.value)] })} /><small>Low <i /> Medium <i /> High</small></label>}{!chained && <label><span>Recent context rounds <b>{generation.context_rounds === null ? "All" : context}</b></span><input type="range" min="0" max="20" step="1" value={generation.context_rounds === null ? 20 : context} onChange={(event) => { const value = Number(event.target.value); onChange({ ...generation, context_rounds: value >= 20 ? null : value }); }} /><small>0 <i /> All</small></label>}<label><span>Maximum ReAct rounds <b>{generation.tool_rounds === null ? "Unlimited" : tools}</b></span><input type="range" min="1" max="20" step="1" value={generation.tool_rounds === null ? 20 : tools} onChange={(event) => { const value = Number(event.target.value); onChange({ ...generation, tool_rounds: value >= 20 ? null : value }); }} /><small>1 <i /> Unlimited</small></label><label className="markdown-toggle"><span>Enable Markdown</span><input type="checkbox" checked={generation.enable_markdown} onChange={(event) => onChange({ ...generation, enable_markdown: event.target.checked })} /></label><label className="markdown-toggle"><span>Stream output</span><input type="checkbox" checked={generation.stream} onChange={(event) => onChange({ ...generation, stream: event.target.checked })} /></label></div>}</div>;
 }
 
-function ThinkingBlock({ reasoning }: { reasoning: string }) {
-  const [open, setOpen] = useState(false);
-  const [contentHeight, setContentHeight] = useState(0);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  useEffect(() => {
-    if (!open) { setContentHeight(0); return; }
-    const measure = () => { const node = scrollRef.current; if (node) setContentHeight(Math.min(node.scrollHeight, 300)); };
-    measure();
-    const observer = new ResizeObserver(measure);
-    if (scrollRef.current) observer.observe(scrollRef.current);
-    return () => observer.disconnect();
-  }, [open, reasoning]);
-  return <div className="thinking-block"><button type="button" className="thinking-summary" aria-expanded={open} onClick={() => setOpen(!open)}>Thinking</button><div className="thinking-collapse" style={{ maxHeight: open ? contentHeight : 0 }}><div ref={scrollRef} className="thinking-scroll"><div className="plain-content">{reasoning}</div></div></div></div>;
-}
-
 function preprocessLatex(input: string): string {
   const blocks: string[] = [];
   const protectedText = input.replace(/```[\s\S]*?```|`[^`\n]*`/g, (match) => {
@@ -532,6 +525,8 @@ function preprocessLatex(input: string): string {
   const converted = protectedText
     .replace(/\\\[([\s\S]*?)\\\]/g, (_, body) => `$$\n${body}\n$$`)
     .replace(/\\\(([\s\S]*?)\\\)/g, (_, body) => `$${body}$`);
+  // The NUL sentinel cannot collide with LaTeX the user is shown.
+  // eslint-disable-next-line no-control-regex
   return converted.replace(/\u0000(\d+)\u0000/g, (_, index) => blocks[Number(index)]);
 }
 
@@ -703,7 +698,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
 
 function splitLegacyThinking(value: string) {
   const reasoning: string[] = [];
-  let content = value.replace(/<(think|thinking)>([\s\S]*?)(?:<\/\1>|$)/gi, (_, _tag, thought: string) => {
+  const content = value.replace(/<(think|thinking)>([\s\S]*?)(?:<\/\1>|$)/gi, (_, _tag, thought: string) => {
     if (thought.trim()) reasoning.push(thought.trim());
     return "";
   });

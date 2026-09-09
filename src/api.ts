@@ -1,4 +1,4 @@
-import type { Conversation, DictionaryResponse, GenerationSettings, Message, Page, Provider, ProviderKind, ProviderModel, SearchResult, Session, ToolActivity, User } from "./types";
+import type { Conversation, DictionaryResponse, GenerationSettings, Message, Page, Provider, ProviderKind, ProviderModel, SearchResult, Session, ToolActivity } from "./types";
 
 const apiBase = import.meta.env.VITE_API_URL || "/malim_chat_api";
 let session: Session | null = null;
@@ -17,7 +17,6 @@ export function subscribeSession(listener: (value: Session | null) => void) {
   sessionListener = listener;
   return () => { if (sessionListener === listener) sessionListener = null; };
 }
-export function getSession() { return session; }
 
 async function refreshSession() {
   if (!session) return null;
@@ -54,7 +53,7 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
   return response.status === 204 ? undefined as T : response.json();
 }
 
-type StreamEvent = { type: string; delta?: string; round?: number; message?: Message | string; tool?: ToolActivity };
+export type StreamEvent = { type: string; delta?: string; round?: number; message?: Message | string; tool?: ToolActivity };
 async function requestStream(path: string, payload: unknown, onEvent: (event: StreamEvent) => void, signal?: AbortSignal): Promise<Message> {
   const headers = new Headers({ "Content-Type": "application/json", Accept: "text/event-stream" });
   if (session) headers.set("Authorization", `Bearer ${session.access_token}`);
@@ -89,7 +88,6 @@ async function safeFetch(url: string, init: RequestInit = {}): Promise<Response>
 export const api = {
   signup: (email: string, password: string, display_name: string) => request<Session>("/v1/auth/signup", { method: "POST", body: JSON.stringify({ email, password, display_name }) }, false),
   login: (email: string, password: string) => request<Session>("/v1/auth/login", { method: "POST", body: JSON.stringify({ email, password }) }, false),
-  me: () => request<User>("/v1/me"),
   providers: () => request<Provider[]>("/v1/providers"),
   createProvider: (payload: { name: string; kind: ProviderKind; base_url: string; api_key: string }) => request<Provider>("/v1/providers", { method: "POST", body: JSON.stringify(payload) }),
   updateProvider: (id: string, payload: { name?: string; kind?: ProviderKind; base_url?: string; api_key?: string }) => request<Provider>(`/v1/providers/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
@@ -100,7 +98,6 @@ export const api = {
   conversations: (cursor?: string) => request<Page<Conversation>>(`/v1/conversations?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createConversation: (payload: { title?: string; provider_id?: string; model?: string }) => request<Conversation>("/v1/conversations", { method: "POST", body: JSON.stringify(payload) }),
   updateConversation: (id: string, payload: { title?: string; archived?: boolean; provider_id?: string; model?: string; generation_settings?: GenerationSettings; is_favorite?: boolean }) => request<Conversation>(`/v1/conversations/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
-  deleteConversation: (id: string) => request<void>(`/v1/conversations/${id}`, { method: "DELETE" }),
   messages: (id: string, cursor?: string) => request<Page<Message>>(`/v1/conversations/${id}/messages?limit=100${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`),
   createMessage: (conversationId: string, content: string, mutationId: string, search: boolean, images: string[] = []) => request<Message>(`/v1/conversations/${conversationId}/messages`, { method: "POST", body: JSON.stringify({ content, client_mutation_id: mutationId, search, images }) }),
   respond: (conversationId: string, messageId: string, search: boolean, options?: { temperature?: number; reasoning_effort?: string; enable_markdown?: boolean; context_rounds?: number | null; tool_rounds?: number | null; stream?: boolean }) => request<Message>(`/v1/conversations/${conversationId}/respond`, { method: "POST", body: JSON.stringify({ message_id: messageId, search, ...options }) }),
@@ -109,6 +106,5 @@ export const api = {
   updateMessage: (conversationId: string, messageId: string, content: string) => request<Message>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "PATCH", body: JSON.stringify({ content }) }),
   deleteMessage: (conversationId: string, messageId: string) => request<void>(`/v1/conversations/${conversationId}/messages/${messageId}`, { method: "DELETE" }),
   compact: (conversationId: string, force = true) => request<{ compacted: boolean; message: Message; context_tokens: number }>(`/v1/conversations/${conversationId}/compact`, { method: "POST", body: JSON.stringify({ force }) }),
-  dictionary: (word: string, dictionary: "russian_en" | "german_en" | "english_zh") => request<DictionaryResponse>(`/v1/dictionary?word=${encodeURIComponent(word)}&dictionary=${dictionary}`),
-  search: (q: string) => request<SearchResult[]>(`/v1/search?q=${encodeURIComponent(q)}`)
+  dictionary: (word: string, dictionary: "russian_en" | "german_en" | "english_zh") => request<DictionaryResponse>(`/v1/dictionary?word=${encodeURIComponent(word)}&dictionary=${dictionary}`)
 };
