@@ -492,11 +492,13 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
 /// these need no executor. Chat Completions and Anthropic providers have no equivalent,
 /// which is why those go through the ReAct loop with our SearXNG functions instead.
 ///
-/// Only tools the gateway is known to accept are listed. `code_interpreter` and the
-/// newer `web_search` spelling were tried: every Responses request carrying them came
-/// back as a stream with no text in it, so they are out until that is proven otherwise.
+/// `web_search_preview` rather than the newer `web_search` spelling: that keeps the tool
+/// name the gateway is known to accept, so a failure here points at `code_interpreter`.
 fn responses_tools() -> Vec<Value> {
-    vec![json!({ "type": "web_search_preview" })]
+    vec![
+        json!({ "type": "web_search_preview" }),
+        json!({ "type": "code_interpreter", "container": { "type": "auto" } }),
+    ]
 }
 
 fn responses_content(body: &Value) -> Option<String> {
