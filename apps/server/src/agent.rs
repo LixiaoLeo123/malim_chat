@@ -9,17 +9,37 @@ pub(super) struct WebAgentAnswer {
     pub(super) sources: Vec<Value>,
 }
 
-fn emit_tool_event(
-    events: Option<&AgentEventSink>,
-    id: impl Into<String>,
-    name: &str,
+/// Checkpoints the run so a retry can resume it. A failed checkpoint is never fatal:
+/// the answer is still worth delivering, and the next turn rebuilds from the transcript.
+#[allow(clippy::too_many_arguments)]
+async fn checkpoint(
+    state: &AppState,
+    conversation_id: Uuid,
+    user_message_id: Uuid,
     status: &str,
-    input: Value,
+    transcript: &[Value],
+    sources: &[Value],
+    events: Option<&AgentEventSink>,
     round: usize,
-    source_count: Option<usize>,
-    detail: Option<&str>,
+    error_message: Option<&str>,
+    stage: &str,
 ) {
-    agent_events::emit(events, id, name, status, input, round, source_count, detail);
+    let history = events.map(|sink| sink.history()).unwrap_or_default();
+    if let Err(checkpoint_error) = save_agent_run(
+        state,
+        conversation_id,
+        user_message_id,
+        status,
+        transcript,
+        sources,
+        &history,
+        round,
+        error_message,
+    )
+    .await
+    {
+        warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, stage, "could not save agent checkpoint");
+    }
 }
 
 pub(super) async fn run_web_agent(
@@ -43,29 +63,23 @@ pub(super) async fn run_web_agent(
 
     let max_rounds = tool_rounds.map(usize::from);
     let mut round = 0usize;
-    if let Err(checkpoint_error) = save_agent_run(
+    checkpoint(
         state,
         conversation_id,
         user_message_id,
         "running",
         &transcript,
         &sources,
-        &events
-            .as_ref()
-            .map(|sink| sink.history())
-            .unwrap_or_default(),
+        events,
         round,
         None,
-    )
-    .await
-    {
-        warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save initial agent checkpoint");
-    }
+        "could not save initial agent checkpoint",
+    ).await;
     loop {
         if max_rounds.is_some_and(|limit| round >= limit) {
             break;
         }
-        emit_tool_event(
+        agent_events::emit(
             events,
             format!("plan-{round}"),
             "planning",
@@ -89,7 +103,7 @@ pub(super) async fn run_web_agent(
         {
             Ok(turn) => turn,
             Err(error) if error.code == "provider_tool_unsupported" => {
-                emit_tool_event(
+                agent_events::emit(
                     events,
                     format!("plan-{round}"),
                     "planning",
@@ -121,7 +135,7 @@ pub(super) async fn run_web_agent(
                 });
             }
             Err(error) => {
-                emit_tool_event(
+                agent_events::emit(
                     events,
                     format!("plan-{round}"),
                     "planning",
@@ -131,28 +145,22 @@ pub(super) async fn run_web_agent(
                     None,
                     Some(&error.message),
                 );
-                if let Err(checkpoint_error) = save_agent_run(
-                    state,
-                    conversation_id,
-                    user_message_id,
-                    "failed",
-                    &transcript,
-                    &sources,
-                    &events
-                        .as_ref()
-                        .map(|sink| sink.history())
-                        .unwrap_or_default(),
-                    round,
-                    Some(&error.message),
-                )
-                .await
-                {
-                    warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save failed agent checkpoint");
-                }
+                checkpoint(
+        state,
+        conversation_id,
+        user_message_id,
+        "failed",
+        &transcript,
+        &sources,
+        events,
+        round,
+        Some(&error.message),
+        "could not save failed agent checkpoint",
+    ).await;
                 return Err(error);
             }
         };
-        emit_tool_event(
+        agent_events::emit(
             events,
             format!("plan-{round}"),
             "planning",
@@ -189,7 +197,7 @@ pub(super) async fn run_web_agent(
         let mut anthropic_results = Vec::new();
         for (index, call) in turn.tool_calls.iter().enumerate() {
             let input = call.input.clone();
-            emit_tool_event(
+            agent_events::emit(
                 events,
                 &call.id,
                 &call.name,
@@ -209,7 +217,7 @@ pub(super) async fn run_web_agent(
                 .ok()
                 .map(|value| value.chars().take(1200).collect::<String>());
             let source_count = result["results"].as_array().map(Vec::len);
-            emit_tool_event(
+            agent_events::emit(
                 events,
                 &call.id,
                 &call.name,
@@ -232,28 +240,23 @@ pub(super) async fn run_web_agent(
         if kind == "anthropic" && !anthropic_results.is_empty() {
             transcript.push(json!({"role":"user","content":anthropic_results}));
         }
-        if let Err(checkpoint_error) = save_agent_run(
+        checkpoint(
             state,
             conversation_id,
             user_message_id,
             "running",
             &transcript,
             &sources,
-            &events
-                .as_ref()
-                .map(|sink| sink.history())
-                .unwrap_or_default(),
+            events,
             round + 1,
             None,
+            "after tool round",
         )
-        .await
-        {
-            warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save agent checkpoint after tool round");
-        }
+        .await;
         round += 1;
     }
 
-    emit_tool_event(
+    agent_events::emit(
         events,
         "draft",
         "drafting",
@@ -280,7 +283,7 @@ pub(super) async fn run_web_agent(
     let draft = match draft {
         Ok(draft) => draft,
         Err(error) => {
-            emit_tool_event(
+            agent_events::emit(
                 events,
                 "draft",
                 "drafting",
@@ -290,30 +293,24 @@ pub(super) async fn run_web_agent(
                 None,
                 Some(&error.message),
             );
-            if let Err(checkpoint_error) = save_agent_run(
-                state,
-                conversation_id,
-                user_message_id,
-                "failed",
-                &transcript,
-                &sources,
-                &events
-                    .as_ref()
-                    .map(|sink| sink.history())
-                    .unwrap_or_default(),
-                round,
-                Some(&error.message),
-            )
-            .await
-            {
-                warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save drafting failure checkpoint");
-            }
+            checkpoint(
+        state,
+        conversation_id,
+        user_message_id,
+        "failed",
+        &transcript,
+        &sources,
+        events,
+        round,
+        Some(&error.message),
+        "could not save drafting failure checkpoint",
+    ).await;
             return Err(error);
         }
     };
     let (answer, inline_reasoning) = split_thinking(&draft.text);
     let reasoning = format!("{}{}", draft.reasoning, inline_reasoning);
-    emit_tool_event(
+    agent_events::emit(
         events,
         "draft",
         "drafting",
@@ -323,24 +320,18 @@ pub(super) async fn run_web_agent(
         None,
         None,
     );
-    if let Err(checkpoint_error) = save_agent_run(
+    checkpoint(
         state,
         conversation_id,
         user_message_id,
         "completed",
         &transcript,
         &sources,
-        &events
-            .as_ref()
-            .map(|sink| sink.history())
-            .unwrap_or_default(),
+        events,
         round,
         None,
-    )
-    .await
-    {
-        warn!(conversation_id=%conversation_id, error=%checkpoint_error.message, "could not save completed agent checkpoint");
-    }
+        "could not save completed agent checkpoint",
+    ).await;
     Ok(WebAgentAnswer {
         answer,
         reasoning,
