@@ -637,18 +637,23 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         error,
         incomplete,
     };
-    // A gateway can fail the turn inside the stream while still answering 200, and it
-    // reports that several ways: a bare `error`, a nested `response.error`, or a
-    // `response` whose status is `failed`.
-    let nested = value.get("response").filter(|response| {
-        response.get("error").is_some() || response["status"].as_str() == Some("failed")
-    });
-    if value.get("error").is_some() || nested.is_some() {
-        let source = nested.unwrap_or(&value);
-        let detail = upstream_detail(&source.to_string());
-        if !detail.is_empty() {
-            return Some(fragment(Some(detail), None));
-        }
+    // A gateway can fail the turn inside the stream while still answering 200: a bare
+    // `error`, a nested `response.error`, or a `response` whose status is `failed`. A JSON
+    // `null` counts as absent, because every lifecycle frame carries `"error": null` and
+    // reading that as a failure aborts the stream before a single token arrives.
+    let failure = value
+        .get("error")
+        .or_else(|| value.get("response").and_then(|response| response.get("error")))
+        .filter(|error| !error.is_null());
+    if failure.is_some() || value["response"]["status"].as_str() == Some("failed") {
+        let detail = failure
+            .map(|error| match error.as_str() {
+                Some(text) => text.to_string(),
+                None => upstream_detail(&error.to_string()),
+            })
+            .filter(|detail| !detail.is_empty())
+            .unwrap_or_else(|| "the provider marked the response as failed".into());
+        return Some(fragment(Some(detail), None));
     }
     if let Some(reason) = value["response"]["incomplete_details"]["reason"]
         .as_str()

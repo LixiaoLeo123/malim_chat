@@ -483,6 +483,17 @@ mod tests {
         .expect("incomplete should surface");
         assert_eq!(incomplete.error, None);
         assert_eq!(incomplete.incomplete.as_deref(), Some("max_output_tokens"));
+
+        // Lifecycle frames serialize their empty fields as JSON null, so `"error": null`
+        // must read as "no error" — reading it as one kills the turn before any text.
+        let created = provider_stream_delta(
+            "openai_responses",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_3\",\"status\":\"in_progress\",\"error\":null,\"incomplete_details\":null}}",
+        )
+        .expect("the stored response id is still worth keeping");
+        assert_eq!(created.error, None);
+        assert_eq!(created.incomplete, None);
+        assert_eq!(created.response_id.as_deref(), Some("resp_3"));
     }
 
     #[test]
