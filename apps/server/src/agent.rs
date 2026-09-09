@@ -339,3 +339,48 @@ pub(super) async fn run_web_agent(
         sources,
     })
 }
+
+// --- stored runs: the checkpoint a retry resumes from ---------------------------
+pub(crate) async fn load_failed_agent_run(
+    state: &AppState,
+    conversation_id: Uuid,
+    user_message_id: Uuid,
+) -> Result<Option<(Vec<Value>, Vec<Value>, Vec<Value>, i32)>, ApiError> {
+    sqlx::query_as("SELECT transcript,sources,events,round FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 AND status='failed' ORDER BY updated_at DESC LIMIT 1")
+        .bind(conversation_id).bind(user_message_id).fetch_optional(&state.db).await.map_err(ApiError::from)
+}
+
+pub(crate) async fn agent_run_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((conversation_id, message_id)): Path<(Uuid, Uuid)>,
+) -> Result<Json<Value>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    own_conversation(&state.db, user_id, conversation_id).await?;
+    let run: Option<(String, Value, Value, Value, i32, Option<String>)> = sqlx::query_as("SELECT status,events,sources,transcript,round,error_message FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 ORDER BY updated_at DESC LIMIT 1")
+        .bind(conversation_id).bind(message_id).fetch_optional(&state.db).await?;
+    let Some((status, events, sources, transcript, round, error_message)) = run else {
+        return Err(ApiError::not_found());
+    };
+    Ok(Json(
+        json!({"status":status,"events":events,"sources":sources,"transcript":transcript,"round":round,"error_message":error_message}),
+    ))
+}
+
+pub(crate) async fn save_agent_run(
+    state: &AppState,
+    conversation_id: Uuid,
+    user_message_id: Uuid,
+    status: &str,
+    transcript: &[Value],
+    sources: &[Value],
+    events: &[Value],
+    round: usize,
+    error_message: Option<&str>,
+) -> Result<(), ApiError> {
+    sqlx::query("INSERT INTO agent_runs (id,conversation_id,user_message_id,status,transcript,sources,events,round,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (user_message_id) WHERE status IN ('running','failed') DO UPDATE SET status=EXCLUDED.status,transcript=EXCLUDED.transcript,sources=EXCLUDED.sources,events=EXCLUDED.events,round=EXCLUDED.round,error_message=EXCLUDED.error_message,updated_at=now()")
+        .bind(Uuid::new_v4()).bind(conversation_id).bind(user_message_id).bind(status).bind(json!(transcript)).bind(json!(sources)).bind(json!(events)).bind(round as i32).bind(error_message).execute(&state.db).await.map_err(|error| {
+            if error.as_database_error().and_then(|db| db.code()).as_deref() == Some("23505") { ApiError::conflict("This conversation already has an active agent run.") } else { ApiError::from(error) }
+        })?;
+    Ok(())
+}

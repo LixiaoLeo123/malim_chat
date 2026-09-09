@@ -41,35 +41,42 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 mod agent;
-mod provider_config;
-mod conversation;
-mod respond;
-mod compaction;
-mod stream;
 mod agent_events;
 mod auth;
+mod compaction;
 mod content;
+mod conversation;
 mod dictionary;
+mod models;
+mod provider_config;
 mod providers;
+mod respond;
+mod stream;
 mod thinking;
+mod web_tools;
 
+use agent::agent_run_events;
 use auth::{decrypt, encrypt, login, refresh, signup, user_from_headers};
 use compaction::{auto_compact, compact};
+use content::{content_part, estimate_image_tokens, estimate_tokens, parse_data_url};
+use conversation::{
+    create_conversation, create_message, delete_conversation, delete_message, list_conversations,
+    list_messages, update_conversation, update_message,
+};
+use models::{
+    Conversation, CreateConversation, CreateMessage, GenerationSettings, Message, Page, PageQuery,
+    Provider, ProviderModel, ProviderModelRequest, ProviderRequest, ProviderRow, RespondRequest,
+    UpdateConversation, UpdateMessage, UpdateProviderModelRequest, UpdateProviderRequest,
+};
 use provider_config::{
     create_provider, create_provider_model, configured_model, delete_provider,
     delete_provider_model, list_providers, own_provider, provider_first_model,
     provider_model_chain_enabled, provider_model_kind, provider_model_supports_images,
     update_provider, update_provider_model,
 };
-use conversation::{
-    create_conversation, create_message, delete_conversation, delete_message, list_conversations,
-    list_messages, update_conversation, update_message,
-};
 use respond::{clear_chain, respond};
 use stream::{stream_response, stream_web_agent_response};
-use content::{content_part, estimate_image_tokens, estimate_tokens, parse_data_url};
 use thinking::{split_thinking, strip_thinking, ThinkingStream};
-mod web_tools;
 
 const ACCESS_TOKEN_MINUTES: i64 = 15;
 const REFRESH_TOKEN_DAYS: i64 = 30;
@@ -271,236 +278,6 @@ impl From<reqwest::Error> for ApiError {
         error!(%error, "upstream provider failure");
         Self::provider_unavailable()
     }
-}
-
-#[derive(Debug, Serialize)]
-struct Provider {
-    id: Uuid,
-    name: String,
-    kind: String,
-    base_url: String,
-    default_model: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-    models: Vec<ProviderModel>,
-}
-
-#[derive(Debug, FromRow)]
-struct ProviderRow {
-    id: Uuid,
-    name: String,
-    kind: String,
-    base_url: String,
-    default_model: String,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-struct ProviderModel {
-    id: Uuid,
-    provider_id: Uuid,
-    group_name: String,
-    model: String,
-    kind: String,
-    sort_order: i32,
-    context_window: i32,
-    supports_images: bool,
-    chain_context: bool,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-struct Conversation {
-    id: Uuid,
-    title: String,
-    model_provider_id: Option<Uuid>,
-    model: Option<String>,
-    context_window: i32,
-    context_tokens: i32,
-    is_favorite: bool,
-    generation_settings: Value,
-    revision: i64,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Serialize, FromRow)]
-struct Message {
-    id: Uuid,
-    conversation_id: Uuid,
-    sequence: i64,
-    client_mutation_id: Option<Uuid>,
-    role: String,
-    content: String,
-    reasoning_content: String,
-    content_format: String,
-    status: String,
-    model: Option<String>,
-    token_count: i32,
-    search_sources: Value,
-    images: Value,
-    edited_at: Option<DateTime<Utc>>,
-    created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
-}
-
-#[derive(Deserialize)]
-struct PageQuery {
-    cursor: Option<String>,
-    limit: Option<i64>,
-}
-
-#[derive(Serialize)]
-struct Page<T> {
-    items: Vec<T>,
-    next_cursor: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct CreateConversation {
-    title: Option<String>,
-    provider_id: Option<Uuid>,
-    model: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UpdateConversation {
-    title: Option<String>,
-    archived: Option<bool>,
-    provider_id: Option<Uuid>,
-    model: Option<String>,
-    generation_settings: Option<GenerationSettings>,
-    is_favorite: Option<bool>,
-}
-
-#[derive(Deserialize, Serialize)]
-struct GenerationSettings {
-    temperature: f32,
-    reasoning_effort: String,
-    enable_markdown: bool,
-    stream: bool,
-    #[serde(default = "default_context_rounds")]
-    context_rounds: Option<u8>,
-    #[serde(default = "default_tool_rounds")]
-    tool_rounds: Option<u8>,
-}
-
-fn default_context_rounds() -> Option<u8> {
-    Some(8)
-}
-
-fn default_tool_rounds() -> Option<u8> {
-    Some(DEFAULT_WEB_TOOL_ROUNDS as u8)
-}
-
-#[derive(Deserialize)]
-struct ProviderRequest {
-    name: String,
-    kind: Option<String>,
-    base_url: String,
-    api_key: String,
-    default_model: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct UpdateProviderRequest {
-    name: Option<String>,
-    kind: Option<String>,
-    base_url: Option<String>,
-    api_key: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct ProviderModelRequest {
-    group_name: String,
-    model: String,
-    kind: String,
-    sort_order: Option<i32>,
-    context_window: Option<i32>,
-    supports_images: Option<bool>,
-    chain_context: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct UpdateProviderModelRequest {
-    group_name: Option<String>,
-    model: Option<String>,
-    kind: Option<String>,
-    sort_order: Option<i32>,
-    context_window: Option<i32>,
-    supports_images: Option<bool>,
-    chain_context: Option<bool>,
-}
-
-#[derive(Deserialize)]
-struct CreateMessage {
-    content: String,
-    client_mutation_id: Uuid,
-    search: Option<bool>,
-    images: Option<Vec<String>>,
-}
-
-#[derive(Deserialize)]
-struct UpdateMessage {
-    content: String,
-}
-
-#[derive(Deserialize)]
-struct RespondRequest {
-    message_id: Uuid,
-    search: Option<bool>,
-    temperature: Option<f32>,
-    reasoning_effort: Option<String>,
-    enable_markdown: Option<bool>,
-    stream: Option<bool>,
-    context_rounds: Option<Option<u8>>,
-    tool_rounds: Option<Option<u8>>,
-}
-
-async fn load_failed_agent_run(
-    state: &AppState,
-    conversation_id: Uuid,
-    user_message_id: Uuid,
-) -> Result<Option<(Vec<Value>, Vec<Value>, Vec<Value>, i32)>, ApiError> {
-    sqlx::query_as("SELECT transcript,sources,events,round FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 AND status='failed' ORDER BY updated_at DESC LIMIT 1")
-        .bind(conversation_id).bind(user_message_id).fetch_optional(&state.db).await.map_err(ApiError::from)
-}
-
-async fn agent_run_events(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path((conversation_id, message_id)): Path<(Uuid, Uuid)>,
-) -> Result<Json<Value>, ApiError> {
-    let user_id = user_from_headers(&state, &headers)?;
-    own_conversation(&state.db, user_id, conversation_id).await?;
-    let run: Option<(String, Value, Value, Value, i32, Option<String>)> = sqlx::query_as("SELECT status,events,sources,transcript,round,error_message FROM agent_runs WHERE conversation_id=$1 AND user_message_id=$2 ORDER BY updated_at DESC LIMIT 1")
-        .bind(conversation_id).bind(message_id).fetch_optional(&state.db).await?;
-    let Some((status, events, sources, transcript, round, error_message)) = run else {
-        return Err(ApiError::not_found());
-    };
-    Ok(Json(
-        json!({"status":status,"events":events,"sources":sources,"transcript":transcript,"round":round,"error_message":error_message}),
-    ))
-}
-
-async fn save_agent_run(
-    state: &AppState,
-    conversation_id: Uuid,
-    user_message_id: Uuid,
-    status: &str,
-    transcript: &[Value],
-    sources: &[Value],
-    events: &[Value],
-    round: usize,
-    error_message: Option<&str>,
-) -> Result<(), ApiError> {
-    sqlx::query("INSERT INTO agent_runs (id,conversation_id,user_message_id,status,transcript,sources,events,round,error_message) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (user_message_id) WHERE status IN ('running','failed') DO UPDATE SET status=EXCLUDED.status,transcript=EXCLUDED.transcript,sources=EXCLUDED.sources,events=EXCLUDED.events,round=EXCLUDED.round,error_message=EXCLUDED.error_message,updated_at=now()")
-        .bind(Uuid::new_v4()).bind(conversation_id).bind(user_message_id).bind(status).bind(json!(transcript)).bind(json!(sources)).bind(json!(events)).bind(round as i32).bind(error_message).execute(&state.db).await.map_err(|error| {
-            if error.as_database_error().and_then(|db| db.code()).as_deref() == Some("23505") { ApiError::conflict("This conversation already has an active agent run.") } else { ApiError::from(error) }
-        })?;
-    Ok(())
 }
 
 #[derive(Deserialize)]

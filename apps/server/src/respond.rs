@@ -1,4 +1,5 @@
 use super::*;
+use crate::agent::load_failed_agent_run;
 
 /// The turn pipeline: assemble what the provider sees, decide between the hosted
 /// search, the ReAct loop and a plain answer, then store the reply.
