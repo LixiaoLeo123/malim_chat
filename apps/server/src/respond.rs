@@ -102,14 +102,17 @@ pub(crate) async fn respond(
     let context_rounds = request.context_rounds.unwrap_or(None);
 let tool_rounds = request.tool_rounds.unwrap_or(None);
     let explicit_search = web_tools::content_requests_web_search(&input.content);
-    // Responses providers can run OpenAI's hosted tools on their own side, so the
-    // retrieved-evidence ReAct loop never applies to them: it speaks the Chat and Anthropic
-    // tool dialects only. Both switches are per model because a gateway implements any
-    // subset of the dialect and only the user knows which one their channel serves.
+    // Two dialects can run tools on their own side — OpenAI's on Responses, Anthropic's on
+    // Messages — and the retrieved-evidence ReAct loop is the third way, built for the Chat
+    // dialect. Only one applies per turn, and both switches are per model because a gateway
+    // implements any subset of a dialect and only the user knows what their channel serves.
+    // Responses cannot fall back to the ReAct loop, so an opted-out model there simply
+    // answers without searching.
     let responses_model = kind == "openai_responses";
-    let hosted_tools = responses_model
-        && provider_model_bool(&state.db, provider_id, &model, "hosted_tools", true).await?;
-    let search_requested = !responses_model && (request.search.unwrap_or(false) || explicit_search);
+    let hosted_tools = (responses_model || kind == "anthropic")
+        && provider_model_hosted_tools(&state.db, provider_id, &model).await?;
+    let search_requested =
+        !responses_model && !hosted_tools && (request.search.unwrap_or(false) || explicit_search);
     let tools = if hosted_tools {
         providers::Tools::Hosted
     } else if search_requested {
@@ -209,6 +212,17 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
         return Ok(Json(message).into_response());
     }
     if request.stream.unwrap_or(false) {
+        // A paused Anthropic tool turn is continued by re-issuing this request with the
+        // paused content appended, so keep what it takes to rebuild it.
+        let turn = (kind == "anthropic" && hosted_tools).then(|| {
+            Box::new(crate::stream::AnthropicTurn {
+                base: p.1.clone(),
+                key: api_key.clone(),
+                model: model.clone(),
+                messages: transcript.clone(),
+                temperature: request.temperature,
+            })
+        });
         let upstream = match providers::call_provider_stream(
             &state.http,
             &kind,
@@ -253,6 +267,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
             vec![],
             enable_markdown,
             kind,
+            turn,
         ));
     }
     let reply = match providers::call_provider(
@@ -299,7 +314,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
         &model,
         answer,
         reasoning,
-        &[],
+        &reply.sources,
         enable_markdown,
         reply.response_id.as_deref(),
     )

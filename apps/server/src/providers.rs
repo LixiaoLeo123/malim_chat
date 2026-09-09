@@ -20,8 +20,11 @@ impl RequestKind {
     }
 }
 
-/// Who does the searching: the ReAct loop hands the model our SearXNG functions, while
-/// Responses providers run OpenAI's hosted search on their side.
+/// Who does the work: `Retrieved` hands the model our SearXNG functions and runs the ReAct
+/// loop, `Hosted` declares the tools the provider executes on its own side — OpenAI's on
+/// the Responses endpoint, Anthropic's on Messages. Never both: our hosted `web_search`
+/// would collide with the client tool of the same name, and a turn that mixes the two
+/// leaves a server call suspended until the client result comes back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Tools {
     None,
@@ -37,6 +40,8 @@ pub(crate) struct Reply {
     pub(crate) reasoning: String,
     /// Responses ids can be referenced by the next turn; other dialects return none.
     pub(crate) response_id: Option<String>,
+    /// Pages a hosted search or fetch brought into the answer, for the citation list.
+    pub(crate) sources: Vec<Value>,
 }
 
 #[derive(Debug)]
@@ -84,6 +89,9 @@ pub(crate) async fn call_provider_with_tools(
             .ok_or_else(|| ApiError::bad("The provider returned an unexpected tool response."))?;
         let tool_calls = blocks
             .iter()
+            // Server tools report themselves the same way; their work is already done and
+            // answering them would strand the turn on a call we never made.
+            .filter(|block| block["type"] == "tool_use")
             .filter_map(|block| {
                 Some(ToolCall {
                     id: block["id"].as_str()?.to_string(),
@@ -97,7 +105,7 @@ pub(crate) async fn call_provider_with_tools(
             reply: Reply {
                 text,
                 reasoning,
-                response_id: None,
+                ..Default::default()
             },
             assistant_message: json!({ "role": "assistant", "content": blocks }),
             tool_calls,
@@ -128,7 +136,7 @@ pub(crate) async fn call_provider_with_tools(
         reply: Reply {
             text,
             reasoning,
-            response_id: None,
+            ..Default::default()
         },
         assistant_message: message,
         tool_calls,
@@ -169,16 +177,19 @@ pub(crate) async fn call_provider(
             })?,
             reasoning: responses_reasoning(&body).unwrap_or_default(),
             response_id: body["id"].as_str().map(str::to_string),
+            ..Default::default()
         },
         RequestKind::Anthropic => {
             let (text, reasoning) = anthropic_parts(&body);
             if text.is_empty() && reasoning.is_empty() {
                 return Err(invalid_provider_response());
             }
+            let blocks = body["content"].as_array().cloned().unwrap_or_default();
             Reply {
                 text,
                 reasoning,
-                response_id: None,
+                sources: hosted_sources(&blocks),
+                ..Default::default()
             }
         }
         RequestKind::OpenAiChat => {
@@ -195,7 +206,7 @@ pub(crate) async fn call_provider(
             Reply {
                 text,
                 reasoning,
-                response_id: None,
+                ..Default::default()
             }
         }
     })
@@ -228,13 +239,13 @@ pub(crate) async fn call_provider_stream(
 }
 
 /// A provider request, already shaped for its dialect.
-struct Outbound {
-    url: String,
-    body: Value,
-    anthropic: bool,
+pub(crate) struct Outbound {
+    pub(crate) url: String,
+    pub(crate) body: Value,
+    pub(crate) anthropic: bool,
 }
 
-fn build_request(
+pub(crate) fn build_request(
     kind: &str,
     base: &str,
     model: &str,
@@ -290,6 +301,9 @@ fn build_request(
                 .collect::<Vec<_>>());
             if !system.is_empty() {
                 body["system"] = json!(system);
+            }
+            if tools == Tools::Hosted {
+                body["tools"] = json!(anthropic_tools());
             }
             if tools == Tools::Retrieved {
                 body["tools"] = json!(web_tool_definitions("anthropic"));
@@ -542,8 +556,8 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
 }
 
 /// Hosted tools the Responses API runs on its own side: no call ever comes back to us, so
-/// these need no executor. Chat Completions and Anthropic providers have no equivalent,
-/// which is why those go through the ReAct loop with our SearXNG functions instead.
+/// these need no executor. Chat Completions has no equivalent, which is why that dialect
+/// goes through the ReAct loop with our SearXNG functions instead.
 ///
 /// `web_search_preview` rather than the newer `web_search` spelling: that keeps the tool
 /// name the gateway is known to accept, so a failure here points at `code_interpreter`.
@@ -552,6 +566,131 @@ fn responses_tools() -> Vec<Value> {
         json!({ "type": "web_search_preview" }),
         json!({ "type": "code_interpreter", "container": { "type": "auto" } }),
     ]
+}
+
+/// Tools Anthropic executes on its own side, so these need no executor either. Pinned to
+/// the versions that require no `anthropic-beta` header and no paired code-execution
+/// version: the `_20260209` web tools bring their own sandbox and reject an older
+/// `code_execution` in the same request. Search and fetch are capped so a single turn
+/// cannot spend the account's quota browsing on the user's behalf.
+fn anthropic_tools() -> Vec<Value> {
+    vec![
+        json!({ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }),
+        json!({
+            "type": "web_fetch_20250910",
+            "name": "web_fetch",
+            "max_uses": 5,
+            "citations": { "enabled": true },
+        }),
+        json!({ "type": "code_execution_20250825", "name": "code_execution" }),
+    ]
+}
+
+/// Pages a hosted search or fetch brought into the answer, in the shape the citation list
+/// already renders.
+pub(crate) fn hosted_sources(blocks: &[Value]) -> Vec<Value> {
+    blocks
+        .iter()
+        .flat_map(sources_from_block)
+        .filter(|source| source["url"].as_str().is_some_and(|url| url.starts_with("http")))
+        .collect()
+}
+
+fn sources_from_block(block: &Value) -> Vec<Value> {
+    match block["type"].as_str() {
+        Some("web_search_tool_result") => block["content"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(|item| {
+                json!({
+                    "title": item["title"].as_str().unwrap_or_default(),
+                    "url": item["url"].as_str().unwrap_or_default(),
+                    "content": item["page_age"].as_str().unwrap_or_default(),
+                    "engine": "Anthropic web_search",
+                })
+            })
+            .collect(),
+        Some("web_fetch_tool_result") => block["content"]["url"]
+            .as_str()
+            .map(|url| {
+                json!({
+                    "title": block["content"]["content"]["title"].as_str().unwrap_or(url),
+                    "url": url,
+                    "content": "",
+                    "engine": "Anthropic web_fetch",
+                })
+            })
+            .into_iter()
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One of Anthropic's hosted-tool blocks, in the timeline shape the ReAct loop already
+/// emits so the client renders it without a second path. A call and its result share the
+/// `srvtoolu_` id, so the row updates in place instead of doubling up.
+pub(crate) fn host_tool_activity(block: &Value) -> Option<Value> {
+    let kind = block["type"].as_str()?;
+    if kind == "server_tool_use" {
+        return Some(json!({
+            "id": block["id"],
+            "name": block["name"],
+            "status": "running",
+            "input": block["input"],
+        }));
+    }
+    let name = match kind {
+        "web_search_tool_result" => "web_search",
+        "web_fetch_tool_result" => "web_fetch",
+        "code_execution_tool_result"
+        | "bash_code_execution_tool_result"
+        | "text_editor_code_execution_tool_result" => "code_execution",
+        _ => return None,
+    };
+    Some(json!({
+        "id": block["tool_use_id"],
+        "name": name,
+        "status": if block["content"]["type"].as_str().is_some_and(|kind| kind.ends_with("_error")) {
+            "failed"
+        } else {
+            "completed"
+        },
+        "source_count": block["content"].as_array().map(Vec::len).unwrap_or_default(),
+        "detail": tool_result_detail(block),
+    }))
+}
+
+/// What a hosted call came back with, shortened to one line: the error code, the titles or
+/// URL it reached, or the program's output.
+fn tool_result_detail(block: &Value) -> String {
+    let content = &block["content"];
+    for field in ["error_code", "error_message"] {
+        if let Some(text) = content[field].as_str() {
+            return text.to_string();
+        }
+    }
+    if let Some(items) = content.as_array() {
+        let titles = items
+            .iter()
+            .filter_map(|item| item["title"].as_str())
+            .take(5)
+            .collect::<Vec<_>>()
+            .join("; ");
+        if !titles.is_empty() {
+            return titles;
+        }
+    }
+    if let Some(url) = content["url"].as_str() {
+        return url.to_string();
+    }
+    for field in ["stdout", "stderr"] {
+        if let Some(text) = content[field].as_str().filter(|text| !text.trim().is_empty()) {
+            return text.trim().chars().take(300).collect();
+        }
+    }
+    String::new()
 }
 
 fn responses_content(body: &Value) -> Option<String> {
@@ -604,8 +743,9 @@ fn openai_message_parts(message: &Value) -> (String, String) {
     )
 }
 
-/// One decoded frame from a provider stream.
-#[derive(Debug, PartialEq, Eq)]
+/// One decoded frame from a provider stream. Each frame carries one kind of news, so the
+/// sparse ones are built with `..Default::default()`.
+#[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct StreamFragment {
     pub(crate) reasoning: bool,
     pub(crate) text: String,
@@ -618,6 +758,15 @@ pub(crate) struct StreamFragment {
     pub(crate) error: Option<String>,
     /// Why a response ended without producing text: token limit, filtering, and so on.
     pub(crate) incomplete: Option<String>,
+    /// Anthropic reports its own tool calls and results as content blocks. The timeline
+    /// shows them because the stream goes quiet while a search runs, and quiet reads as a
+    /// stall.
+    pub(crate) activity: Option<Value>,
+    /// Pages those tools reached, for the citation list.
+    pub(crate) sources: Vec<Value>,
+    /// Anthropic paused inside its own tool loop: the turn continues by resending what we
+    /// have so far, unchanged.
+    pub(crate) paused: bool,
 }
 
 pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFragment> {
@@ -630,12 +779,9 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
     }
     let value: Value = serde_json::from_str(payload).ok()?;
     let fragment = |error: Option<String>, incomplete: Option<String>| StreamFragment {
-        reasoning: false,
-        text: String::new(),
-        part: None,
-        response_id: None,
         error,
         incomplete,
+        ..Default::default()
     };
     // A gateway can fail the turn inside the stream while still answering 200: a bare
     // `error`, a nested `response.error`, or a `response` whose status is `failed`. A JSON
@@ -674,7 +820,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                 text: value["delta"].as_str()?.to_string(),
                 part: None,
                 response_id,
-                error: None,                incomplete: None,
+                ..Default::default()
             },
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 StreamFragment {
@@ -690,7 +836,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                         format!("{output_index}:{index}")
                     }),
                     response_id,
-                    error: None,                incomplete: None,
+                    ..Default::default()
                 }
             }
             _ => StreamFragment {
@@ -698,7 +844,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                 text: String::new(),
                 part: None,
                 response_id,
-                error: None,                incomplete: None,
+                ..Default::default()
             },
         };
         if fragment.text.is_empty() && fragment.response_id.is_none() {
@@ -707,21 +853,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         return Some(fragment);
     }
     if kind == RequestKind::Anthropic {
-        return value["delta"]["text"].as_str().map(|text| StreamFragment {
-            reasoning: false,
-            text: text.to_string(),
-            part: None,
-            response_id: None,
-            error: None,                incomplete: None,
-        }).or_else(|| {
-            value["delta"]["thinking"].as_str().map(|text| StreamFragment {
-                reasoning: true,
-                text: text.to_string(),
-                part: None,
-                response_id: None,
-                error: None,                incomplete: None,
-            })
-        });
+        return crate::anthropic_stream::fragment(&value);
     }
     let delta = &value["choices"].as_array()?.first()?["delta"];
     let text = |reasoning: bool, value: &str| StreamFragment {
@@ -729,7 +861,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         text: value.to_string(),
         part: None,
         response_id: None,
-        error: None,                incomplete: None,
+        ..Default::default()
     };
     delta["content"]
         .as_str()

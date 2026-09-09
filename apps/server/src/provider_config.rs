@@ -191,6 +191,16 @@ pub(crate) async fn provider_model_bool(
     )
 }
 
+/// Whether this model should be sent the provider's own hosted tools. Per model because a
+/// gateway implements any subset of a dialect, and a rejected tool fails the whole turn.
+pub(crate) async fn provider_model_hosted_tools(
+    pool: &PgPool,
+    provider_id: Uuid,
+    model: &str,
+) -> Result<bool, ApiError> {
+    provider_model_bool(pool, provider_id, model, "hosted_tools", true).await
+}
+
 pub(crate) async fn provider_model_supports_images(
     pool: &PgPool,
     provider_id: Uuid,

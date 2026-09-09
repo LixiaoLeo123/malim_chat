@@ -42,6 +42,7 @@ use uuid::Uuid;
 
 mod agent;
 mod agent_events;
+mod anthropic_stream;
 mod auth;
 mod compaction;
 mod content;
@@ -71,8 +72,8 @@ use models::{
 use provider_config::{
     create_provider, create_provider_model, configured_model, delete_provider,
     delete_provider_model, list_providers, own_provider, provider_first_model,
-    provider_model_bool, provider_model_kind, provider_model_supports_images,
-    update_provider, update_provider_model,
+    provider_model_bool, provider_model_hosted_tools, provider_model_kind,
+    provider_model_supports_images, update_provider, update_provider_model,
 };
 use respond::{clear_chain, respond};
 use stream::{stream_response, stream_web_agent_response};
@@ -497,6 +498,120 @@ mod tests {
     }
 
     #[test]
+    fn shows_anthropic_hosted_tools_as_timeline_activity() {
+        let call = provider_stream_delta(
+            "anthropic",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}",
+        )
+        .expect("a hosted call is worth showing");
+        assert_eq!(call.activity.as_ref().unwrap()["id"], "srvtoolu_1");
+        assert_eq!(call.activity.as_ref().unwrap()["status"], "running");
+        assert!(call.sources.is_empty());
+
+        let result = provider_stream_delta(
+            "anthropic",
+            "data: {\"type\":\"content_block_start\",\"index\":2,\"content_block\":{\"type\":\"web_search_tool_result\",\"tool_use_id\":\"srvtoolu_1\",\"content\":[{\"type\":\"web_search_result\",\"title\":\"The Router\",\"url\":\"https://example.com/a\",\"page_age\":\"3 days ago\"}]}}",
+        )
+        .expect("a hosted result is worth showing");
+        // The same id updates the row the call opened instead of adding a second one.
+        assert_eq!(result.activity.as_ref().unwrap()["id"], "srvtoolu_1");
+        assert_eq!(result.activity.as_ref().unwrap()["status"], "completed");
+        assert_eq!(result.sources.len(), 1);
+        assert_eq!(result.sources[0]["url"], "https://example.com/a");
+
+        let paused = provider_stream_delta(
+            "anthropic",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"}}",
+        )
+        .expect("a pause is not an end");
+        assert!(paused.paused);
+        assert!(paused.text.is_empty());
+
+        let stopped = provider_stream_delta(
+            "anthropic",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"}}",
+        );
+        assert!(stopped.is_none(), "a finished turn has nothing to relay");
+    }
+
+    #[test]
+    fn sends_the_provider_the_tools_its_dialect_actually_defines() {
+        let hosted = crate::providers::build_request(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-sonnet-5",
+            &[crate::respond::instruction_message(true)],
+            None,
+            None,
+            crate::providers::Tools::Hosted,
+            false,
+            None,
+        );
+        let types = hosted.body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["type"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        // These exact strings are the API's, and the versions are the ones that need no
+        // beta header and no paired code-execution version.
+        assert_eq!(
+            types,
+            [
+                "web_search_20250305",
+                "web_fetch_20250910",
+                "code_execution_20250825"
+            ]
+        );
+        assert_eq!(hosted.body["messages"], serde_json::json!([]));
+        assert!(hosted.anthropic);
+
+        // A Chat endpoint has no hosted tools at all, so it must never be sent any.
+        let plain = crate::providers::build_request(
+            "openai_compatible",
+            "https://example.com/v1",
+            "glm-5.3",
+            &[crate::respond::instruction_message(true)],
+            None,
+            None,
+            crate::providers::Tools::Hosted,
+            false,
+            None,
+        );
+        assert!(plain.body.get("tools").is_none());
+    }
+
+    #[test]
+    fn rebuilds_a_paused_anthropic_message_to_send_back_unchanged() {
+        use crate::anthropic_stream::AnthropicMessage;
+        let mut message = AnthropicMessage::default();
+        for frame in [
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Searching\"}}",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\" now\"}}",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"server_tool_use\",\"id\":\"srvtoolu_1\",\"name\":\"web_search\",\"input\":{}}}",
+        ] {
+            message.apply(frame);
+        }
+        // A hosted call's input arrives in fragments and is only whole at the end.
+        let partial = serde_json::json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"query\":\"routers\"}"}});
+        message.apply(&format!("data: {partial}"));
+        for frame in [
+            "data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\"}}",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"pause_turn\"}}",
+        ] {
+            message.apply(frame);
+        }
+        assert!(message.paused());
+        let content = message.content();
+        assert_eq!(content[0]["text"], "Searching now");
+        assert_eq!(content[1]["input"]["query"], "routers");
+        assert_eq!(content[1]["name"], "web_search");
+        // `message_start` describes the envelope, not a block, so it must not become one.
+        assert_eq!(content.len(), 2);
+    }
+
+    #[test]
     fn keeps_responses_summary_parts_apart() {
         assert_eq!(
             provider_stream_delta(
@@ -509,7 +624,7 @@ mod tests {
                 part: Some("1:2".into()),
                 response_id: None,
                 error: None,
-                incomplete: None,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -523,7 +638,7 @@ mod tests {
                 part: Some("2:2".into()),
                 response_id: None,
                 error: None,
-                incomplete: None,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -537,7 +652,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
-                incomplete: None,
+                ..Default::default()
             })
         );
     }
@@ -555,7 +670,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
-                incomplete: None,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -569,7 +684,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
-                incomplete: None,
+                ..Default::default()
             })
         );
         assert_eq!(
@@ -580,7 +695,7 @@ mod tests {
                 part: None,
                 response_id: None,
                 error: None,
-                incomplete: None,
+                ..Default::default()
             })
         );
     }
