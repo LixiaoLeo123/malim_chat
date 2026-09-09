@@ -36,6 +36,16 @@ async function copyText(text: string) {
   }
 }
 
+/**
+ * A callback with a stable identity that always runs the latest closure. Replaces the
+ * `useCallback(fn, [deps])` wrappers, which kept the first render's closure alive.
+ */
+function useEvent<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn);
+  useLayoutEffect(() => { ref.current = fn; });
+  return useCallback((...args: A) => ref.current(...args), []);
+}
+
 function updateToolEvents(current: ToolActivity[], next?: ToolActivity) {
   if (!next) return current;
   const index = current.findIndex((item) => item.id === next.id);
@@ -84,8 +94,11 @@ function Auth({ onSession }: { onSession: (session: Session) => void }) {
 }
 
 function Chat() {
-  const state = useAppStore();
-  const { conversations, providers, activeId, messages, sidebarOpen, busy, error } = state;
+  const {
+    session, conversations, providers, activeId, messages, sidebarOpen, busy, error,
+    appendConversations, prependMessages, setProviders, setConversations, setActiveId,
+    setSidebarOpen, setBusy, setError, setMessages, upsertMessage, removeMessage,
+  } = useAppStore();
   const [providerOpen, setProviderOpen] = useState(false);
   const [searchEnabled, setSearchEnabled] = useState(false);
   const [lookup, setLookup] = useState<{ word: string; x: number; y: number } | null>(null);
@@ -104,8 +117,25 @@ function Chat() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const activeConversation = activeId ? conversations.find((item) => item.id === activeId) ?? null : null;
 
-  useEffect(() => { void bootstrap(); }, []);
-  useEffect(() => { if (activeId && !messages[activeId]) void loadMessages(activeId); }, [activeId]);
+  const bootstrap = useEvent(async () => {
+    try {
+      const [chats, configured] = await Promise.all([api.conversations(), api.providers()]);
+      setConversations(chats.items);
+      setConversationCursor(chats.next_cursor);
+      setProviders(configured);
+      if (!useAppStore.getState().activeId && chats.items[0]) setActiveId(chats.items[0].id);
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to load your workspace."); }
+  });
+  const loadMessages = useEvent(async (id: string) => {
+    try {
+      const page = await api.messages(id);
+      setMessages(id, page.items);
+      setMessageCursors((current) => ({ ...current, [id]: page.next_cursor }));
+    }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to load messages."); }
+  });
+  useEffect(() => { void bootstrap(); }, [bootstrap]);
+  useEffect(() => { if (activeId && !useAppStore.getState().messages[activeId]) void loadMessages(activeId); }, [activeId, loadMessages]);
   useEffect(() => {
     const media = window.matchMedia("(prefers-color-scheme: dark)");
     const apply = () => setTheme(media.matches ? "dark" : "light");
@@ -113,65 +143,51 @@ function Chat() {
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
   }, []);
-  useEffect(() => { if (activeConversation) setGeneration(activeConversation.generation_settings ?? defaultGeneration); }, [activeConversation?.id]);
+  useEffect(() => {
+    const conversation = useAppStore.getState().conversations.find((item) => item.id === activeId);
+    if (conversation) setGeneration(conversation.generation_settings ?? defaultGeneration);
+  }, [activeId]);
   useEffect(() => () => { Object.values(generationTimers.current).forEach((timer) => window.clearTimeout(timer)); }, []);
 
-  async function bootstrap() {
-    try {
-      const [chats, configured] = await Promise.all([api.conversations(), api.providers()]);
-      state.setConversations(chats.items);
-      setConversationCursor(chats.next_cursor);
-      state.setProviders(configured);
-      if (!useAppStore.getState().activeId && chats.items[0]) state.setActiveId(chats.items[0].id);
-    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load your workspace."); }
-  }
-  async function loadMessages(id: string) {
-    try {
-      const page = await api.messages(id);
-      state.setMessages(id, page.items);
-      setMessageCursors((current) => ({ ...current, [id]: page.next_cursor }));
-    }
-    catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load messages."); }
-  }
   const loadMoreConversations = useCallback(async function loadMoreConversations() {
     if (!conversationCursor || loadingConversations) return;
     setLoadingConversations(true);
     try {
       const page = await api.conversations(conversationCursor);
-      state.appendConversations(page.items);
+      appendConversations(page.items);
       setConversationCursor(page.next_cursor);
-    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load conversations."); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to load conversations."); }
     finally { setLoadingConversations(false); }
-  }, [conversationCursor, loadingConversations]);
+  }, [appendConversations, conversationCursor, loadingConversations, setError]);
   async function loadOlderMessages(id: string) {
     const cursor = messageCursors[id];
     if (!cursor || loadingOlder) return;
     setLoadingOlder(true);
     try {
       const page = await api.messages(id, cursor);
-      state.prependMessages(id, page.items);
+      prependMessages(id, page.items);
       setMessageCursors((current) => ({ ...current, [id]: page.next_cursor }));
-    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to load older messages."); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to load older messages."); }
     finally { setLoadingOlder(false); }
   }
   async function newChat() {
-    if (!providers.length) { setProviderOpen(true); state.setError("Add a provider before creating a chat."); return; }
+    if (!providers.length) { setProviderOpen(true); setError("Add a provider before creating a chat."); return; }
     try {
       const conversation = await api.createConversation({ provider_id: providers[0].id, model: providers[0].models[0]?.model ?? providers[0].default_model });
-      state.setConversations([conversation, ...useAppStore.getState().conversations]);
-      state.setMessages(conversation.id, []);
-      state.setActiveId(conversation.id);
+      setConversations([conversation, ...useAppStore.getState().conversations]);
+      setMessages(conversation.id, []);
+      setActiveId(conversation.id);
       setSidebarCollapsed(false);
-    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to create a conversation."); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to create a conversation."); }
   }
   async function changeModel(providerId: string, model: string) {
     if (!activeConversation || !model.trim()) return;
     setModelChanging(true);
     try {
       const updated = await api.updateConversation(activeConversation.id, { provider_id: providerId, model: model.trim() });
-      state.setConversations(useAppStore.getState().conversations.map((item) => item.id === updated.id ? updated : item));
+      setConversations(useAppStore.getState().conversations.map((item) => item.id === updated.id ? updated : item));
       setModelMenuOpen(false);
-    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to change the model."); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to change the model."); }
     finally { setModelChanging(false); }
   }
   function signOut() { setSession(null); }
@@ -182,9 +198,9 @@ function Chat() {
     if (!activeConversation) return;
     const conversationId = activeConversation.id;
     setGeneration(next);
-    state.setConversations(useAppStore.getState().conversations.map((conversation) => conversation.id === conversationId ? { ...conversation, generation_settings: next } : conversation));
+    setConversations(useAppStore.getState().conversations.map((conversation) => conversation.id === conversationId ? { ...conversation, generation_settings: next } : conversation));
     window.clearTimeout(generationTimers.current[conversationId]);
-    generationTimers.current[conversationId] = window.setTimeout(() => { void api.updateConversation(conversationId, { generation_settings: next }).catch((cause) => state.setError(cause instanceof Error ? cause.message : "Unable to save conversation parameters.")); }, 350);
+    generationTimers.current[conversationId] = window.setTimeout(() => { void api.updateConversation(conversationId, { generation_settings: next }).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to save conversation parameters.")); }, 350);
   }
   async function sendMessage(conversationId: string, content: string, search: boolean, options = generation, images: string[] = []) {
     const mutationId = uuid();
@@ -192,34 +208,34 @@ function Chat() {
     let sent: Message | null = null;
     let pendingId: string | null = null;
     const controller = options.stream ? beginStream() : null;
-    state.upsertMessage(conversationId, optimistic);
-    state.setBusy(true);
+    upsertMessage(conversationId, optimistic);
+    setBusy(true);
     try {
       sent = await api.createMessage(conversationId, content, mutationId, search, images);
-      state.upsertMessage(conversationId, sent);
+      upsertMessage(conversationId, sent);
       const list = useAppStore.getState().conversations;
       if (list[0]?.id !== conversationId) {
         const item = list.find((conversation) => conversation.id === conversationId);
-        if (item) state.setConversations([{ ...item, updated_at: now() }, ...list.filter((conversation) => conversation.id !== conversationId)]);
+        if (item) setConversations([{ ...item, updated_at: now() }, ...list.filter((conversation) => conversation.id !== conversationId)]);
       }
       pendingId = `assistant-${mutationId}`;
       const turn = await runTurn(conversationId, sent, options, search, pendingId, [], controller?.signal);
-      state.removeMessage(conversationId, pendingId);
-      state.upsertMessage(conversationId, { ...turn.answer, tool_events: turn.toolEvents });
+      removeMessage(conversationId, pendingId);
+      upsertMessage(conversationId, { ...turn.answer, tool_events: turn.toolEvents });
       const chats = await api.conversations();
-      state.setConversations(chats.items);
+      setConversations(chats.items);
       setConversationCursor(chats.next_cursor);
     } catch (cause) {
-      if (pendingId) state.removeMessage(conversationId, pendingId);
+      if (pendingId) removeMessage(conversationId, pendingId);
       if ((cause as Error)?.name === "AbortError") return;
-      state.upsertMessage(conversationId, { ...(sent ?? optimistic), status: "error", optimistic: !sent, updated_at: now() });
-      state.upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", images: [], reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true, retry_message_id: (sent ?? optimistic).id });
-      state.setError(cause instanceof Error ? cause.message : "Message delivery failed.");
-    } finally { state.setBusy(false); if (controller) endStream(); }
+      upsertMessage(conversationId, { ...(sent ?? optimistic), status: "error", optimistic: !sent, updated_at: now() });
+      upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", images: [], reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true, retry_message_id: (sent ?? optimistic).id });
+      setError(cause instanceof Error ? cause.message : "Message delivery failed.");
+    } finally { setBusy(false); if (controller) endStream(); }
   }
-  const handleEditMessage = useCallback(editMessage, [activeId]);
-  const handleDeleteMessage = useCallback(deleteMessage, [activeId]);
-  const handleRetryMessage = useCallback(retryMessage, [activeId, searchEnabled, generation]);
+  const handleEditMessage = useEvent(editMessage);
+  const handleDeleteMessage = useEvent(deleteMessage);
+  const handleRetryMessage = useEvent(retryMessage);
   /**
    * Streams one assistant turn over a user message: placeholder row, live tool and
    * reasoning events, then the server's final message. Shared by send and retry.
@@ -230,7 +246,7 @@ function Chat() {
     let toolEvents = seed;
     const sequence = base.sequence + 0.5;
     const render = () => ({ ...base, id: pendingId, sequence, client_mutation_id: null, role: "assistant" as const, content: streamedContent, images: [] as string[], reasoning_content: streamedReasoning, status: "streaming" as const, model: null, token_count: 0, search_sources: [], tool_events: toolEvents });
-    state.upsertMessage(conversationId, render());
+    upsertMessage(conversationId, render());
     const onEvent = (event: StreamEvent) => {
       if (event.type === "tool") toolEvents = updateToolEvents(toolEvents, event.tool);
       else if (event.type === "reasoning") {
@@ -240,7 +256,7 @@ function Chat() {
         const previous = toolEvents.find((item) => item.id === id);
         toolEvents = updateToolEvents(toolEvents, { id, name: "reasoning", status: "completed", round: event.round, detail: `${previous?.detail ?? ""}${delta}` });
       } else streamedContent += event.delta ?? "";
-      state.upsertMessage(conversationId, render());
+      upsertMessage(conversationId, render());
     };
     const answer = options.stream ? await api.respondStream(conversationId, base.id, search, options, onEvent, signal) : await api.respond(conversationId, base.id, search, options);
     return { answer, toolEvents };
@@ -248,74 +264,74 @@ function Chat() {
   async function retryMessage(message: Message) {
     if (!activeId) return;
     const target = message.retry_message_id ? (useAppStore.getState().messages[activeId]?.find((item) => item.id === message.retry_message_id) ?? message) : message;
-    if (message.retry_message_id) state.removeMessage(activeId, message.id);
+    if (message.retry_message_id) removeMessage(activeId, message.id);
     if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled, generation, target.images ?? []); return; }
     const pendingId = `retry-${target.id}`;
     let seed: ToolActivity[] = [];
     try { seed = (await api.agentRun(activeId, target.id)).events ?? []; } catch { /* no previous run */ }
-    state.upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
+    upsertMessage(activeId, { ...target, status: "pending", updated_at: now() });
     const controller = generation.stream ? beginStream() : null;
-    state.setBusy(true);
+    setBusy(true);
     try {
       const turn = await runTurn(activeId, target, generation, searchEnabled, pendingId, seed, controller?.signal);
-      state.removeMessage(activeId, pendingId);
-      state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() });
-      state.upsertMessage(activeId, { ...turn.answer, tool_events: turn.toolEvents });
+      removeMessage(activeId, pendingId);
+      upsertMessage(activeId, { ...target, status: "complete", updated_at: now() });
+      upsertMessage(activeId, { ...turn.answer, tool_events: turn.toolEvents });
     } catch (cause) {
-      state.removeMessage(activeId, pendingId);
-      if ((cause as Error)?.name === "AbortError") { state.upsertMessage(activeId, { ...target, status: "complete", updated_at: now() }); return; }
-      state.upsertMessage(activeId, { ...target, status: "error", updated_at: now() });
-      state.setError(cause instanceof Error ? cause.message : "Retry failed.");
-    } finally { state.setBusy(false); if (controller) endStream(); }
+      removeMessage(activeId, pendingId);
+      if ((cause as Error)?.name === "AbortError") { upsertMessage(activeId, { ...target, status: "complete", updated_at: now() }); return; }
+      upsertMessage(activeId, { ...target, status: "error", updated_at: now() });
+      setError(cause instanceof Error ? cause.message : "Retry failed.");
+    } finally { setBusy(false); if (controller) endStream(); }
   }
   async function editMessage(message: Message, content: string) {
     if (!activeId) return;
     const before = useAppStore.getState().messages[activeId] ?? [];
-    state.upsertMessage(activeId, { ...message, content });
+    upsertMessage(activeId, { ...message, content });
     try {
-      state.upsertMessage(activeId, await api.updateMessage(activeId, message.id, content));
+      upsertMessage(activeId, await api.updateMessage(activeId, message.id, content));
       const chats = await api.conversations();
-      state.setConversations(chats.items);
+      setConversations(chats.items);
       setConversationCursor(chats.next_cursor);
     }
-    catch (cause) { state.setMessages(activeId, before); state.setError(cause instanceof Error ? cause.message : "Could not edit message."); }
+    catch (cause) { setMessages(activeId, before); setError(cause instanceof Error ? cause.message : "Could not edit message."); }
   }
   async function deleteMessage(message: Message) {
     if (!activeId) return;
     const before = useAppStore.getState().messages[activeId] ?? [];
-    state.removeMessage(activeId, message.id);
+    removeMessage(activeId, message.id);
     if (message.optimistic || message.id.startsWith("local-") || message.id.startsWith("error-") || message.id.startsWith("assistant-") || message.id.startsWith("retry-")) return;
     try {
       await api.deleteMessage(activeId, message.id);
       const chats = await api.conversations();
-      state.setConversations(chats.items);
+      setConversations(chats.items);
       setConversationCursor(chats.next_cursor);
     }
-    catch (cause) { state.setMessages(activeId, before); state.setError(cause instanceof Error ? cause.message : "Could not delete message."); }
+    catch (cause) { setMessages(activeId, before); setError(cause instanceof Error ? cause.message : "Could not delete message."); }
   }
 
   const toggleFavorite = useCallback(async function toggleFavorite(id: string) {
     const before = useAppStore.getState().conversations;
     const item = before.find((conversation) => conversation.id === id);
     if (!item) return;
-    state.setConversations(before.map((conversation) => conversation.id === id ? { ...conversation, is_favorite: !conversation.is_favorite } : conversation));
-    try { const updated = await api.updateConversation(id, { is_favorite: !item.is_favorite }); state.setConversations(useAppStore.getState().conversations.map((conversation) => conversation.id === id ? updated : conversation)); }
-    catch (cause) { state.setConversations(before); state.setError(cause instanceof Error ? cause.message : "Unable to update favorite."); }
-  }, []);
+    setConversations(before.map((conversation) => conversation.id === id ? { ...conversation, is_favorite: !conversation.is_favorite } : conversation));
+    try { const updated = await api.updateConversation(id, { is_favorite: !item.is_favorite }); setConversations(useAppStore.getState().conversations.map((conversation) => conversation.id === id ? updated : conversation)); }
+    catch (cause) { setConversations(before); setError(cause instanceof Error ? cause.message : "Unable to update favorite."); }
+  }, [setConversations, setError]);
   async function compactConversation() {
     if (!activeId || compacting) return;
     setCompacting(true);
     try {
       const result = await api.compact(activeId);
-      state.upsertMessage(activeId, result.message);
+      upsertMessage(activeId, result.message);
       const chats = await api.conversations();
-      state.setConversations(chats.items);
+      setConversations(chats.items);
       setConversationCursor(chats.next_cursor);
-    } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Compaction failed."); } finally { setCompacting(false); }
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Compaction failed."); } finally { setCompacting(false); }
   }
 
   const handleLookup = useCallback((word: string, anchor: { x: number; y: number }) => setLookup({ word, ...anchor }), []);
-  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={state.setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); state.setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { state.setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} hasMore={conversationCursor !== null} loadingMore={loadingConversations} onLoadMore={loadMoreConversations} onToggleFavorite={toggleFavorite} onSettings={() => setProviderOpen(true)} onClose={() => state.setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={state.session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => state.setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => state.setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => state.setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} hasOlder={Boolean(activeId && messageCursors[activeId])} loadingOlder={loadingOlder} onLoadOlder={loadOlderMessages} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} lookupActive={lookup !== null} streaming={streaming} onStop={stopStreaming} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content, images) => activeId ? sendMessage(activeId, content, searchEnabled, generation, images ?? []) : Promise.resolve()} onEdit={handleEditMessage} onDelete={handleDeleteMessage} onRetry={handleRetryMessage} onLookup={handleLookup} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { state.setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); setLookup(null); }} />}</main>;
+  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} hasMore={conversationCursor !== null} loadingMore={loadingConversations} onLoadMore={loadMoreConversations} onToggleFavorite={toggleFavorite} onSettings={() => setProviderOpen(true)} onClose={() => setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} hasOlder={Boolean(activeId && messageCursors[activeId])} loadingOlder={loadingOlder} onLoadOlder={loadOlderMessages} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} lookupActive={lookup !== null} streaming={streaming} onStop={stopStreaming} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content, images) => activeId ? sendMessage(activeId, content, searchEnabled, generation, images ?? []) : Promise.resolve()} onEdit={handleEditMessage} onDelete={handleDeleteMessage} onRetry={handleRetryMessage} onLookup={handleLookup} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); setLookup(null); }} />}</main>;
 }
 
 function useFlip(ref: { current: HTMLElement | null }, deps: unknown[]) {
@@ -338,6 +354,8 @@ function useFlip(ref: { current: HTMLElement | null }, deps: unknown[]) {
     previous.current = current;
     if (!moved.length) return;
     requestAnimationFrame(() => { moved.forEach((node) => { node.style.transition = "transform 300ms cubic-bezier(.2,.7,.2,1)"; node.style.transform = ""; }); const clear = (event: TransitionEvent) => { const target = event.target as HTMLElement; target.style.transition = ""; target.style.transform = ""; target.removeEventListener("transitionend", clear); }; moved.forEach((node) => node.addEventListener("transitionend", clear)); });
+    // The caller forwards its own dependency list, so the rule cannot check it statically.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, deps);
 }
 function ConversationRow({ conversation, active, onSelect, onRename, onToggleFavorite }: { conversation: Conversation; active: boolean; onSelect: (id: string) => void; onRename: (id: string, title: string) => Promise<void>; onToggleFavorite: (id: string) => void }) {
@@ -660,7 +678,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
   }
   function handleTouchEnd() { cancelLongPress(); }
   const selectionTimer = useRef<number | null>(null);
-  function onSelectionChange() {
+  const onSelectionChange = useEvent(() => {
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || !selection.toString().trim()) {
       if (selectionTimer.current !== null) { window.clearTimeout(selectionTimer.current); selectionTimer.current = null; }
@@ -679,8 +697,8 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
         captureSelection();
       }
     }, 200);
-  }
-  useEffect(() => { document.addEventListener("selectionchange", onSelectionChange); return () => { document.removeEventListener("selectionchange", onSelectionChange); if (selectionTimer.current !== null) window.clearTimeout(selectionTimer.current); }; }, []);
+  });
+  useEffect(() => { document.addEventListener("selectionchange", onSelectionChange); return () => { document.removeEventListener("selectionchange", onSelectionChange); if (selectionTimer.current !== null) window.clearTimeout(selectionTimer.current); }; }, [onSelectionChange]);
   async function copyContent() {
     try {
       await copyText(content);
