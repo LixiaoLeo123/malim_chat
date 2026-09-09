@@ -492,15 +492,11 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
 /// these need no executor. Chat Completions and Anthropic providers have no equivalent,
 /// which is why those go through the ReAct loop with our SearXNG functions instead.
 ///
-/// Only the tools whose results the pipeline can carry are listed. `file_search` needs a
-/// vector store we never upload to, `computer_use`/`local_shell`/`apply_patch` need an
-/// environment to act in, and `image_generation` returns a picture the transcript has no
-/// place for.
+/// Only tools the gateway is known to accept are listed. `code_interpreter` and the
+/// newer `web_search` spelling were tried: every Responses request carrying them came
+/// back as a stream with no text in it, so they are out until that is proven otherwise.
 fn responses_tools() -> Vec<Value> {
-    vec![
-        json!({ "type": "web_search" }),
-        json!({ "type": "code_interpreter", "container": { "type": "auto" } }),
-    ]
+    vec![json!({ "type": "web_search_preview" })]
 }
 
 fn responses_content(body: &Value) -> Option<String> {
@@ -563,6 +559,8 @@ pub(crate) struct StreamFragment {
     pub(crate) part: Option<String>,
     /// Responses ids arrive on the lifecycle frames, not the text deltas.
     pub(crate) response_id: Option<String>,
+    /// Gateways report failures inside the stream body while still answering 200.
+    pub(crate) error: Option<String>,
 }
 
 pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFragment> {
@@ -574,6 +572,18 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         return None;
     }
     let value: Value = serde_json::from_str(payload).ok()?;
+    if value.get("error").is_some() {
+        let detail = upstream_detail(payload);
+        if !detail.is_empty() {
+            return Some(StreamFragment {
+                reasoning: false,
+                text: String::new(),
+                part: None,
+                response_id: None,
+                error: Some(detail),
+            });
+        }
+    }
     let kind = RequestKind::parse(kind);
     if kind == RequestKind::OpenAiResponses {
         let response_id = value["response"]["id"]
@@ -587,6 +597,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                 text: value["delta"].as_str()?.to_string(),
                 part: None,
                 response_id,
+                error: None,
             },
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 StreamFragment {
@@ -602,6 +613,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                         format!("{output_index}:{index}")
                     }),
                     response_id,
+                    error: None,
                 }
             }
             _ => StreamFragment {
@@ -609,6 +621,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
                 text: String::new(),
                 part: None,
                 response_id,
+                error: None,
             },
         };
         if fragment.text.is_empty() && fragment.response_id.is_none() {
@@ -622,12 +635,14 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
             text: text.to_string(),
             part: None,
             response_id: None,
+            error: None,
         }).or_else(|| {
             value["delta"]["thinking"].as_str().map(|text| StreamFragment {
                 reasoning: true,
                 text: text.to_string(),
                 part: None,
                 response_id: None,
+                error: None,
             })
         });
     }
@@ -637,6 +652,7 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         text: value.to_string(),
         part: None,
         response_id: None,
+        error: None,
     };
     delta["content"]
         .as_str()

@@ -478,6 +478,7 @@ mod tests {
                 text: "**Modeling**".into(),
                 part: Some("1:2".into()),
                 response_id: None,
+                error: None,
             })
         );
         assert_eq!(
@@ -490,6 +491,7 @@ mod tests {
                 text: "**Again**".into(),
                 part: Some("2:2".into()),
                 response_id: None,
+                error: None,
             })
         );
         assert_eq!(
@@ -502,6 +504,7 @@ mod tests {
                 text: "hello".into(),
                 part: None,
                 response_id: None,
+                error: None,
             })
         );
     }
@@ -518,6 +521,7 @@ mod tests {
                 text: "hello".into(),
                 part: None,
                 response_id: None,
+                error: None,
             })
         );
         assert_eq!(
@@ -530,6 +534,7 @@ mod tests {
                 text: "plan".into(),
                 part: None,
                 response_id: None,
+                error: None,
             })
         );
         assert_eq!(
@@ -539,6 +544,7 @@ mod tests {
                 text: "plan".into(),
                 part: None,
                 response_id: None,
+                error: None,
             })
         );
     }
