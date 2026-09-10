@@ -301,3 +301,10 @@
 /* Streaming already reveals the answer progressively; re-animating when the streamed
    placeholder is swapped for the saved message reads as the reply jumping. */
 .message-list.stream-output .message.assistant { animation: none; }
+
+/* Android raises its selection toolbar from the same long press that opens the dictionary
+   popover, and the toolbar covers it. The app reads the word from the tap point instead of a
+   selection, so it turns selection off for text the lookup can act on — leaving the edit
+   box, the composer and every browser alone. */
+.no-native-selection .message-content,
+.no-native-selection .tool-step-copy { -webkit-user-select: none; user-select: none; }
