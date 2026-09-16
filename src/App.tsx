@@ -107,7 +107,7 @@ function Chat() {
     setSidebarOpen, setBusy, setError, setMessages, upsertMessage, removeMessage,
   } = useAppStore();
   const [providerOpen, setProviderOpen] = useState(false);
-  const [searchEnabled, setSearchEnabled] = useState(false);
+  const [searchEnabled, setSearchEnabled] = useState(() => localStorage.getItem("malim-search-enabled") === "1");
   const [lookup, setLookup] = useState<{ word: string; x: number; y: number } | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
@@ -150,6 +150,7 @@ function Chat() {
     media.addEventListener("change", apply);
     return () => media.removeEventListener("change", apply);
   }, []);
+  useEffect(() => { localStorage.setItem("malim-search-enabled", searchEnabled ? "1" : "0"); }, [searchEnabled]);
   useEffect(() => {
     const conversation = useAppStore.getState().conversations.find((item) => item.id === activeId);
     if (conversation) {
