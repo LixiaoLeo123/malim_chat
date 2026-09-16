@@ -60,7 +60,6 @@ pub(super) async fn run_web_agent(
 ) -> Result<WebAgentAnswer, ApiError> {
     transcript.insert(0, json!({"role":"system","content":"You are a web research agent. Before answering, use web_search with a concise, specific 3-12 word query derived from the user request. Never copy the full user message verbatim as the initial query. Refine the query when evidence is weak, and use open_web_page on important sources before relying on them. Do not invent tool results or citations. Give a direct answer only after gathering enough evidence, citing the supporting source URLs."}));
     let mut sources = initial_sources;
-    let mut allowed_urls = Vec::new();
 
     let max_rounds = tool_rounds.map(usize::from);
     let mut round = 0usize;
@@ -209,7 +208,7 @@ pub(super) async fn run_web_agent(
                 None,
             );
             let result = if index < 16 {
-                execute_web_tool(state, call, &mut sources, &mut allowed_urls).await
+                execute_web_tool(state, call, &mut sources).await
             } else {
                 json!({"error":"This tool-call batch exceeded the safety limit of sixteen calls. Continue using the results already returned."})
             };

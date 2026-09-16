@@ -1,6 +1,10 @@
 use super::*;
 use crate::providers::ToolCall;
 
+const MAX_REDIRECT_HOPS: usize = 5;
+const MAX_TEXT_CHARS: usize = 12_000;
+const TOTAL_FETCH_TIMEOUT_SECS: u64 = 20;
+
 pub(crate) fn is_valid_search_query(query: &str) -> bool {
     let normalized = query.trim();
     normalized.chars().count() >= 2 && normalized.chars().count() <= 180
@@ -102,19 +106,19 @@ pub(crate) fn web_tool_definitions(kind: &str) -> Value {
     });
     let open_schema = json!({
         "type": "object",
-        "properties": {"url": {"type": "string", "description": "An exact http(s) URL returned by web_search."}},
+        "properties": {"url": {"type": "string", "description": "An exact public http(s) URL to read: a web_search result, a link the user shared, or a link found on an opened page."}},
         "required": ["url"],
         "additionalProperties": false
     });
     if kind == "anthropic" {
         json!([
             {"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","input_schema":search_schema},
-            {"name":"open_web_page","description":"Read the text of an exact result URL returned by web_search. Use this to verify details before making consequential claims.","input_schema":open_schema}
+            {"name":"open_web_page","description":"Read the text of any public web page by exact URL: a web_search result, a link the user shared, or a link found on an opened page. Use it to verify details before making consequential claims.","input_schema":open_schema}
         ])
     } else {
         json!([
             {"type":"function","function":{"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","parameters":search_schema}},
-            {"type":"function","function":{"name":"open_web_page","description":"Read the text of an exact result URL returned by web_search. Use this to verify details before making consequential claims.","parameters":open_schema}}
+            {"type":"function","function":{"name":"open_web_page","description":"Read the text of any public web page by exact URL: a web_search result, a link the user shared, or a link found on an opened page. Use it to verify details before making consequential claims.","parameters":open_schema}}
         ])
     }
 }
@@ -255,50 +259,91 @@ fn html_to_text(html: &str) -> String {
         .collect()
 }
 
-async fn open_search_result(
-    state: &AppState,
-    url: &str,
-    allowed_urls: &[String],
-) -> Result<Value, String> {
-    if !allowed_urls.iter().any(|allowed| allowed == url)
-        || !is_safe_public_url(url)
-        || !resolves_to_public_addresses(url).await
-    {
-        return Err("The URL must be an exact public result returned by web_search.".into());
+// Resolve one hop: reject non-public targets and return the next URL to follow.
+pub(crate) fn resolve_next_url(base: &reqwest::Url, location: &str) -> Result<reqwest::Url, String> {
+    let next = base
+        .join(location)
+        .map_err(|_| "The page redirect target was not a valid URL.".to_string())?;
+    if !is_safe_public_url(next.as_str()) {
+        return Err("Only public http(s) websites can be opened.".to_string());
     }
-    let response = state
-        .web_reader
-        .get(url)
-        .header("Accept", "text/html, text/plain;q=0.9")
-        .send()
+    Ok(next)
+}
+
+async fn open_public_page(state: &AppState, url: &str) -> Result<Value, String> {
+    if !is_safe_public_url(url) || !resolves_to_public_addresses(url).await {
+        return Err("Only public http(s) websites can be opened.".to_string());
+    }
+    // Redirects are never followed automatically (web_reader uses Policy::none), so each hop
+    // is re-validated here: a public URL cannot bounce the server into a private address.
+    let deadline = tokio::time::Instant::now()
+        + std::time::Duration::from_secs(TOTAL_FETCH_TIMEOUT_SECS);
+    let mut current = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(_) => return Err("The page could not be retrieved.".to_string()),
+    };
+    let mut hops = 0usize;
+    let (final_url, content_type, body) = loop {
+        let sent = match tokio::time::timeout_at(
+            deadline,
+            state
+                .web_reader
+                .get(current.clone())
+                .header("Accept", "text/html, text/plain;q=0.9")
+                .header("User-Agent", "malim-chat-reader/1.0")
+                .send(),
+        )
         .await
-        .map_err(|_| "The page could not be retrieved.".to_string())?
-        .error_for_status()
-        .map_err(|_| "The page returned an error response.".to_string())?;
-    let content_type = response
-        .headers()
-        .get(http::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if !content_type.is_empty()
-        && !content_type.contains("text/")
-        && !content_type.contains("html")
-        && !content_type.contains("xml")
-    {
-        return Err("The result is not a readable text page.".into());
-    }
-    let mut bytes = Vec::new();
-    let mut body = response.bytes_stream();
-    while let Some(next) = body.next().await {
-        let chunk = next.map_err(|_| "The page could not be read.".to_string())?;
-        let remaining = 1_000_000usize.saturating_sub(bytes.len());
-        if remaining == 0 {
-            break;
+        {
+            Ok(Ok(sent)) => sent,
+            Ok(Err(_)) => return Err("The page could not be retrieved.".to_string()),
+            Err(_) => return Err("The page took too long to open.".to_string()),
+        };
+        let status = sent.status();
+        // Copy the small headers before buffering the body, which consumes the response.
+        let content_type = sent
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let location = sent
+            .headers()
+            .get(http::header::LOCATION)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let bytes = match tokio::time::timeout_at(deadline, sent.bytes()).await {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(_)) => return Err("The page could not be read.".to_string()),
+            Err(_) => return Err("The page took too long to open.".to_string()),
+        };
+        if status.is_redirection() {
+            if let Some(location) = location {
+                if hops >= MAX_REDIRECT_HOPS {
+                    return Err("The page redirected too many times.".to_string());
+                }
+                let next = resolve_next_url(&current, &location)?;
+                if next == current {
+                    return Err("The page redirected to itself.".to_string());
+                }
+                hops += 1;
+                current = next;
+                continue;
+            }
         }
-        bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-    }
-    let raw = String::from_utf8_lossy(&bytes);
+        if !status.is_success() {
+            return Err("The page returned an error response.".to_string());
+        }
+        if !content_type.is_empty()
+            && !content_type.contains("text/")
+            && !content_type.contains("html")
+            && !content_type.contains("xml")
+        {
+            return Err("The result is not a readable text page.".to_string());
+        }
+        break (current.clone(), content_type, bytes.to_vec());
+    };
+    let raw = String::from_utf8_lossy(&body);
     let content = if content_type.contains("html") || raw.contains("<html") {
         html_to_text(&raw)
     } else {
@@ -306,20 +351,19 @@ async fn open_search_result(
             .collect::<Vec<_>>()
             .join(" ")
             .chars()
-            .take(12_000)
+            .take(MAX_TEXT_CHARS)
             .collect()
     };
     if content.trim().is_empty() {
-        return Err("The page did not contain readable text.".into());
+        return Err("The page did not contain readable text.".to_string());
     }
-    Ok(json!({"url":url,"content":content}))
+    Ok(json!({"url": final_url.as_str().to_string(), "content": content}))
 }
 
 pub(crate) async fn execute_web_tool(
     state: &AppState,
     call: &ToolCall,
     sources: &mut Vec<Value>,
-    allowed_urls: &mut Vec<String>,
 ) -> Value {
     match call.name.as_str() {
         "web_search" => {
@@ -335,17 +379,6 @@ pub(crate) async fn execute_web_tool(
             match fetch_search(state, &query).await {
                 Ok(results) => {
                     add_search_sources(sources, &query, results);
-                    for result in sources.iter() {
-                        if result["query"] == query {
-                            if let Some(url) = result["url"].as_str() {
-                                if is_safe_public_url(url)
-                                    && !allowed_urls.iter().any(|allowed| allowed == url)
-                                {
-                                    allowed_urls.push(url.to_string());
-                                }
-                            }
-                        }
-                    }
                     let matching = sources
                         .iter()
                         .filter(|result| result["query"] == query)
@@ -358,13 +391,26 @@ pub(crate) async fn execute_web_tool(
         }
         "open_web_page" => {
             let url = call.input["url"].as_str().unwrap_or("");
-            match open_search_result(state, url, allowed_urls).await {
+            match open_public_page(state, url).await {
                 Ok(page) => {
-                    if let Some(source) = sources
-                        .iter_mut()
-                        .find(|source| source["url"] == page["url"])
+                    if let Some(source) =
+                        sources.iter_mut().find(|source| source["url"] == page["url"])
                     {
                         source["content"] = page["content"].clone();
+                    } else if let (Some(source_url), Some(content)) = (
+                        page["url"].as_str(),
+                        page["content"].as_str(),
+                    ) {
+                        let snippet: String = content.chars().take(900).collect();
+                        if !sources.iter().any(|source| source["url"] == source_url) {
+                            sources.push(json!({
+                                "url": source_url,
+                                "title": "",
+                                "content": snippet,
+                                "engine": "opened page",
+                            }));
+                            sources.truncate(MAX_WEB_SOURCES);
+                        }
                     }
                     page
                 }

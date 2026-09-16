@@ -751,6 +751,25 @@ mod tests {
     }
 
     #[test]
+    fn revalidates_open_web_page_redirect_targets() {
+        let base = reqwest::Url::parse("https://example.com/a").unwrap();
+        // Relative Location headers resolve against the current URL...
+        assert_eq!(
+            crate::web_tools::resolve_next_url(&base, "/b")
+                .unwrap()
+                .as_str(),
+            "https://example.com/b"
+        );
+        // ...absolute ones win, and any public http(s) target is now allowed, not only
+        // an exact web_search result.
+        assert!(crate::web_tools::resolve_next_url(&base, "https://other.test/page").is_ok());
+        // A public page must not be able to redirect the server into a private address.
+        assert!(crate::web_tools::resolve_next_url(&base, "http://127.0.0.1/admin").is_err());
+        assert!(crate::web_tools::resolve_next_url(&base, "http://169.254.169.254/").is_err());
+        assert!(crate::web_tools::resolve_next_url(&base, "file:///etc/passwd").is_err());
+    }
+
+    #[test]
     fn parses_image_data_urls() {
         assert_eq!(
             parse_data_url("data:image/png;base64,AAAA"),
