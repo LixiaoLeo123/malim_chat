@@ -64,20 +64,9 @@ pub(crate) async fn call_provider_with_tools(
     key: &str,
     model: &str,
     messages: &[Value],
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
+    sampling: &Sampling,
 ) -> Result<ToolTurn, ApiError> {
-    let request = build_request(
-        kind,
-        base,
-        model,
-        messages,
-        temperature,
-        reasoning_effort,
-        Tools::Retrieved,
-        false,
-        None,
-    );
+    let request = build_request(kind, base, model, messages, sampling, Tools::Retrieved, false, None);
     let body: Value = send(http, &request, key, true, false)
         .await?
         .json()
@@ -150,22 +139,11 @@ pub(crate) async fn call_provider(
     key: &str,
     model: &str,
     messages: &[Value],
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
+    sampling: &Sampling,
     tools: Tools,
     chain: Option<&str>,
 ) -> Result<Reply, ApiError> {
-    let request = build_request(
-        kind,
-        base,
-        model,
-        messages,
-        temperature,
-        reasoning_effort,
-        tools,
-        false,
-        chain,
-    );
+    let request = build_request(kind, base, model, messages, sampling, tools, false, chain);
     let body: Value = send(http, &request, key, false, chain.is_some())
         .await?
         .json()
@@ -219,22 +197,11 @@ pub(crate) async fn call_provider_stream(
     key: &str,
     model: &str,
     messages: &[Value],
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
+    sampling: &Sampling,
     tools: Tools,
     chain: Option<&str>,
 ) -> Result<reqwest::Response, ApiError> {
-    let request = build_request(
-        kind,
-        base,
-        model,
-        messages,
-        temperature,
-        reasoning_effort,
-        tools,
-        true,
-        chain,
-    );
+    let request = build_request(kind, base, model, messages, sampling, tools, true, chain);
     send(http, &request, key, false, chain.is_some()).await
 }
 
@@ -245,13 +212,35 @@ pub(crate) struct Outbound {
     pub(crate) anthropic: bool,
 }
 
+/// Every sampling knob a provider call can carry, as one value so each path —
+/// plain, streamed, agent loop, paused-turn rebuild — sends the identical set.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Sampling {
+    pub(crate) temperature: Option<f32>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) top_p: Option<f32>,
+    pub(crate) top_k: Option<u32>,
+    pub(crate) max_tokens: Option<u32>,
+}
+
+impl From<&crate::models::RespondRequest> for Sampling {
+    fn from(request: &crate::models::RespondRequest) -> Self {
+        Self {
+            temperature: request.temperature,
+            reasoning_effort: request.reasoning_effort.clone(),
+            top_p: request.top_p,
+            top_k: request.top_k,
+            max_tokens: request.max_tokens,
+        }
+    }
+}
+
 pub(crate) fn build_request(
     kind: &str,
     base: &str,
     model: &str,
     messages: &[Value],
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
+    sampling: &Sampling,
     tools: Tools,
     stream: bool,
     chain: Option<&str>,
@@ -259,8 +248,18 @@ pub(crate) fn build_request(
     let kind = RequestKind::parse(kind);
     let url = provider_url(kind, base);
     let mut body = json!({ "model": model });
-    if let Some(value) = temperature {
-        body["temperature"] = json!(value.clamp(0.0, 2.0));
+    // Anthropic's temperature stops at 1; the OpenAI dialects take up to 2. Clamping
+    // instead of rejecting keeps a value carried over from another model harmless.
+    if let Some(value) = sampling.temperature {
+        let capped = match kind {
+            RequestKind::Anthropic => value.clamp(0.0, 1.0),
+            _ => value.clamp(0.0, 2.0),
+        };
+        body["temperature"] = json!(capped);
+    }
+    // top_p is understood by all three dialects.
+    if let Some(value) = sampling.top_p {
+        body["top_p"] = json!(value.clamp(0.0, 1.0));
     }
     match kind {
         RequestKind::OpenAiResponses => {
@@ -271,9 +270,12 @@ pub(crate) fn build_request(
             if tools == Tools::Hosted {
                 body["tools"] = json!(responses_tools());
             }
-            if let Some(value) = reasoning_effort {
+            if let Some(value) = &sampling.reasoning_effort {
                 // Responses exposes no raw chain of thought; the summary is all there is.
                 body["reasoning"] = json!({"effort": value, "summary": "auto"});
+            }
+            if let Some(value) = sampling.max_tokens {
+                body["max_output_tokens"] = json!(value);
             }
             if stream {
                 body["stream"] = json!(true);
@@ -294,7 +296,8 @@ pub(crate) fn build_request(
                 .filter_map(|message| message["content"].as_str())
                 .collect::<Vec<_>>()
                 .join("\n\n");
-            body["max_tokens"] = json!(8192);
+            // The API requires max_tokens; 8192 is the fallback when the user sets none.
+            body["max_tokens"] = json!(sampling.max_tokens.unwrap_or(8192));
             body["messages"] = json!(messages
                 .iter()
                 .filter(|message| message["role"] != "system")
@@ -307,6 +310,12 @@ pub(crate) fn build_request(
             }
             if tools == Tools::Retrieved {
                 body["tools"] = json!(web_tool_definitions("anthropic"));
+            }
+            if let Some(value) = sampling.top_k {
+                body["top_k"] = json!(value);
+            }
+            if let Some(value) = &sampling.reasoning_effort {
+                body["effort"] = json!(value);
             }
             if stream {
                 body["stream"] = json!(true);
@@ -323,8 +332,11 @@ pub(crate) fn build_request(
             if tools == Tools::Retrieved {
                 body["tools"] = json!(web_tool_definitions("openai_compatible"));
             }
-            if let Some(value) = reasoning_effort {
+            if let Some(value) = &sampling.reasoning_effort {
                 body["reasoning_effort"] = json!(value);
+            }
+            if let Some(value) = sampling.max_tokens {
+                body["max_tokens"] = json!(value);
             }
             Outbound {
                 url,

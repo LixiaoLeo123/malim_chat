@@ -1,6 +1,6 @@
 use super::*;
 use crate::agent_events::{self, AgentEventSink};
-use crate::providers::{Tools, call_provider, call_provider_with_tools};
+use crate::providers::{Sampling, Tools, call_provider, call_provider_with_tools};
 use crate::thinking::split_thinking;
 use crate::web_tools::execute_web_tool;
 
@@ -50,8 +50,7 @@ pub(super) async fn run_web_agent(
     key: &str,
     model: &str,
     mut transcript: Vec<Value>,
-    temperature: Option<f32>,
-    reasoning_effort: Option<&str>,
+    sampling: &Sampling,
     events: Option<&AgentEventSink>,
     tool_rounds: Option<u8>,
     conversation_id: Uuid,
@@ -96,8 +95,7 @@ pub(super) async fn run_web_agent(
             key,
             model,
             &transcript,
-            temperature,
-            reasoning_effort,
+            sampling,
         )
         .await
         {
@@ -121,8 +119,7 @@ pub(super) async fn run_web_agent(
                     key,
                     model,
                     &transcript,
-                    temperature,
-                    reasoning_effort,
+                    sampling,
                     Tools::None,
                     None,
                 )
@@ -274,8 +271,7 @@ pub(super) async fn run_web_agent(
         key,
         model,
         &transcript,
-        temperature,
-        reasoning_effort,
+        sampling,
         Tools::None,
         None,
     )

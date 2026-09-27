@@ -74,6 +74,7 @@ pub(crate) async fn respond(
     Path(id): Path<Uuid>,
     Json(request): Json<RespondRequest>,
 ) -> Result<Response, ApiError> {
+    validate_respond_request(&request)?;
     let user_id = user_from_headers(&state, &headers)?;
     let conversation = own_conversation(&state.db, user_id, id).await?;
     let input:Message=sqlx::query_as("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE id=$1 AND conversation_id=$2 AND role='user' AND deleted_at IS NULL").bind(request.message_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
@@ -101,6 +102,7 @@ pub(crate) async fn respond(
         .unwrap_or(false);
     let context_rounds = request.context_rounds.unwrap_or(None);
 let tool_rounds = request.tool_rounds.unwrap_or(None);
+    let sampling = providers::Sampling::from(&request);
     let explicit_search = web_tools::content_requests_web_search(&input.content);
     // Two dialects can run tools on their own side — OpenAI's on Responses, Anthropic's on
     // Messages — and the retrieved-evidence ReAct loop is the third way, built for the Chat
@@ -174,8 +176,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
                 model,
                 transcript,
                 input.id,
-                request.temperature,
-                request.reasoning_effort,
+                sampling.clone(),
                 enable_markdown,
                 tool_rounds,
                 resumed_sources.clone(),
@@ -188,8 +189,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
             &api_key,
             &model,
             transcript,
-            request.temperature,
-            request.reasoning_effort.as_deref(),
+            &sampling,
             None,
             tool_rounds,
             id,
@@ -220,7 +220,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
                 key: api_key.clone(),
                 model: model.clone(),
                 messages: transcript.clone(),
-                temperature: request.temperature,
+                sampling: sampling.clone(),
             })
         });
         let upstream = match providers::call_provider_stream(
@@ -230,8 +230,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
             &api_key,
             &model,
             &transcript,
-            request.temperature,
-            request.reasoning_effort.as_deref(),
+            &sampling,
             tools,
             chain_id.as_deref(),
         )
@@ -249,8 +248,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
                     &api_key,
                     &model,
                     &transcript,
-                    request.temperature,
-                    request.reasoning_effort.as_deref(),
+                    &sampling,
                     tools,
                     None,
                 )
@@ -277,8 +275,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
         &api_key,
         &model,
         &transcript,
-        request.temperature,
-        request.reasoning_effort.as_deref(),
+        &sampling,
         tools,
         chain_id.as_deref(),
     )
@@ -296,8 +293,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
                 &api_key,
                 &model,
                 &transcript,
-                request.temperature,
-                request.reasoning_effort.as_deref(),
+                &sampling,
                 tools,
                 None,
             )

@@ -116,6 +116,14 @@ pub(crate) struct GenerationSettings {
     pub(crate) context_rounds: Option<u8>,
     #[serde(default = "default_tool_rounds")]
     pub(crate) tool_rounds: Option<u8>,
+    // Absent on rows written before these existed, and never written back for
+    // conversations that leave them unset — None means "provider default".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) top_p: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) top_k: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_tokens: Option<u32>,
 }
 
 pub(crate) fn default_context_rounds() -> Option<u8> {
@@ -190,4 +198,7 @@ pub(crate) struct RespondRequest {
     pub(crate) stream: Option<bool>,
     pub(crate) context_rounds: Option<Option<u8>>,
     pub(crate) tool_rounds: Option<Option<u8>>,
+    pub(crate) top_p: Option<f32>,
+    pub(crate) top_k: Option<u32>,
+    pub(crate) max_tokens: Option<u32>,
 }

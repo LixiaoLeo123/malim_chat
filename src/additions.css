@@ -308,3 +308,8 @@
    box, the composer and every browser alone. */
 .no-native-selection .message-content,
 .no-native-selection .tool-step-copy { -webkit-user-select: none; user-select: none; }
+
+/* The parameter list now runs to nine rows on a short viewport; scroll instead of growing
+   past the top of the screen. */
+.generation-popover { max-height: calc(100dvh - 190px); overflow-y: auto; }
+.generation-popover input[type=number] { width: 100%; box-sizing: border-box; }

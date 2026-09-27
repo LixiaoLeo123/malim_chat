@@ -312,7 +312,69 @@ fn validate_generation_settings(settings: GenerationSettings) -> Result<Value, A
             ));
         }
     }
+    if let Some(top_p) = settings.top_p {
+        if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) {
+            return Err(ApiError::bad("Top-p must be between 0 and 1."));
+        }
+    }
+    if let Some(top_k) = settings.top_k {
+        if !(1..=1000).contains(&top_k) {
+            return Err(ApiError::bad("Top-k must be between 1 and 1000."));
+        }
+    }
+    if let Some(max_tokens) = settings.max_tokens {
+        if !(1..=1_000_000).contains(&max_tokens) {
+            return Err(ApiError::bad("Max tokens must be between 1 and 1,000,000."));
+        }
+    }
     Ok(json!(settings))
+}
+
+/// /respond applies these per turn; same ranges as the PATCH validator so a bad
+/// client cannot push garbage to the provider.
+fn validate_respond_request(request: &RespondRequest) -> Result<(), ApiError> {
+    if let Some(temperature) = request.temperature {
+        if !temperature.is_finite() || !(0.0..=2.0).contains(&temperature) {
+            return Err(ApiError::bad("Temperature must be between 0 and 2."));
+        }
+    }
+    if let Some(effort) = &request.reasoning_effort {
+        if !matches!(effort.as_str(), "low" | "medium" | "high") {
+            return Err(ApiError::bad(
+                "Reasoning effort must be low, medium, or high.",
+            ));
+        }
+    }
+    if let Some(top_p) = request.top_p {
+        if !top_p.is_finite() || !(0.0..=1.0).contains(&top_p) {
+            return Err(ApiError::bad("Top-p must be between 0 and 1."));
+        }
+    }
+    if let Some(top_k) = request.top_k {
+        if !(1..=1000).contains(&top_k) {
+            return Err(ApiError::bad("Top-k must be between 1 and 1000."));
+        }
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        if !(1..=1_000_000).contains(&max_tokens) {
+            return Err(ApiError::bad("Max tokens must be between 1 and 1,000,000."));
+        }
+    }
+    if let Some(Some(rounds)) = request.context_rounds {
+        if rounds > 20 {
+            return Err(ApiError::bad(
+                "Context rounds must be between 0 and 20, or All.",
+            ));
+        }
+    }
+    if let Some(Some(rounds)) = request.tool_rounds {
+        if rounds == 0 || rounds > 20 {
+            return Err(ApiError::bad(
+                "Tool rounds must be between 1 and 20, or Unlimited.",
+            ));
+        }
+    }
+    Ok(())
 }
 
 async fn own_conversation(
@@ -442,6 +504,7 @@ mod tests {
         provider_error_from_response, provider_stream_delta, provider_url, RequestKind, StreamFragment,
     };
     use crate::web_tools::{is_safe_public_url, is_valid_search_query, web_tool_definitions};
+    use crate::{validate_generation_settings, validate_respond_request};
     use axum::http::StatusCode;
 
     #[test]
@@ -541,8 +604,7 @@ mod tests {
             "https://api.anthropic.com",
             "claude-sonnet-5",
             &[crate::respond::instruction_message(true)],
-            None,
-            None,
+            &Default::default(),
             crate::providers::Tools::Hosted,
             false,
             None,
@@ -571,8 +633,7 @@ mod tests {
             "https://api.openai.com/v1",
             "gpt-6-astra",
             &[crate::respond::instruction_message(true)],
-            None,
-            None,
+            &Default::default(),
             crate::providers::Tools::Hosted,
             false,
             None,
@@ -590,13 +651,270 @@ mod tests {
             "https://example.com/v1",
             "glm-5.3",
             &[crate::respond::instruction_message(true)],
-            None,
-            None,
+            &Default::default(),
             crate::providers::Tools::Hosted,
             false,
             None,
         );
         assert!(plain.body.get("tools").is_none());
+    }
+
+    #[test]
+    fn sends_anthropic_sampling_parameters_and_keeps_8192_as_fallback() {
+        use crate::providers::{Sampling, build_request};
+        let full = Sampling {
+            temperature: Some(1.7),
+            reasoning_effort: Some("high".into()),
+            top_p: Some(0.9),
+            top_k: Some(50),
+            max_tokens: Some(4096),
+        };
+        let body = &build_request(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            &[],
+            &full,
+            crate::providers::Tools::None,
+            false,
+            None,
+        )
+        .body;
+        // Anthropic's scale stops at 1, so a carried-over OpenAI value is capped.
+        assert_eq!(body["temperature"], 1.0);
+        assert_eq!(body["effort"], "high");
+        // f32 mantissa: 0.9 does not survive the trip through JSON exactly.
+        assert!((body["top_p"].as_f64().unwrap() - 0.9).abs() < 1e-6);
+        assert_eq!(body["top_k"], 50);
+        assert_eq!(body["max_tokens"], 4096);
+
+        // With nothing chosen, max_tokens is the API's required fallback and the
+        // optional keys are absent rather than sent as null.
+        let body = &build_request(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            &[],
+            &Sampling::default(),
+            crate::providers::Tools::None,
+            false,
+            None,
+        )
+        .body;
+        assert_eq!(body["max_tokens"], 8192);
+        assert!(body.get("effort").is_none());
+        assert!(body.get("top_p").is_none());
+        assert!(body.get("top_k").is_none());
+        assert!(body.get("temperature").is_none());
+    }
+
+    #[test]
+    fn maps_max_tokens_and_effort_per_dialect() {
+        use crate::providers::{Sampling, build_request};
+        let full = Sampling {
+            temperature: Some(1.7),
+            reasoning_effort: Some("medium".into()),
+            top_p: Some(0.8),
+            top_k: Some(40),
+            max_tokens: Some(4096),
+        };
+
+        let responses = &build_request(
+            "openai_responses",
+            "https://api.openai.com/v1",
+            "gpt-6-astra",
+            &[],
+            &full,
+            crate::providers::Tools::None,
+            false,
+            None,
+        )
+        .body;
+        assert_eq!(responses["max_output_tokens"], 4096);
+        assert_eq!(
+            responses["reasoning"],
+            serde_json::json!({"effort": "medium", "summary": "auto"})
+        );
+        // Only Anthropic clamps; the OpenAI dialects take the full 0..=2 range.
+        assert!((responses["temperature"].as_f64().unwrap() - 1.7).abs() < 1e-6);
+
+        let chat = &build_request(
+            "openai_compatible",
+            "https://example.com/v1",
+            "glm-5.3",
+            &[],
+            &full,
+            crate::providers::Tools::None,
+            false,
+            None,
+        )
+        .body;
+        assert_eq!(chat["max_tokens"], 4096);
+        assert_eq!(chat["reasoning_effort"], "medium");
+        // top_k is an Anthropic parameter; a value kept from an Anthropic model
+        // must not leak into another dialect.
+        assert!(chat.get("top_k").is_none());
+        assert!(chat.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn accepts_old_generation_settings_payloads_without_the_new_keys() {
+        let value = serde_json::json!({
+            "temperature": 0.7,
+            "reasoning_effort": "medium",
+            "enable_markdown": true,
+            "stream": true
+        });
+        let settings: crate::models::GenerationSettings =
+            serde_json::from_value(value).expect("the old PATCH shape must still parse");
+        assert_eq!(settings.top_p, None);
+        assert_eq!(settings.top_k, None);
+        assert_eq!(settings.max_tokens, None);
+        let round_tripped = serde_json::to_value(&settings).unwrap();
+        assert!(round_tripped.get("top_p").is_none());
+        assert!(round_tripped.get("top_k").is_none());
+        assert!(round_tripped.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn validates_the_new_parameter_ranges() {
+        use crate::models::GenerationSettings;
+        let base = || GenerationSettings {
+            temperature: 0.7,
+            reasoning_effort: "medium".into(),
+            enable_markdown: true,
+            stream: true,
+            context_rounds: None,
+            tool_rounds: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+        };
+        let valid = GenerationSettings {
+            temperature: 1.0,
+            reasoning_effort: "high".into(),
+            top_p: Some(1.0),
+            top_k: Some(1),
+            max_tokens: Some(1_000_000),
+            ..base()
+        };
+        assert!(validate_generation_settings(valid).is_ok());
+
+        let reject = |settings: GenerationSettings| {
+            validate_generation_settings(settings).unwrap_err().message
+        };
+        assert_eq!(
+            reject(GenerationSettings {
+                top_p: Some(1.5),
+                ..base()
+            }),
+            "Top-p must be between 0 and 1."
+        );
+        assert_eq!(
+            reject(GenerationSettings {
+                top_k: Some(0),
+                ..base()
+            }),
+            "Top-k must be between 1 and 1000."
+        );
+        assert_eq!(
+            reject(GenerationSettings {
+                top_k: Some(1001),
+                ..base()
+            }),
+            "Top-k must be between 1 and 1000."
+        );
+        assert_eq!(
+            reject(GenerationSettings {
+                max_tokens: Some(0),
+                ..base()
+            }),
+            "Max tokens must be between 1 and 1,000,000."
+        );
+        assert_eq!(
+            reject(GenerationSettings {
+                temperature: 2.1,
+                ..base()
+            }),
+            "Temperature must be between 0 and 2."
+        );
+        assert_eq!(
+            reject(GenerationSettings {
+                reasoning_effort: "xhigh".into(),
+                ..base()
+            }),
+            "Reasoning effort must be low, medium, or high."
+        );
+    }
+
+    #[test]
+    fn rejects_bad_respond_parameters() {
+        use crate::models::RespondRequest;
+        let base = || RespondRequest {
+            message_id: uuid::Uuid::nil(),
+            search: None,
+            temperature: None,
+            reasoning_effort: None,
+            enable_markdown: None,
+            stream: None,
+            context_rounds: None,
+            tool_rounds: None,
+            top_p: None,
+            top_k: None,
+            max_tokens: None,
+        };
+        assert!(validate_respond_request(&base()).is_ok());
+
+        let reject = |request: RespondRequest| validate_respond_request(&request).unwrap_err().message;
+        assert_eq!(
+            reject(RespondRequest {
+                temperature: Some(2.1),
+                ..base()
+            }),
+            "Temperature must be between 0 and 2."
+        );
+        assert_eq!(
+            reject(RespondRequest {
+                reasoning_effort: Some("xhigh".into()),
+                ..base()
+            }),
+            "Reasoning effort must be low, medium, or high."
+        );
+        assert_eq!(
+            reject(RespondRequest {
+                top_p: Some(f32::NAN),
+                ..base()
+            }),
+            "Top-p must be between 0 and 1."
+        );
+        assert_eq!(
+            reject(RespondRequest {
+                top_k: Some(1001),
+                ..base()
+            }),
+            "Top-k must be between 1 and 1000."
+        );
+        assert_eq!(
+            reject(RespondRequest {
+                max_tokens: Some(0),
+                ..base()
+            }),
+            "Max tokens must be between 1 and 1,000,000."
+        );
+        assert_eq!(
+            reject(RespondRequest {
+                context_rounds: Some(Some(21)),
+                ..base()
+            }),
+            "Context rounds must be between 0 and 20, or All."
+        );
+        assert_eq!(
+            reject(RespondRequest {
+                tool_rounds: Some(Some(0)),
+                ..base()
+            }),
+            "Tool rounds must be between 1 and 20, or Unlimited."
+        );
     }
 
     #[test]

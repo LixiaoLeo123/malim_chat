@@ -116,7 +116,7 @@ pub(crate) async fn compact(
             .await?
             .unwrap_or_else(|| p.0.clone());
         info!(conversation_id=%id, through_sequence=end, source_characters=source.len(), "manual compaction started");
-        providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], Some(0.2), None, providers::Tools::None, None).await?.text
+        providers::call_provider(&state.http, &kind, &p.1, &api_key, &model, &[json!({"role":"system","content":"Create a concise, factual memory for continuing this conversation. Preserve decisions, constraints, user preferences, unresolved tasks, and important technical details. Do not use Markdown."}), json!({"role":"user","content":format!("Previous memory:\n{}\n\nConversation to compact:\n{}", prior.as_ref().map(|item| item.0.as_str()).unwrap_or(""), source.chars().take(120_000).collect::<String>())})], &providers::Sampling { temperature: Some(0.2), ..providers::Sampling::default() }, providers::Tools::None, None).await?.text
     } else {
         source.chars().take(30_000).collect()
     };

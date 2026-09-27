@@ -14,7 +14,7 @@ pub(crate) struct AnthropicTurn {
     pub(crate) key: String,
     pub(crate) model: String,
     pub(crate) messages: Vec<Value>,
-    pub(crate) temperature: Option<f32>,
+    pub(crate) sampling: crate::providers::Sampling,
 }
 
 /// One server-sent event, in the shape the client reads.
@@ -151,8 +151,7 @@ pub(crate) fn stream_response(
                 &turn.key,
                 &turn.model,
                 &messages,
-                turn.temperature,
-                None,
+                &turn.sampling,
                 providers::Tools::Hosted,
                 None,
             )
@@ -214,8 +213,7 @@ pub(crate) fn stream_web_agent_response(
     model: String,
     transcript: Vec<Value>,
     user_message_id: Uuid,
-    temperature: Option<f32>,
-    reasoning_effort: Option<String>,
+    sampling: crate::providers::Sampling,
     enable_markdown: bool,
     tool_rounds: Option<u8>,
     initial_sources: Vec<Value>,
@@ -226,7 +224,7 @@ pub(crate) fn stream_web_agent_response(
         let worker_state = state.clone();
         let worker_model = model.clone();
         tokio::spawn(async move {
-            let result = agent::run_web_agent(&worker_state, &kind, &base, &api_key, &worker_model, transcript, temperature, reasoning_effort.as_deref(), Some(&event_sink), tool_rounds, conversation_id, user_message_id, initial_sources).await;
+            let result = agent::run_web_agent(&worker_state, &kind, &base, &api_key, &worker_model, transcript, &sampling, Some(&event_sink), tool_rounds, conversation_id, user_message_id, initial_sources).await;
             match result {
                 Ok(result) if !result.answer.trim().is_empty() => {
                     if !result.reasoning.trim().is_empty() { let _ = event_sink.send(json!({"type":"reasoning","delta":result.reasoning})); }
