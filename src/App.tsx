@@ -359,11 +359,18 @@ function useFlip(ref: { current: HTMLElement | null }, deps: unknown[]) {
     const container = ref.current;
     if (!container) return;
     const current = new Map<string, DOMRect>();
-    container.querySelectorAll<HTMLElement>("[data-flip-id]").forEach((node) => { current.set(node.dataset.flipId ?? "", node.getBoundingClientRect()); });
+    const nodes = new Map<string, HTMLElement>();
+    container.querySelectorAll<HTMLElement>("[data-flip-id]").forEach((node) => {
+      const id = node.dataset.flipId ?? "";
+      current.set(id, node.getBoundingClientRect());
+      nodes.set(id, node);
+    });
     const moved: HTMLElement[] = [];
     for (const [id, rect] of previous.current) {
-      const node = container.querySelector<HTMLElement>(`[data-flip-id="${CSS.escape(id)}"]`);
-      const now = node ? current.get(id) : undefined;
+      // The node is already in hand from the measurement pass; a per-id querySelector
+      // here makes reordering O(n²) and visibly slow once the history grows.
+      const node = nodes.get(id);
+      const now = current.get(id);
       if (node && now && (Math.abs(now.top - rect.top) > 1 || Math.abs(now.left - rect.left) > 1)) {
         node.style.transition = "none";
         node.style.transform = `translate(${rect.left - now.left}px, ${rect.top - now.top}px)`;
@@ -769,15 +776,22 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
     const root = selection.getRangeAt(0).commonAncestorContainer;
+    const range = selection.getRangeAt(0);
     const container = (root.nodeType === Node.ELEMENT_NODE ? root : root.parentElement) as HTMLElement | null;
     if (!container || !container.querySelector(".katex")) return;
+    // Formulas the selection cuts into contribute no mathml annotation to the clone (it
+    // sits before the visible html where the selection starts), so the TeX is read from
+    // the live elements, matched by document order to the cloned fragments.
+    const live = Array.from(container.querySelectorAll(".katex")).filter((el) => range.intersectsNode(el));
     const holder = document.createElement("div");
     holder.appendChild(selection.getRangeAt(0).cloneContents());
-    for (const math of Array.from(holder.querySelectorAll(".katex"))) {
-      const tex = math.querySelector(".katex-mathml annotation")?.textContent ?? "";
-      const block = math.closest(".katex-display") !== null;
+    const fragments = Array.from(holder.querySelectorAll(".katex"));
+    fragments.forEach((math, index) => {
+      const source = live[index] ?? math;
+      const tex = source.querySelector(".katex-mathml annotation")?.textContent ?? "";
+      const block = source.closest(".katex-display") !== null;
       math.replaceWith(document.createTextNode(block ? `$$${tex}$$` : `$${tex}$`));
-    }
+    });
     event.clipboardData?.setData("text/plain", holder.textContent ?? "");
     event.preventDefault();
   }
