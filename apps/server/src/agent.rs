@@ -190,7 +190,14 @@ pub(super) async fn run_web_agent(
             tool_calls = turn.tool_calls.len(),
             "web agent requested tools"
         );
-        transcript.push(turn.assistant_message);
+        // Responses transcripts are flat input-item lists: the assistant turn is a set of
+        // function_call items, and results ride back as function_call_output items.
+        if kind == "openai_responses" {
+            let items = turn.assistant_message.as_array().cloned().unwrap_or_default();
+            transcript.extend(items);
+        } else {
+            transcript.push(turn.assistant_message);
+        }
         let mut anthropic_results = Vec::new();
         for (index, call) in turn.tool_calls.iter().enumerate() {
             let input = call.input.clone();
@@ -230,6 +237,8 @@ pub(super) async fn run_web_agent(
             );
             if kind == "anthropic" {
                 anthropic_results.push(json!({"type":"tool_result","tool_use_id":call.id,"content":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
+            } else if kind == "openai_responses" {
+                transcript.push(json!({"type":"function_call_output","call_id":call.id,"output":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
             } else {
                 transcript.push(json!({"role":"tool","tool_call_id":call.id,"content":serde_json::to_string(&result).unwrap_or_else(|_| "{}".into())}));
             }

@@ -327,7 +327,23 @@ fn validate_generation_settings(settings: GenerationSettings) -> Result<Value, A
             return Err(ApiError::bad("Max tokens must be between 1 and 1,000,000."));
         }
     }
+    validate_web_uses(settings.web_search_uses, settings.web_fetch_uses)?;
     Ok(json!(settings))
+}
+
+/// Caps on Anthropic's hosted web tools; 5/5 matches the historical hardcode.
+fn validate_web_uses(search_uses: Option<u32>, fetch_uses: Option<u32>) -> Result<(), ApiError> {
+    if let Some(uses) = search_uses {
+        if !(1..=50).contains(&uses) {
+            return Err(ApiError::bad("Max web searches must be between 1 and 50."));
+        }
+    }
+    if let Some(uses) = fetch_uses {
+        if !(1..=50).contains(&uses) {
+            return Err(ApiError::bad("Max page fetches must be between 1 and 50."));
+        }
+    }
+    Ok(())
 }
 
 /// /respond applies these per turn; same ranges as the PATCH validator so a bad
@@ -374,6 +390,7 @@ fn validate_respond_request(request: &RespondRequest) -> Result<(), ApiError> {
             ));
         }
     }
+    validate_web_uses(request.web_search_uses, request.web_fetch_uses)?;
     Ok(())
 }
 
@@ -605,7 +622,7 @@ mod tests {
             "claude-sonnet-5",
             &[crate::respond::instruction_message(true)],
             &Default::default(),
-            crate::providers::Tools::Hosted,
+            crate::providers::Tools::hosted(None, None),
             false,
             None,
         );
@@ -634,7 +651,7 @@ mod tests {
             "gpt-6-astra",
             &[crate::respond::instruction_message(true)],
             &Default::default(),
-            crate::providers::Tools::Hosted,
+            crate::providers::Tools::hosted(None, None),
             false,
             None,
         );
@@ -652,7 +669,7 @@ mod tests {
             "glm-5.3",
             &[crate::respond::instruction_message(true)],
             &Default::default(),
-            crate::providers::Tools::Hosted,
+            crate::providers::Tools::hosted(None, None),
             false,
             None,
         );
@@ -774,6 +791,127 @@ mod tests {
         assert!(round_tripped.get("top_p").is_none());
         assert!(round_tripped.get("top_k").is_none());
         assert!(round_tripped.get("max_tokens").is_none());
+        assert!(round_tripped.get("web_search_uses").is_none());
+        assert!(round_tripped.get("web_fetch_uses").is_none());
+    }
+
+    #[test]
+    fn caps_anthropic_hosted_tools_with_the_chosen_uses() {
+        let body = &crate::providers::build_request(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-sonnet-5",
+            &[],
+            &Default::default(),
+            crate::providers::Tools::hosted(Some(3), Some(9)),
+            false,
+            None,
+        )
+        .body;
+        let tools = body["tools"].as_array().unwrap();
+        let search = tools
+            .iter()
+            .find(|tool| tool["name"] == "web_search")
+            .unwrap();
+        let fetch = tools
+            .iter()
+            .find(|tool| tool["name"] == "web_fetch")
+            .unwrap();
+        assert_eq!(search["max_uses"], 3);
+        assert_eq!(fetch["max_uses"], 9);
+
+        // Unset means the historical 5/5, so existing clients see no change.
+        let body = &crate::providers::build_request(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-sonnet-5",
+            &[],
+            &Default::default(),
+            crate::providers::Tools::hosted(None, None),
+            false,
+            None,
+        )
+        .body;
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(
+            tools
+                .iter()
+                .find(|tool| tool["name"] == "web_search")
+                .unwrap()["max_uses"],
+            5
+        );
+        assert_eq!(
+            tools
+                .iter()
+                .find(|tool| tool["name"] == "web_fetch")
+                .unwrap()["max_uses"],
+            5
+        );
+    }
+
+    #[test]
+    fn gives_responses_flat_function_tools_for_the_react_loop() {
+        let body = &crate::providers::build_request(
+            "openai_responses",
+            "https://api.openai.com/v1",
+            "gpt-6-astra",
+            &[],
+            &Default::default(),
+            crate::providers::Tools::Retrieved,
+            false,
+            None,
+        )
+        .body;
+        let tools = body["tools"].as_array().unwrap();
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["name"], "web_search");
+        // The Responses dialect declares function tools flat; a nested `function` object
+        // is the Chat shape and gets rejected here.
+        assert!(tools[0].get("function").is_none());
+        assert_eq!(tools[1]["name"], "open_web_page");
+    }
+
+    #[test]
+    fn preserves_typed_items_and_parses_responses_function_calls() {
+        // responses_input must pass typed agent-loop items through verbatim.
+        let shaped = crate::providers::build_request(
+            "openai_responses",
+            "https://api.openai.com/v1",
+            "gpt-6-astra",
+            &[
+                serde_json::json!({"role":"system","content":"instructions"}),
+                serde_json::json!({"type":"function_call","call_id":"c1","name":"web_search","arguments":"{\"query\":\"weather\"}"}),
+                serde_json::json!({"type":"function_call_output","call_id":"c1","output":"[]"}),
+            ],
+            &Default::default(),
+            crate::providers::Tools::None,
+            false,
+            None,
+        )
+        .body;
+        let input = shaped["input"].as_array().unwrap();
+        assert_eq!(input[0]["role"], "system");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[2]["call_id"], "c1");
+
+        // The tool turn parser reads function_call items out of the output array.
+        let body = serde_json::json!({
+            "output": [
+                {"type":"reasoning","summary":[]},
+                {"type":"function_call","call_id":"c1","name":"web_search","arguments":"{\"query\":\"weather today\"}"},
+                {"type":"message","content":[{"type":"output_text","text":"checking"}]}
+            ]
+        });
+        let turn = crate::providers::responses_tool_turn_for_test(&body);
+        assert_eq!(turn.tool_calls.len(), 1);
+        assert_eq!(turn.tool_calls[0].name, "web_search");
+        assert_eq!(turn.tool_calls[0].input["query"], "weather today");
+        // The echoed assistant turn is a flat item list: the function_call plus the
+        // message item, without the reasoning item.
+        let items = turn.assistant_message.as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[1]["type"], "message");
     }
 
     #[test]
@@ -789,6 +927,8 @@ mod tests {
             top_p: None,
             top_k: None,
             max_tokens: None,
+            web_search_uses: None,
+            web_fetch_uses: None,
         };
         let valid = GenerationSettings {
             temperature: 1.0,
@@ -862,6 +1002,8 @@ mod tests {
             top_p: None,
             top_k: None,
             max_tokens: None,
+            web_search_uses: None,
+            web_fetch_uses: None,
         };
         assert!(validate_respond_request(&base()).is_ok());
 

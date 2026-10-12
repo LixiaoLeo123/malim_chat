@@ -115,6 +115,12 @@ pub(crate) fn web_tool_definitions(kind: &str) -> Value {
             {"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","input_schema":search_schema},
             {"name":"open_web_page","description":"Read the text of any public web page by exact URL: a web_search result, a link the user shared, or a link found on an opened page. Use it to verify details before making consequential claims.","input_schema":open_schema}
         ])
+    } else if kind == "openai_responses" {
+        // The Responses dialect declares function tools flat — no nested `function` object.
+        json!([
+            {"type":"function","name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","parameters":search_schema},
+            {"type":"function","name":"open_web_page","description":"Read the text of any public web page by exact URL: a web_search result, a link the user shared, or a link found on an opened page. Use it to verify details before making consequential claims.","parameters":open_schema}
+        ])
     } else {
         json!([
             {"type":"function","function":{"name":"web_search","description":"Search the public web for current, factual information. Use focused queries and refine them when the initial evidence is weak.","parameters":search_schema}},

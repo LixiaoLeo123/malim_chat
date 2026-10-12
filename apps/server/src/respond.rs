@@ -105,18 +105,17 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
     let sampling = providers::Sampling::from(&request);
     let explicit_search = web_tools::content_requests_web_search(&input.content);
     // Two dialects can run tools on their own side — OpenAI's on Responses, Anthropic's on
-    // Messages — and the retrieved-evidence ReAct loop is the third way, built for the Chat
-    // dialect. Only one applies per turn, and both switches are per model because a gateway
+    // Messages — and the retrieved-evidence ReAct loop covers every dialect when they are
+    // off. Only one applies per turn, and both switches are per model because a gateway
     // implements any subset of a dialect and only the user knows what their channel serves.
-    // Responses cannot fall back to the ReAct loop, so an opted-out model there simply
-    // answers without searching.
     let responses_model = kind == "openai_responses";
     let hosted_tools = (responses_model || kind == "anthropic")
         && provider_model_hosted_tools(&state.db, provider_id, &model).await?;
-    let search_requested =
-        !responses_model && !hosted_tools && (request.search.unwrap_or(false) || explicit_search);
+    // Every dialect can search now: hosted dialects do it on the provider's side when
+    // hosted tools are on, and any of them runs the SearXNG ReAct loop when they are off.
+    let search_requested = !hosted_tools && (request.search.unwrap_or(false) || explicit_search);
     let tools = if hosted_tools {
-        providers::Tools::Hosted
+        providers::Tools::hosted(request.web_search_uses, request.web_fetch_uses)
     } else if search_requested {
         providers::Tools::Retrieved
     } else {
@@ -215,12 +214,16 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
         // A paused Anthropic tool turn is continued by re-issuing this request with the
         // paused content appended, so keep what it takes to rebuild it.
         let turn = (kind == "anthropic" && hosted_tools).then(|| {
+            let search_uses = request.web_search_uses.unwrap_or(5);
+            let fetch_uses = request.web_fetch_uses.unwrap_or(5);
             Box::new(crate::stream::AnthropicTurn {
                 base: p.1.clone(),
                 key: api_key.clone(),
                 model: model.clone(),
                 messages: transcript.clone(),
                 sampling: sampling.clone(),
+                web_search_uses: search_uses,
+                web_fetch_uses: fetch_uses,
             })
         });
         let upstream = match providers::call_provider_stream(

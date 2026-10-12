@@ -15,6 +15,8 @@ pub(crate) struct AnthropicTurn {
     pub(crate) model: String,
     pub(crate) messages: Vec<Value>,
     pub(crate) sampling: crate::providers::Sampling,
+    pub(crate) web_search_uses: u32,
+    pub(crate) web_fetch_uses: u32,
 }
 
 /// One server-sent event, in the shape the client reads.
@@ -152,7 +154,7 @@ pub(crate) fn stream_response(
                 &turn.model,
                 &messages,
                 &turn.sampling,
-                providers::Tools::Hosted,
+                providers::Tools::hosted(Some(turn.web_search_uses), Some(turn.web_fetch_uses)),
                 None,
             )
             .await

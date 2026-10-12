@@ -29,7 +29,20 @@ impl RequestKind {
 pub(crate) enum Tools {
     None,
     Retrieved,
-    Hosted,
+    /// Hosted tools with per-tool use caps; the defaults match the historical 5/5.
+    Hosted {
+        web_search_uses: u32,
+        web_fetch_uses: u32,
+    },
+}
+
+impl Tools {
+    pub(crate) fn hosted(web_search_uses: Option<u32>, web_fetch_uses: Option<u32>) -> Self {
+        Tools::Hosted {
+            web_search_uses: web_search_uses.unwrap_or(5),
+            web_fetch_uses: web_fetch_uses.unwrap_or(5),
+        }
+    }
 }
 
 /// A completed non-streaming turn. Reasoning is carried separately instead of being
@@ -57,8 +70,48 @@ pub(crate) struct ToolTurn {
     pub(crate) tool_calls: Vec<ToolCall>,
 }
 
-pub(crate) async fn call_provider_with_tools(
-    http: &Client,
+/// Turns a Responses output array into a tool turn: `function_call` items become tool
+/// calls, and the items are echoed back verbatim on the next round. Dropping the
+/// reasoning item is safe because no `previous_response_id` links the rounds; the
+/// transcript is a flat input-item list, so the agent loop splices items in one by one.
+fn responses_tool_turn(body: &Value) -> Result<ToolTurn, ApiError> {
+    let output = body["output"]
+        .as_array()
+        .cloned()
+        .ok_or_else(|| ApiError::bad("The Responses provider returned an unexpected tool response."))?;
+    let tool_calls = output
+        .iter()
+        .filter(|item| item["type"] == "function_call")
+        .filter_map(|item| {
+            Some(ToolCall {
+                id: item["call_id"].as_str()?.to_string(),
+                name: item["name"].as_str()?.to_string(),
+                input: serde_json::from_str(item["arguments"].as_str().unwrap_or("{}"))
+                    .unwrap_or_else(|_| json!({})),
+            })
+        })
+        .collect();
+    Ok(ToolTurn {
+        reply: Reply {
+            text: responses_content(body).unwrap_or_default(),
+            reasoning: responses_reasoning(body).unwrap_or_default(),
+            ..Default::default()
+        },
+        assistant_message: json!(output
+            .iter()
+            .filter(|item| item["type"] != "reasoning")
+            .cloned()
+            .collect::<Vec<_>>()),
+        tool_calls,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn responses_tool_turn_for_test(body: &Value) -> ToolTurn {
+    responses_tool_turn(body).expect("a valid output array")
+}
+
+pub(crate) async fn call_provider_with_tools(    http: &Client,
     kind: &str,
     base: &str,
     key: &str,
@@ -71,6 +124,9 @@ pub(crate) async fn call_provider_with_tools(
         .await?
         .json()
         .await?;
+    if RequestKind::parse(kind) == RequestKind::OpenAiResponses {
+        return Ok(responses_tool_turn(&body)?);
+    }
     if request.anthropic {
         let blocks = body["content"]
             .as_array()
@@ -267,8 +323,11 @@ pub(crate) fn build_request(
             if let Some(id) = chain {
                 body["previous_response_id"] = json!(id);
             }
-            if tools == Tools::Hosted {
+            if let Tools::Hosted { .. } = tools {
                 body["tools"] = json!(responses_tools());
+            }
+            if tools == Tools::Retrieved {
+                body["tools"] = json!(web_tool_definitions("openai_responses"));
             }
             if let Some(value) = &sampling.reasoning_effort {
                 // Responses exposes no raw chain of thought; the summary is all there is.
@@ -305,8 +364,8 @@ pub(crate) fn build_request(
             if !system.is_empty() {
                 body["system"] = json!(system);
             }
-            if tools == Tools::Hosted {
-                body["tools"] = json!(anthropic_tools());
+            if let Tools::Hosted { web_search_uses, web_fetch_uses } = tools {
+                body["tools"] = json!(anthropic_tools(web_search_uses, web_fetch_uses));
             }
             if tools == Tools::Retrieved {
                 body["tools"] = json!(web_tool_definitions("anthropic"));
@@ -561,6 +620,11 @@ fn responses_input(messages: &[Value]) -> Vec<Value> {
     messages
         .iter()
         .filter_map(|message| {
+            // Agent-loop items (function_call, function_call_output) carry their own
+            // `type` and no role; they pass through verbatim or the API rejects the call.
+            if message.get("type").is_some() {
+                return Some(message.clone());
+            }
             let role = message["role"].as_str()?;
             Some(json!({ "role": role, "content": message["content"].clone() }))
         })
@@ -585,13 +649,13 @@ fn responses_tools() -> Vec<Value> {
 /// version: the `_20260209` web tools bring their own sandbox and reject an older
 /// `code_execution` in the same request. Search and fetch are capped so a single turn
 /// cannot spend the account's quota browsing on the user's behalf.
-fn anthropic_tools() -> Vec<Value> {
+fn anthropic_tools(web_search_uses: u32, web_fetch_uses: u32) -> Vec<Value> {
     vec![
-        json!({ "type": "web_search_20250305", "name": "web_search", "max_uses": 5 }),
+        json!({ "type": "web_search_20250305", "name": "web_search", "max_uses": web_search_uses }),
         json!({
             "type": "web_fetch_20250910",
             "name": "web_fetch",
-            "max_uses": 5,
+            "max_uses": web_fetch_uses,
             "citations": { "enabled": true },
         }),
         json!({ "type": "code_execution_20250825", "name": "code_execution" }),

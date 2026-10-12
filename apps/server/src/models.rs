@@ -124,6 +124,10 @@ pub(crate) struct GenerationSettings {
     pub(crate) top_k: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) web_search_uses: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) web_fetch_uses: Option<u32>,
 }
 
 pub(crate) fn default_context_rounds() -> Option<u8> {
@@ -201,4 +205,6 @@ pub(crate) struct RespondRequest {
     pub(crate) top_p: Option<f32>,
     pub(crate) top_k: Option<u32>,
     pub(crate) max_tokens: Option<u32>,
+    pub(crate) web_search_uses: Option<u32>,
+    pub(crate) web_fetch_uses: Option<u32>,
 }
