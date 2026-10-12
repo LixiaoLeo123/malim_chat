@@ -775,16 +775,19 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
     if (!renderMarkdown) return;
     const selection = window.getSelection();
     if (!selection || selection.isCollapsed || selection.rangeCount === 0) return;
-    const root = selection.getRangeAt(0).commonAncestorContainer;
     const range = selection.getRangeAt(0);
-    const container = (root.nodeType === Node.ELEMENT_NODE ? root : root.parentElement) as HTMLElement | null;
-    if (!container || !container.querySelector(".katex")) return;
+    // The common ancestor of a formula-only selection sits inside .katex, where no
+    // .katex can be found again — always search from the message body.
+    const container = bodyRef.current;
+    if (!container || !range.intersectsNode(container)) return;
+    if (!container.querySelector(".katex")) return;
     // Formulas the selection cuts into contribute no mathml annotation to the clone (it
     // sits before the visible html where the selection starts), so the TeX is read from
     // the live elements, matched by document order to the cloned fragments.
     const live = Array.from(container.querySelectorAll(".katex")).filter((el) => range.intersectsNode(el));
+    if (!live.length) return;
     const holder = document.createElement("div");
-    holder.appendChild(selection.getRangeAt(0).cloneContents());
+    holder.appendChild(range.cloneContents());
     const fragments = Array.from(holder.querySelectorAll(".katex"));
     fragments.forEach((math, index) => {
       const source = live[index] ?? math;
@@ -795,11 +798,28 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
     event.clipboardData?.setData("text/plain", holder.textContent ?? "");
     event.preventDefault();
   }
+  // Rendered formulas are overlapping positioned spans, so the browser cannot build a
+  // selection inside one — dragging highlights nothing until it swallows the whole atom.
+  // Treat every formula as one selectable unit: a press inside it selects the whole
+  // formula, which then copies as raw TeX through handleCopy.
+  function handleMathMouseDown(event: React.MouseEvent<HTMLDivElement>) {
+    if (!renderMarkdown || event.button !== 0) return;
+    const target = event.target as HTMLElement;
+    const math = target.closest(".katex-display") ?? target.closest(".katex");
+    if (!math || !bodyRef.current?.contains(math)) return;
+    event.preventDefault();
+    const selection = window.getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(math);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
   const legacy = splitLegacyThinking(message.content);
   const content = legacy.content;
   const reasoning = [message.reasoning_content, legacy.reasoning].filter(Boolean).join("\n");
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
-  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onCopy={handleCopy} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <><ToolActivityList events={message.tool_events} reasoning={reasoning} streaming={message.status === "streaming"} theme={theme} markdown={markdownEnabled} />{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>}</>} {isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}<SourceList sources={message.search_sources ?? []} /><div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></article>;
+  return <article id={`message-${message.id}`} className={`message ${message.role === "user" ? "user" : message.role === "summary" ? "summary" : "assistant"} ${message.status === "error" ? "message-error" : ""}`}><div className="message-avatar">{message.role === "user" ? "You" : <Bot size={17} />}</div><div className="message-body" ref={bodyRef} onMouseUp={captureSelection} onCopy={handleCopy} onMouseDown={handleMathMouseDown} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <><ToolActivityList events={message.tool_events} reasoning={reasoning} streaming={message.status === "streaming"} theme={theme} markdown={markdownEnabled} />{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>}</>} {isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}<SourceList sources={message.search_sources ?? []} /><div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></article>;
 }
 
 function splitLegacyThinking(value: string) {
