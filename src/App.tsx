@@ -191,8 +191,15 @@ function Chat() {
   }
   async function newChat() {
     if (!providers.length) { setProviderOpen(true); setError("Add a provider before creating a chat."); return; }
+    // Start where the user last was: the most recent conversation's model, not the
+    // first provider's first model they probably never chose themselves.
+    const previous = useAppStore.getState().conversations[0];
+    const provider = providers.find((item) => item.id === previous?.model_provider_id) ?? providers[0];
+    const model = previous?.model && previous.model_provider_id === provider.id
+      ? previous.model
+      : provider.models[0]?.model ?? provider.default_model;
     try {
-      const conversation = await api.createConversation({ provider_id: providers[0].id, model: providers[0].models[0]?.model ?? providers[0].default_model });
+      const conversation = await api.createConversation({ provider_id: provider.id, model });
       setConversations([conversation, ...useAppStore.getState().conversations]);
       setMessages(conversation.id, []);
       setActiveId(conversation.id);
