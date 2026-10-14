@@ -1,6 +1,6 @@
 import { Search } from "lucide-react";
 import type { Message } from "../../types";
-import { sourceHost } from "../../lib/utils";
+import { sourceHost } from "../../lib/app-utils";
 
 export function SourceList({ sources }: { sources: Message["search_sources"] }) {
   if (sources.length === 0) return null;

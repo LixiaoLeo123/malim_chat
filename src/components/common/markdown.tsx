@@ -6,7 +6,7 @@ import rehypeKatex from "rehype-katex";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { oneDark, oneLight } from "react-syntax-highlighter/dist/esm/styles/prism";
 import { Check, Copy } from "lucide-react";
-import { copyText, preprocessLatex } from "../../lib/utils";
+import { copyText, preprocessLatex } from "../../lib/app-utils";
 
 function CodeBlock({ language, code, theme }: { language: string; code: string; theme: "light" | "dark" }) {
   const [copied, setCopied] = useState(false);
