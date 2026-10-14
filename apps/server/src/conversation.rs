@@ -25,8 +25,24 @@ pub(crate) async fn list_conversations(
     }))
 }
 
-pub(crate) async fn create_conversation(
+/// Starred conversations, most recent first. Sent ahead of the paginated
+/// history so the sidebar's Starred section is complete without scrolling
+/// through every page of recent chats.
+pub(crate) async fn list_favorite_conversations(
     State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<Conversation>>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let rows = sqlx::query_as::<_, Conversation>(
+        "SELECT id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at FROM conversations WHERE user_id=$1 AND archived_at IS NULL AND is_favorite=TRUE ORDER BY updated_at DESC,id DESC LIMIT 200",
+    )
+    .bind(user_id)
+    .fetch_all(&state.db)
+    .await?;
+    Ok(Json(rows))
+}
+
+pub(crate) async fn create_conversation(    State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<CreateConversation>,
 ) -> Result<Json<Conversation>, ApiError> {

@@ -54,8 +54,12 @@ function Chat() {
 
   const bootstrap = useEvent(async () => {
     try {
-      const [chats, configured] = await Promise.all([api.conversations(), api.providers()]);
-      setConversations(chats.items);
+      const [chats, starred, configured] = await Promise.all([api.conversations(), api.favoriteConversations(), api.providers()]);
+      // The paginated history may not reach a starred conversation for many pages;
+      // merge the favorites feed in so the Starred section is complete on load.
+      const seen = new Set(chats.items.map((chat) => chat.id));
+      const missing = starred.filter((chat) => !seen.has(chat.id));
+      setConversations([...missing, ...chats.items]);
       setConversationCursor(chats.next_cursor);
       setProviders(configured);
       if (!useAppStore.getState().activeId && chats.items[0]) setActiveId(chats.items[0].id);

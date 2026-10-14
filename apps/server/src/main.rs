@@ -61,8 +61,9 @@ use auth::{decrypt, encrypt, login, refresh, signup, user_from_headers};
 use compaction::{auto_compact, compact};
 use content::{content_part, estimate_image_tokens, estimate_tokens, parse_data_url};
 use conversation::{
-    create_conversation, create_message, delete_conversation, delete_message, list_conversations,
-    list_messages, update_conversation, update_message,
+    create_conversation, create_message, delete_conversation, delete_message,
+    list_conversations, list_favorite_conversations, list_messages, update_conversation,
+    update_message,
 };
 use models::{
     Conversation, CreateConversation, CreateMessage, GenerationSettings, Message, Page, PageQuery,
@@ -472,6 +473,10 @@ async fn main() -> anyhow::Result<()> {
         .route(
             "/v1/conversations",
             get(list_conversations).post(create_conversation),
+        )
+        .route(
+            "/v1/conversations/favorites",
+            get(list_favorite_conversations),
         )
         .route(
             "/v1/conversations/{id}",
