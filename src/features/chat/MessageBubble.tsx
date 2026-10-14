@@ -1,16 +1,15 @@
 import { memo, useEffect, useRef, useState, type ClipboardEvent, type TouchEvent } from "react";
-import { Check, Copy, Edit3, Trash2 } from "lucide-react";
-import type { Message as MessageModel } from "../../types";
-import { copyText, lookupSuppressed, splitLegacyThinking } from "../../lib/app-utils";
+import { Bot, Check, Copy, Edit3, Trash2 } from "lucide-react";
+import type { Message } from "../../types";
+import { copyText, lookupSuppressed, splitLegacyThinking } from "../../lib/utils";
 import { handleKatexCopy, handleMathMouseDown } from "../../lib/katex-copy";
 import { applyLookupHighlight } from "../dictionary/selection";
 import { useSelectionLookup } from "../dictionary/use-selection-lookup";
-import { Message, MessageContent } from "../../components/ai-elements/message";
-import { Response } from "../../components/ai-elements/response";
-import { Reasoning, ReasoningTrigger, ReasoningContent } from "../../components/ai-elements/reasoning";
+import { MemoMarkdown } from "../../components/common/markdown";
 import { SourceList } from "./SourceList";
+import { ToolActivityList } from "./ToolActivityList";
 
-function MessageBubble({ message, markdownEnabled, isLast, lookupActive, onEdit, onDelete, onRetry, onLookup }: { message: MessageModel; markdownEnabled: boolean; isLast: boolean; lookupActive: boolean; onEdit: (message: MessageModel, content: string) => Promise<void>; onDelete: (message: MessageModel) => Promise<void>; onRetry: (message: MessageModel) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void }) {
+function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, onEdit, onDelete, onRetry, onLookup }: { message: Message; markdownEnabled: boolean; theme: "light" | "dark"; isLast: boolean; lookupActive: boolean; onEdit: (message: Message, content: string) => Promise<void>; onDelete: (message: Message) => Promise<void>; onRetry: (message: Message) => Promise<void>; onLookup: (word: string, anchor: { x: number; y: number }) => void }) {
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [draft, setDraft] = useState(message.content);
@@ -73,6 +72,7 @@ function MessageBubble({ message, markdownEnabled, isLast, lookupActive, onEdit,
     const selected = window.getSelection()?.toString().trim() ?? "";
     if (selected && selected.length <= 120) {
       selectionCaptured.current = true;
+      // Prefer the live selection's rect: the debounce path may hand down a stale one.
       const range = window.getSelection()?.rangeCount ? window.getSelection()?.getRangeAt(0).getBoundingClientRect() : undefined;
       onLookup(selected, {
         x: Math.min(window.innerWidth - 18, Math.max(18, range?.left ?? anchor?.left ?? window.innerWidth / 2)),
@@ -98,32 +98,7 @@ function MessageBubble({ message, markdownEnabled, isLast, lookupActive, onEdit,
   const reasoning = [message.reasoning_content, legacy.reasoning].filter(Boolean).join("\n");
   const renderMarkdown = markdownEnabled && message.role === "assistant" && message.content_format === "markdown";
   const isUser = message.role === "user";
-  const streaming = message.status === "streaming";
-  const from = isUser ? "user" : "assistant";
-
-  const body = editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <>
-    {!isUser && reasoning && <Reasoning isStreaming={streaming}><ReasoningTrigger /><ReasoningContent>{reasoning}</ReasoningContent></Reasoning>}
-    {message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}
-    {streaming && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`} ref={bodyRef} onMouseUp={() => captureSelection({})} onCopy={onCopy} onMouseDown={onBodyMouseDown} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{renderMarkdown ? <Response final={!streaming}>{content}</Response> : content}</div>}
-    {isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}
-    <SourceList sources={message.search_sources ?? []} />
-    <div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div>
-  </>;
-
-  return (
-    <Message from={from} className="chat-message py-2.5">
-      {isUser ? (
-        <div className="w-full min-w-0 flex-1 basis-full" ref={bodyRef} onMouseUp={() => captureSelection({})} onCopy={onCopy} onMouseDown={onBodyMouseDown} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>
-          <MessageContent variant="flat">
-            {body}
-          </MessageContent>
-        </div>
-      ) : (
-        <div className="w-full min-w-0 flex-1 basis-full" ref={bodyRef}>
-          <MessageContent variant="flat">{body}</MessageContent>
-        </div>
-      )}
-    </Message>
-  );
+  const kind = isUser ? "user" : message.role === "summary" ? "summary" : "assistant";
+  return <article id={`message-${message.id}`} className={`message ${kind} ${message.status === "error" ? "message-error" : ""}`}>{isUser ? <div className="message-body" ref={bodyRef} onMouseUp={() => captureSelection({})} onCopy={onCopy} onMouseDown={onBodyMouseDown} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <><div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"} user-bubble`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>{message.images?.length > 0 && <div className="message-images">{message.images.map((src) => <img key={src} src={src} alt="Attached image" />)}</div>}</>}</div> : <><div className="message-avatar"><Bot size={15} /></div><div className="message-body" ref={bodyRef} onMouseUp={() => captureSelection({})} onCopy={onCopy} onMouseDown={onBodyMouseDown} onTouchStart={handleTouchStart} onTouchMove={handleTouchMove} onTouchEnd={handleTouchEnd} onTouchCancel={cancelLongPress}>{editing ? <div className="edit-box"><textarea value={draft} onChange={(event) => setDraft(event.target.value)} /><button className="primary small" type="button" onClick={() => { void onEdit(message, draft); setEditing(false); }}>Save</button><button className="text-button small" type="button" onClick={() => { setDraft(message.content); setEditing(false); }}>Cancel</button></div> : <><ToolActivityList events={message.tool_events} reasoning={reasoning} streaming={message.status === "streaming"} theme={theme} markdown={markdownEnabled} />{message.status === "streaming" && !content && !reasoning ? <span className="typing"><i /><i /><i /></span> : (content || message.images?.length > 0) && <div className={`message-content ${renderMarkdown ? "markdown-content" : "plain-content"}`}>{renderMarkdown ? <MemoMarkdown content={content} theme={theme} /> : content}</div>}</>} {isLast && message.status === "error" && (message.role === "user" || message.retry_message_id) && <button type="button" className="retry-button" onClick={() => void onRetry(message)}>Retry response</button>}<SourceList sources={message.search_sources ?? []} /><div className="message-tools"><button type="button" className={copied ? "copied" : ""} title={copied ? "Copied" : "Copy"} onClick={() => void copyContent()}>{copied ? <Check size={14} /> : <Copy size={14} />}</button>{!message.optimistic && message.role !== "system" && <button type="button" title="Edit" onClick={() => setEditing(true)}><Edit3 size={14} /></button>}<button type="button" className={confirmDelete ? "delete armed" : "delete"} title={confirmDelete ? "Click again to delete" : "Delete"} aria-label={confirmDelete ? "Confirm delete message" : "Delete message"} onBlur={() => setConfirmDelete(false)} onClick={(event) => { if (!confirmDelete) { event.preventDefault(); event.currentTarget.focus(); setConfirmDelete(true); return; } event.preventDefault(); setConfirmDelete(false); void onDelete(message); }}><Trash2 size={14} /></button>{message.model && message.status !== "streaming" && message.status !== "pending" && <span className="message-model">{message.model}</span>}</div></div></>}</article>;
 }
 export const MemoMessageBubble = memo(MessageBubble);

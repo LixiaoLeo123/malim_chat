@@ -370,37 +370,3 @@ input, select, textarea { border-radius: var(--radius-sm); transition: border-co
   .composer-footer { padding: 7px 8px 7px 4px; }
   .send-button { padding: 0 11px; }
 }
-
-/* ==========================================================================
-   Vendored ai-elements integration: the chat surface now renders through
-   new-api's Message/Response primitives. These rules adapt the shell layout
-   around them and retire the old avatar-grid where the new markup replaced it.
-   ========================================================================== */
-
-/* The Conversation shell replaces .message-list as the scroll container. */
-.playground-surface { display: flex; flex-direction: column; flex: 1; min-height: 0; }
-.chat-conversation { flex: 1; min-height: 0; }
-.chat-conversation-content { max-width: 960px; margin: 0 auto; width: 100%; padding: 36px 28px 24px; }
-@media (max-width: 720px) { .chat-conversation-content { padding: 22px 16px 16px; } }
-
-/* Old .message grid no longer applies to the vendored Message wrapper: keep
-   vertical rhythm and error/retry affordances only. */
-.message.chat-message { display: block; padding: 6px 0; margin: 0; animation: none; }
-.message.chat-message .message-body { min-width: 0; }
-.user-bubble { background: #ececec; border-radius: 16px; padding: 9px 14px; max-width: 82%; margin-left: auto; width: fit-content; }
-.app-shell.dark .user-bubble { background: #2e2e2e; }
-/* Assistant message tools: keep hover reveal from the base sheet. */
-.message.chat-message .message-tools { opacity: 0; }
-.message.chat-message:hover .message-tools { opacity: 1; }
-@media (hover: none) { .message.chat-message .message-tools { opacity: 1; } }
-
-/* Old markdown-content pre styles are superseded by the code-block component. */
-.message-content.markdown-content { white-space: normal; }
-.message-content.plain-content { white-space: pre-wrap; overflow-wrap: anywhere; }
-
-/* KaTeX blocks inside Response: scroll long formulas, keep copy intact. */
-.markdown-content .katex-display { overflow-x: auto; overflow-y: hidden; max-width: 100%; }
-.katex-host .katex-display { margin: 0; }
-
-/* Reasoning (Reasoning component) sizes. */
-.message.chat-message [data-slot="reasoning"] { margin: 0 0 8px; }

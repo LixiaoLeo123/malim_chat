@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Bot, Check, CircleAlert, LoaderCircle } from "lucide-react";
 import type { ToolActivity } from "../../types";
-import { sourceHost } from "../../lib/app-utils";
+import { sourceHost } from "../../lib/utils";
 import { MemoMarkdown } from "../../components/common/markdown";
 
 export function ToolActivityList({ events, reasoning, streaming, theme, markdown }: { events?: ToolActivity[]; reasoning?: string; streaming?: boolean; theme: "light" | "dark"; markdown: boolean }) {
