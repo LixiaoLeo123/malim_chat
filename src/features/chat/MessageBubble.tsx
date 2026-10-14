@@ -40,7 +40,7 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
     let end = offset;
     while (end < text.length && isWord(text[end])) end++;
     const word = text.slice(start, end);
-    if (word && word.length <= 120 && !lookupSuppressed()) { selectionCaptured.current = true; applyLookupHighlight(node, start, end); onLookup(word, { x: Math.min(window.innerWidth - 18, Math.max(18, x)), y: Math.min(window.innerHeight - 18, Math.max(18, y + 12)) }); }
+    if (word && word.length <= 120 && !lookupSuppressed(word)) { selectionCaptured.current = true; applyLookupHighlight(node, start, end); onLookup(word, { x: Math.min(window.innerWidth - 18, Math.max(18, x)), y: Math.min(window.innerHeight - 18, Math.max(18, y + 12)) }); }
   }
   function handleTouchStart(event: TouchEvent<HTMLDivElement>) {
     if ((event.target as HTMLElement).closest?.("button, a, textarea, input, select")) return;
@@ -68,9 +68,13 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
 
   // --- Dictionary lookup: selection path --------------------------------------
   const captureSelection = (anchor?: { left?: number; bottom?: number }) => {
-    if (lookupActive || lookupSuppressed()) return;
     const selected = window.getSelection()?.toString().trim() ?? "";
-    if (selected && selected.length <= 120) {
+    if (!selected || selected.length > 120) return;
+    // The popover close writes a cooldown for the dismissed word; a different
+    // word must open immediately (issue: selecting word B while word A's
+    // popover was open used to be swallowed by that cooldown).
+    if (lookupActive || lookupSuppressed(selected)) return;
+    {
       selectionCaptured.current = true;
       // Prefer the live selection's rect: the debounce path may hand down a stale one.
       const range = window.getSelection()?.rangeCount ? window.getSelection()?.getRangeAt(0).getBoundingClientRect() : undefined;

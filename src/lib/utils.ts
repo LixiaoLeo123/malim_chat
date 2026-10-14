@@ -21,10 +21,21 @@ export const androidApp = /android/i.test(navigator.userAgent) && "__TAURI_INTER
 
 // Closing the dictionary popover fires pointerdown, then pointerup and selectionchange
 // land on the message text right under it; without a cooldown the same word immediately
-// re-opens the popover the user just dismissed.
+// re-opens the popover the user just dismissed. The cooldown applies to that word only —
+// pressing a different word must open it straight away.
 let lookupCooldownUntil = 0;
-export function suppressLookup() { lookupCooldownUntil = Date.now() + 350; }
-export function lookupSuppressed() { return Date.now() < lookupCooldownUntil; }
+let suppressedWord: string | null = null;
+export function suppressLookup(word?: string) {
+  lookupCooldownUntil = Date.now() + 350;
+  suppressedWord = word ?? null;
+}
+export function lookupSuppressed(word?: string) {
+  if (Date.now() >= lookupCooldownUntil) return false;
+  // No word given (older call sites): blanket cooldown.
+  if (word === undefined) return true;
+  // A word given: only suppressed when it is the word the user just dismissed.
+  return suppressedWord === null || suppressedWord === word;
+}
 
 export async function copyText(text: string) { if (navigator.clipboard?.writeText) { await navigator.clipboard.writeText(text); }
   else {

@@ -1,102 +1,15 @@
 /*
- * Visual refresh applied to the restored feature-module client: the WolfAI
- * playground input area (elevated card, footer bar with tool pill group and
- * labelled Send) and the WolfAI model selector trigger in the header.
- * Deliberately NO overflow:hidden on the composer, so the parameters popover
- * is never clipped.
+ * Model selector appearance refinement only: WolfAI-style trigger in the
+ * conversation header — cpu icon, model name, provider badge, chevrons.
+ * The composer keeps its original layout and styling.
  */
 
 :root {
-  --accent: #0f766e;
-  --accent-strong: #0d665f;
-  --accent-soft: #e8f3f1;
-  --accent-ring: #cfe5e1;
-  --surface: #ffffff;
-  --canvas: #f7f8f7;
   --ink: #1a232b;
   --ink-soft: #5c6870;
   --ink-faint: #8b959b;
-  --line: #e7eae8;
-  --line-soft: #eef1ef;
 }
 
-/* ------------------------------------------------ WolfAI composer card */
-.composer {
-  border-radius: 14px;
-  border-color: rgba(16, 24, 32, .09);
-  box-shadow: 0 18px 60px -32px rgba(0, 0, 0, .65), 0 0 0 1px rgba(16, 24, 32, .04);
-}
-.composer:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
-  box-shadow: 0 22px 70px -34px rgba(0, 0, 0, .75), 0 0 0 3px color-mix(in srgb, var(--accent) 14%, transparent);
-  transform: none;
-}
-/* Round the corners on the pieces inside the card (no overflow clipping). */
-.composer > textarea:first-of-type { border-radius: 13px 13px 0 0; }
-.composer > .image-previews:first-child,
-.composer > .image-error:first-child { border-radius: 13px 13px 0 0; }
-.composer-footer { border-radius: 0 0 13px 13px; }
-.composer > textarea { padding: 14px 16px 10px; min-height: 64px; font-size: 15px; line-height: 1.65; }
-.composer > .image-previews { padding: 4px 14px 0; }
-.composer > .image-error { margin: 6px 16px 0; }
-
-.composer-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  border-top: 1px solid var(--line-soft);
-  background: color-mix(in srgb, var(--canvas) 45%, transparent);
-  padding: 9px 12px;
-}
-.composer-tools { display: flex; align-items: center; min-width: 0; }
-.composer-actions { display: flex; align-items: center; gap: 10px; }
-
-/* Tool pill group: bordered container holding attach / web / parameters. */
-.tool-pill-group {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: color-mix(in srgb, var(--surface) 70%, transparent);
-  padding: 3px;
-  box-shadow: 0 1px 2px rgba(16, 24, 32, .04);
-}
-.tool-pill {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border: 0;
-  border-radius: 7px;
-  background: transparent;
-  color: var(--ink-soft);
-  transition: background-color .15s ease, color .15s ease;
-}
-.tool-pill:hover:not(:disabled) { background: color-mix(in srgb, var(--ink) 6%, transparent); color: var(--ink); }
-.tool-pill.active { background: var(--accent-soft); color: var(--accent-strong); }
-.tool-pill:disabled { opacity: .5; }
-/* The Parameters chip lives inside the pill group; match its metrics. */
-.tool-pill-group .generation-control .search-chip { height: 30px; padding: 0 9px; gap: 6px; font-size: 12px; border-radius: 7px; }
-
-/* Labelled Send/Stop pill. */
-.send-button {
-  width: auto;
-  height: 32px;
-  padding: 0 13px;
-  gap: 6px;
-  display: inline-flex;
-  align-items: center;
-  font-size: 12.5px;
-  font-weight: 600;
-}
-.send-button:disabled { background: #e4e7e6; color: #9aa4a8; box-shadow: none; transform: none; }
-.send-button.stop { background: #fdecea; color: #b3261e; }
-.send-button.stop:hover { background: #fbdcd8; transform: none; box-shadow: none; }
-
-/* --------------------------------------------- WolfAI model selector (header) */
 .model-trigger-icon { color: var(--ink-faint); flex: none; }
 .model-trigger-name { min-width: 0; max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12.5px; font-weight: 550; }
 .model-trigger-badge {
@@ -117,31 +30,20 @@
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  max-width: 300px;
+  max-width: 320px;
   height: 32px;
   padding: 0 10px;
   border-radius: 9px;
   box-shadow: none;
 }
-.model-button:hover { border-color: color-mix(in srgb, var(--accent) 35%, transparent); color: var(--accent-strong); background: var(--accent-soft); }
 
-/* --------------------------------------------- dark mode */
-.app-shell.dark { --accent: #2dd4bf; --accent-strong: #5eead4; --accent-soft: #14332f; --accent-ring: #1f4a44; --surface: #1a1a1a; --canvas: #111111; --ink: #ececec; --ink-soft: #b8b8b8; --ink-faint: #7d7d7d; --line: #2c2c2c; --line-soft: #232323; }
-.app-shell.dark .composer { background: #1a1a1a; border-color: #2c2c2c; box-shadow: 0 18px 60px -32px rgba(0, 0, 0, .9), 0 0 0 1px rgba(255, 255, 255, .04); }
-.app-shell.dark .composer > textarea { color: #ececec; }
-.app-shell.dark .composer-footer { background: rgba(17, 17, 17, .6); border-top-color: #232323; }
-.app-shell.dark .tool-pill-group { background: #202020; border-color: #333; }
-.app-shell.dark .tool-pill:hover:not(:disabled) { background: #2e2e2e; color: #fff; }
-.app-shell.dark .tool-pill.active { background: var(--accent-soft); }
-.app-shell.dark .model-button { background: #1f1f1f; border-color: #333; color: #ececec; }
-.app-shell.dark .model-button:hover { background: #262626; border-color: var(--accent-ring); color: var(--accent-strong); }
+/* Dark mode: the app-shell.dark sheet already repaints .model-button; align
+   the new badge and icon with its neutral palette. */
 .app-shell.dark .model-trigger-badge { background: #333; color: #b8b8b8; }
-.app-shell.dark .send-button { background: #ececec; color: #111; }
-.app-shell.dark .send-button:disabled { background: #2a2a2a; color: #6a6a6a; }
-.app-shell.dark .send-button.stop { background: rgba(197, 69, 58, .16); color: #f2a49c; }
+.app-shell.dark .model-trigger-icon, .app-shell.dark .model-trigger-chevron { color: #9a9a9a; }
 
 @media (max-width: 720px) {
-  .composer-footer { flex-wrap: wrap; padding: 8px 10px; }
-  .composer-actions { width: 100%; justify-content: flex-end; }
   .model-trigger-name { max-width: 110px; }
+  /* On narrow screens the header is crowded; hide the badge like WolfAI's sm: variant. */
+  .model-trigger-badge { display: none; }
 }
