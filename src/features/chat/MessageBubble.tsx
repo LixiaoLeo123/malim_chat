@@ -67,14 +67,16 @@ function MessageBubble({ message, markdownEnabled, theme, isLast, lookupActive, 
   function handleTouchEnd() { cancelLongPress(); }
 
   // --- Dictionary lookup: selection path --------------------------------------
-  const captureSelection = (anchor: { left?: number; bottom?: number }) => {
+  const captureSelection = (anchor?: { left?: number; bottom?: number }) => {
     if (lookupActive || lookupSuppressed()) return;
     const selected = window.getSelection()?.toString().trim() ?? "";
     if (selected && selected.length <= 120) {
       selectionCaptured.current = true;
+      // Prefer the live selection's rect: the debounce path may hand down a stale one.
+      const range = window.getSelection()?.rangeCount ? window.getSelection()?.getRangeAt(0).getBoundingClientRect() : undefined;
       onLookup(selected, {
-        x: Math.min(window.innerWidth - 18, Math.max(18, anchor.left ?? window.innerWidth / 2)),
-        y: Math.min(window.innerHeight - 18, Math.max(18, anchor.bottom ?? window.innerHeight / 2)),
+        x: Math.min(window.innerWidth - 18, Math.max(18, range?.left ?? anchor?.left ?? window.innerWidth / 2)),
+        y: Math.min(window.innerHeight - 18, Math.max(18, range?.bottom ?? anchor?.bottom ?? window.innerHeight / 2)),
       });
     }
   };

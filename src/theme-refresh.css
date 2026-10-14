@@ -1,0 +1,257 @@
+/*
+ * Visual refresh in the spirit of new-api's design language: generous radii,
+ * layered soft shadows, quiet borders, a calm neutral canvas, and a charcoal
+ * dark mode. Loaded after styles.css and additions.css so it wins the cascade
+ * without touching any component markup.
+ */
+
+:root {
+  --accent: #0f766e;
+  --accent-strong: #0d665f;
+  --accent-soft: #e8f3f1;
+  --accent-ring: #cfe5e1;
+  --surface: #ffffff;
+  --canvas: #f7f8f7;
+  --ink: #1a232b;
+  --ink-soft: #5c6870;
+  --ink-faint: #8b959b;
+  --line: #e7eae8;
+  --line-soft: #eef1ef;
+  --radius-lg: 14px;
+  --radius-md: 10px;
+  --radius-sm: 7px;
+  --shadow-pop: 0 4px 10px rgba(16, 24, 32, .05), 0 16px 40px rgba(16, 24, 32, .12);
+  --shadow-card: 0 1px 2px rgba(16, 24, 32, .04), 0 2px 8px rgba(16, 24, 32, .05);
+  --shadow-float: 0 12px 34px rgba(16, 24, 32, .14);
+}
+
+* { -webkit-tap-highlight-color: transparent; }
+html, body { text-rendering: optimizeLegibility; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+
+/* ---------------------------------------------------------------- shell */
+.app-shell { background: var(--canvas); color: var(--ink); }
+
+/* -------------------------------------------------------------- sidebar */
+.sidebar {
+  background: var(--surface);
+  border-right: 1px solid var(--line-soft);
+  width: 288px;
+}
+.wordmark { letter-spacing: -0.01em; font-size: 15px; }
+.wordmark svg { color: var(--accent); }
+.new-chat {
+  border-radius: var(--radius-md);
+  border-color: var(--line);
+  font-weight: 550;
+  padding: 10px 12px;
+}
+.new-chat:hover {
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+}
+.history p { text-transform: uppercase; letter-spacing: .07em; font-size: 10.5px; font-weight: 650; color: var(--ink-faint); }
+.conversation-row { border-radius: var(--radius-sm); }
+.conversation-row > button:first-child { border-radius: var(--radius-sm); color: #3c4852; font-size: 13.5px; }
+.conversation-row.selected > button:first-child { background: var(--accent-soft); color: var(--accent-strong); font-weight: 550; }
+.row-action { border-radius: var(--radius-sm); }
+.sidebar-bottom { border-top-color: var(--line-soft); }
+.settings-button { border-radius: var(--radius-sm); font-size: 13.5px; }
+.account-row { border-radius: var(--radius-sm); margin-top: 2px; }
+.avatar { border-radius: 8px; }
+
+/* ---------------------------------------------------------------- header */
+.chat-header {
+  background: color-mix(in srgb, var(--surface) 86%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--line-soft);
+}
+.header-title { font-size: 13.5px; }
+.model-button {
+  border-radius: var(--radius-sm);
+  border-color: var(--line);
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-weight: 500;
+}
+.model-button:hover { border-color: var(--accent-ring); color: var(--accent-strong); background: var(--accent-soft); }
+
+/* -------------------------------------------------------------- messages */
+.message-list { scroll-behavior: smooth; }
+.message { padding: 15px 0; }
+.message-avatar {
+  border-radius: var(--radius-sm);
+  font-size: 10px;
+  letter-spacing: .02em;
+}
+.message.user .message-avatar { background: #eceff0; color: #46515b; }
+.message-content { line-height: 1.68; }
+
+/* -------------------------------------------------------------- composer */
+.composer-wrap { background: linear-gradient(to bottom, transparent, var(--canvas) 30%); }
+.composer {
+  border-radius: var(--radius-lg);
+  border-color: var(--line);
+  background: var(--surface);
+  box-shadow: var(--shadow-card);
+  padding: 12px 13px 9px;
+  transition: border-color .16s ease, box-shadow .16s ease;
+}
+.composer:focus-within {
+  border-color: #9ccac3;
+  box-shadow: 0 0 0 3px #e2f1ee, var(--shadow-card);
+}
+.composer textarea { font-size: 14.5px; color: var(--ink); }
+.send-button {
+  border-radius: var(--radius-sm);
+  background: var(--ink);
+  transition: background-color .16s ease, transform .16s ease, box-shadow .16s ease;
+}
+.send-button:not(:disabled):hover { background: #000; box-shadow: 0 4px 12px rgba(0, 0, 0, .18); }
+.search-chip { border-radius: var(--radius-sm); font-weight: 500; }
+.search-chip.enabled { color: var(--accent-strong); background: var(--accent-soft); }
+.attach-button { border-radius: var(--radius-sm); }
+.context-meter { font-weight: 500; letter-spacing: .01em; }
+.context-meter button { border-radius: var(--radius-sm); font-weight: 600; }
+.context-meter button:hover { background: var(--accent-soft); }
+
+/* ------------------------------------------------------------- popovers */
+.model-popover, .generation-popover, .dictionary-popover, .modal {
+  border-radius: var(--radius-lg);
+  border-color: var(--line);
+  box-shadow: var(--shadow-pop);
+}
+.model-popover { padding: 14px; }
+.generation-popover { padding: 12px; }
+.provider-options button, .configured-models button { border-radius: var(--radius-sm); }
+.kind-toggle { border-radius: var(--radius-sm); }
+.kind-toggle button.selected { background: var(--accent); }
+
+/* ---------------------------------------------------------------- forms */
+input, select, textarea { border-radius: var(--radius-sm); transition: border-color .16s ease, box-shadow .16s ease; }
+.primary { border-radius: var(--radius-sm); font-weight: 550; }
+.text-button { border-radius: var(--radius-sm); font-weight: 500; }
+
+/* ---------------------------------------------------------------- modal */
+.modal { padding: 26px; }
+.modal h2 { letter-spacing: -0.01em; }
+
+/* ------------------------------------------------------------ empty state */
+.empty-state h1 { font-size: 30px; font-weight: 700; letter-spacing: -0.02em; }
+.empty-logo { border-radius: 18px; background: var(--accent-soft); color: var(--accent); }
+
+/* ---------------------------------------------------------------- notice */
+.notice { border-bottom: 1px solid #f3e3c0; }
+
+/* ----------------------------------------------------------------- auth */
+.auth-shell { background: var(--canvas); }
+.auth-brand h1 { font-weight: 750; letter-spacing: -0.025em; }
+.auth-form { border-radius: var(--radius-lg); border-color: var(--line); box-shadow: var(--shadow-pop); padding: 30px; }
+.brand-mark { border-radius: var(--radius-md); }
+
+/* ------------------------------------------------------------- code block */
+.markdown-content pre { border-radius: var(--radius-md); }
+.code-block { border-radius: var(--radius-md); }
+.markdown-content :not(pre) > code { border-radius: 5px; }
+
+/* ------------------------------------------------------------- dark mode */
+/* new-api-style charcoal: near-black canvas, raised cards, quiet borders. */
+.app-shell.dark {
+  --surface: #1a1a1a;
+  --canvas: #111111;
+  --ink: #ececec;
+  --ink-soft: #b8b8b8;
+  --ink-faint: #7d7d7d;
+  --line: #2c2c2c;
+  --line-soft: #232323;
+  --accent: #2dd4bf;
+  --accent-strong: #5eead4;
+  --accent-soft: #14332f;
+  --accent-ring: #1f4a44;
+  --shadow-pop: 0 4px 10px rgba(0, 0, 0, .3), 0 16px 40px rgba(0, 0, 0, .45);
+  --shadow-card: 0 1px 2px rgba(0, 0, 0, .3), 0 2px 8px rgba(0, 0, 0, .25);
+}
+.app-shell.dark { background: var(--canvas); color: var(--ink); }
+.app-shell.dark .sidebar { background: #161616; border-right-color: var(--line-soft); }
+.app-shell.dark .chat-header { background: color-mix(in srgb, #161616 86%, transparent); border-bottom-color: var(--line-soft); }
+.app-shell.dark .composer-wrap { background: linear-gradient(to bottom, transparent, var(--canvas) 30%); }
+.app-shell.dark .composer { background: #1a1a1a; border-color: var(--line); }
+.app-shell.dark .composer:focus-within { border-color: #33534d; box-shadow: 0 0 0 3px rgba(45, 212, 191, .09), var(--shadow-card); }
+.app-shell.dark .send-button { background: #ececec; color: #111; }
+.app-shell.dark .send-button:not(:disabled):hover { background: #fff; }
+.app-shell.dark .send-button.stop { background: #c5453a; color: #fff; }
+.app-shell.dark .conversation-row.selected > button:first-child { background: var(--accent-soft); color: var(--accent-strong); }
+.app-shell.dark .conversation-row:hover > button:first-child { background: #222; }
+.app-shell.dark .new-chat { background: #1a1a1a; border-color: var(--line); color: var(--ink); }
+.app-shell.dark .new-chat:hover { background: var(--accent-soft); border-color: var(--accent-ring); color: var(--accent-strong); }
+.app-shell.dark .model-button { background: #1f1f1f; border-color: var(--line); color: var(--ink-soft); }
+.app-shell.dark .model-popover, .app-shell.dark .generation-popover, .app-shell.dark .dictionary-popover, .app-shell.dark .modal { background: #1e1e1e; border-color: var(--line); }
+.app-shell.dark input, .app-shell.dark select, .app-shell.dark textarea { background: #242424; border-color: #3a3a3a; color: #ececec; }
+.app-shell.dark .icon-button { color: #a8a8a8; }
+.app-shell.dark .icon-button:hover { background: #262626; color: #fff; }
+.app-shell.dark .notice { background: #262115; border-bottom-color: #3a3115; }
+.app-shell.dark .history p { color: var(--ink-faint); }
+.app-shell.dark .settings-button { color: var(--ink); }
+.app-shell.dark .avatar { background: var(--accent-soft); color: var(--accent-strong); }
+.app-shell.dark .message-avatar { background: #262626; color: #d8d8d8; }
+.app-shell.dark .message.user .message-avatar { background: #262626; color: #d8d8d8; }
+.app-shell.dark .empty-state h1 { color: #f2f2f2; }
+.app-shell.dark .empty-state p { color: #9a9a9a; }
+.app-shell.dark .empty-logo { background: var(--accent-soft); color: var(--accent-strong); }
+.app-shell.dark .auth-form { background: #1a1a1a; border-color: var(--line); }
+.app-shell.dark .auth-shell { background: var(--canvas); }
+.app-shell.dark .brand-mark { background: var(--accent-soft); color: var(--accent-strong); }
+.app-shell.dark .provider-card { background: #1e1e1e; border-color: var(--line); }
+.app-shell.dark .provider-card.selected { background: #232323; border-color: var(--accent-ring); }
+.app-shell.dark .provider-form, .app-shell.dark .provider-models { background: #1c1c1c; border-color: var(--line); }
+.app-shell.dark .model-config-row { background: #222; border-color: var(--line); }
+.app-shell.dark .markdown-content pre { background: #141414; }
+.app-shell.dark .markdown-content th { background: #232323; }
+.app-shell.dark .sources { background: #1c1c1c; border-color: var(--line); }
+.app-shell.dark .sources .source-list a { background: #242424; border-color: #333; }
+.app-shell.dark .agent-timeline { background: #1c1c1c; border-color: var(--line); }
+.app-shell.dark .code-copy { color: #a8a8a8; }
+.app-shell.dark .load-older { background: #1c1c1c; border-color: var(--line); color: var(--ink-soft); }
+.app-shell.dark .markdown-toggle { border-top-color: #2c2c2c; }
+.app-shell.dark .markdown-toggle input { background: #3a3a3a; }
+.app-shell.dark .markdown-toggle input:checked { background: var(--accent); }
+.app-shell.dark .generation-popover input[type=range] { background: #333; accent-color: var(--accent); }
+.app-shell.dark .generation-popover input[type=range]::-webkit-slider-thumb { background: var(--accent); border-color: #1a1a1a; box-shadow: none; }
+.app-shell.dark .generation-popover label b { color: var(--accent-strong); }
+.app-shell.dark .kind-toggle { background: #1f1f1f; border-color: #383838; }
+.app-shell.dark .kind-toggle button.selected { background: var(--accent); color: #08211d; }
+.app-shell.dark .provider-avatar { background: linear-gradient(135deg, #0d5f58, #14b8a6); }
+.app-shell.dark .context-meter div { background: #2a2a2a; }
+.app-shell.dark .context-meter i { background: var(--accent); }
+.app-shell.dark .context-meter button { color: var(--accent-strong); }
+.app-shell.dark .context-meter button:hover { background: var(--accent-soft); }
+.app-shell.dark .search-chip.enabled { color: var(--accent-strong); background: var(--accent-soft); }
+.app-shell.dark .search-chip:hover { background: #262626; }
+.app-shell.dark .message-tools button { color: #909090; }
+.app-shell.dark .message-tools button:hover { background: #262626; color: #e8e8e8; }
+.app-shell.dark .message-tools button.copied { color: var(--accent-strong); }
+.app-shell.dark .model-toggle { color: #a8a8a8; }
+.app-shell.dark .model-toggle input { accent-color: var(--accent); }
+.app-shell.dark .section-toggle { color: #a0a0a0; }
+.app-shell.dark .section-toggle:hover { color: #fff; background: #242424; }
+.app-shell.dark .provider-options button, .app-shell.dark .configured-models button { background: #242424; border-color: #333; color: #d5d5d5; }
+.app-shell.dark .provider-options button.selected, .app-shell.dark .configured-models button.selected { background: var(--accent-soft); border-color: var(--accent-ring); color: var(--accent-strong); }
+.app-shell.dark .right-navigator { background: linear-gradient(to right, transparent, var(--canvas) 35%); border-left-color: var(--line-soft); }
+.app-shell.dark .right-nav-inner button:hover { background: #222; border-left-color: var(--accent); color: var(--accent-strong); }
+.app-shell.dark .markdown-content a { color: var(--accent-strong); }
+.app-shell.dark ::highlight(dictionary-lookup) { background-color: rgba(45, 212, 191, .28); }
+.app-shell.dark .image-preview img { border-color: #333; }
+.app-shell.dark .image-error { color: #e58f82; }
+.app-shell.dark .retry-button { background: #2a1d1b; border-color: #4a3230; color: #e5a89f; }
+.app-shell.dark .retry-button:hover { background: #33221f; }
+.app-shell.dark .message.summary .message-avatar { background: #2b2718; color: #d9b95c; }
+.app-shell.dark .message.summary .message-content { background: #221f14; border-left-color: #8a7434; color: #d8c68f; }
+.app-shell.dark .message-content.markdown-content blockquote { border-left-color: #2e5a53; color: #a8b3b0; }
+
+/* Focus visibility everywhere, without shouting. */
+:focus-visible { outline: 2px solid color-mix(in srgb, var(--accent) 55%, transparent); outline-offset: 2px; }
+.app-shell.dark :focus-visible { outline-color: color-mix(in srgb, var(--accent) 65%, transparent); }
+
+/* Slim, quiet scrollbars on the message pane too. */
+.message-list, .configured-models, .provider-list, .modal, .generation-popover, .dictionary-popover { scrollbar-width: thin; scrollbar-color: #c8cfcc transparent; }
+.app-shell.dark .message-list, .app-shell.dark .configured-models, .app-shell.dark .modal, .app-shell.dark .dictionary-popover { scrollbar-color: #3a3a3a transparent; }
