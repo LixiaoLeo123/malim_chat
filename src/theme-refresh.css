@@ -2,9 +2,9 @@
  * Model selector refinement:
  * 1. WolfAI-style trigger in the conversation header
  * 2. Cascading flyout menu:
- *    - Main menu position fixed right below the trigger
- *    - Submenu flyout opens strictly to the LEFT so the main menu never shifts
- *    - Providers from Preferences are grouped cleanly without extraneous captions
+ *    - Main menu lists the providers from Preferences, fixed below the trigger
+ *    - A provider's models open to the LEFT, aligned with the hovered row,
+ *      grouped and labelled by their configured group name
  */
 
 :root {
@@ -74,22 +74,22 @@
 
 .model-menu-card.submenu-flyout {
   position: absolute;
-  top: 0;
   right: calc(100% + 6px);
   width: 240px;
   max-height: calc(100vh - 80px);
   overflow-y: auto;
 }
 
-/* Section header for provider name */
+/* Group label inside a provider's flyout */
 .model-menu-header {
   font-size: 12.5px;
-  font-weight: 600;
+  font-weight: 500;
   color: #8c8c8c;
-  padding: 8px 12px 6px;
-  text-transform: uppercase;
-  letter-spacing: 0.03em;
+  padding: 8px 12px 4px;
 }
+.model-group-section { display: flex; flex-direction: column; gap: 2px; }
+.model-group-section + .model-group-section { margin-top: 4px; padding-top: 4px; border-top: 1px solid rgba(0, 0, 0, 0.06); }
+.app-shell.dark .model-group-section + .model-group-section { border-top-color: #333333; }
 
 /* List of model items */
 .model-card-list {
@@ -143,15 +143,8 @@
   margin-left: 8px;
 }
 
-/* Category rows for other providers */
-.model-menu-categories {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  margin-top: 6px;
-  padding-top: 6px;
-  border-top: 1px solid rgba(0, 0, 0, 0.06);
-}
+/* Provider rows in the main menu */
+.model-menu-card.main-menu { gap: 2px; }
 
 .model-category-row {
   display: flex;
@@ -227,10 +220,6 @@
 
 .app-shell.dark .model-card-check {
   color: #ffffff;
-}
-
-.app-shell.dark .model-menu-categories {
-  border-top-color: #333333;
 }
 
 @media (max-width: 720px) {
