@@ -1,7 +1,8 @@
 /*
- * Model selector appearance refinement only: WolfAI-style trigger in the
- * conversation header — cpu icon, model name, provider badge, chevrons.
- * The composer keeps its original layout and styling.
+ * Model selector refinement:
+ * 1. WolfAI-style trigger in the conversation header
+ * 2. Cascading flyout menu with primary model family pinned + subcategory flyout
+ *    matching ChatGPT/new-api model menu layout
  */
 
 :root {
@@ -37,13 +38,224 @@
   box-shadow: none;
 }
 
-/* Dark mode: the app-shell.dark sheet already repaints .model-button; align
-   the new badge and icon with its neutral palette. */
+/* Container for cascading popovers */
+.model-flyout-container {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  z-index: 50;
+}
+
+/* Individual card styling */
+.model-menu-card {
+  background: #ffffff;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 18px;
+  box-shadow: 0 12px 36px -6px rgba(0, 0, 0, 0.14), 0 4px 16px -2px rgba(0, 0, 0, 0.06);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  animation: menu-enter 0.16s ease-out;
+  user-select: none;
+}
+
+.model-menu-card.main-menu {
+  width: 250px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+}
+
+.model-menu-card.submenu-flyout {
+  width: 270px;
+  max-height: calc(100vh - 80px);
+  overflow-y: auto;
+}
+
+/* Section header (e.g. GPT-5.6) */
+.model-menu-header {
+  font-size: 13px;
+  font-weight: 500;
+  color: #8c8c8c;
+  padding: 8px 12px 4px;
+}
+
+/* List of model items */
+.model-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+/* Single model button */
+.model-card-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  text-align: left;
+  border: none;
+  background: transparent;
+  padding: 8px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+  width: 100%;
+}
+
+.model-card-item:hover {
+  background: #f4f4f4;
+}
+
+.model-card-item.selected {
+  background: #f4f4f4;
+}
+
+.model-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+}
+
+.model-card-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.model-card-name {
+  font-size: 14px;
+  font-weight: 500;
+  color: #1a1a1a;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-card-tag {
+  font-size: 11px;
+  color: #8c8c8c;
+  font-weight: 400;
+}
+
+.model-card-desc {
+  font-size: 11.5px;
+  color: #8c8c8c;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.model-card-check {
+  color: #1a1a1a;
+  flex: none;
+  margin-left: 8px;
+}
+
+/* Category rows with right arrows (e.g. Grok, Claude, Gemini) */
+.model-menu-categories {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid rgba(0, 0, 0, 0.06);
+}
+
+.model-category-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: none;
+  background: transparent;
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  transition: background-color 0.12s ease;
+  width: 100%;
+  text-align: left;
+}
+
+.model-category-row:hover,
+.model-category-row.hovered {
+  background: #f4f4f4;
+}
+
+.model-category-row.has-active .category-name {
+  font-weight: 600;
+}
+
+.category-name {
+  font-size: 14px;
+  color: #1a1a1a;
+  font-weight: 450;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.category-arrow {
+  color: #8c8c8c;
+  flex: none;
+}
+
+/* Dark mode styling */
 .app-shell.dark .model-trigger-badge { background: #333; color: #b8b8b8; }
 .app-shell.dark .model-trigger-icon, .app-shell.dark .model-trigger-chevron { color: #9a9a9a; }
 
+.app-shell.dark .model-menu-card {
+  background: #212121;
+  border-color: #383838;
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.5);
+}
+
+.app-shell.dark .model-menu-header {
+  color: #888888;
+}
+
+.app-shell.dark .model-card-name {
+  color: #eeeeee;
+}
+
+.app-shell.dark .category-name {
+  color: #eeeeee;
+}
+
+.app-shell.dark .model-card-tag,
+.app-shell.dark .model-card-desc,
+.app-shell.dark .category-arrow {
+  color: #999999;
+}
+
+.app-shell.dark .model-card-item:hover,
+.app-shell.dark .model-card-item.selected,
+.app-shell.dark .model-category-row:hover,
+.app-shell.dark .model-category-row.hovered {
+  background: #2e2e2e;
+}
+
+.app-shell.dark .model-card-check {
+  color: #ffffff;
+}
+
+.app-shell.dark .model-menu-categories {
+  border-top-color: #333333;
+}
+
 @media (max-width: 720px) {
   .model-trigger-name { max-width: 110px; }
-  /* On narrow screens the header is crowded; hide the badge like WolfAI's sm: variant. */
   .model-trigger-badge { display: none; }
+  .model-flyout-container {
+    flex-direction: column;
+    right: 0;
+    max-width: calc(100vw - 20px);
+  }
+  .model-menu-card.main-menu,
+  .model-menu-card.submenu-flyout {
+    width: min(290px, calc(100vw - 24px));
+  }
 }

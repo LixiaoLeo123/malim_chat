@@ -52,6 +52,18 @@ function Chat() {
   const [loadingOlder, setLoadingOlder] = useState(false);
   const activeConversation = activeId ? conversations.find((item) => item.id === activeId) ?? null : null;
 
+  const refreshConversations = useCallback(async () => {
+    try {
+      const [chats, starred] = await Promise.all([api.conversations(), api.favoriteConversations()]);
+      const seen = new Set(chats.items.map((chat) => chat.id));
+      const missing = starred.filter((chat) => !seen.has(chat.id));
+      setConversations([...missing, ...chats.items]);
+      setConversationCursor(chats.next_cursor);
+    } catch {
+      // Background refreshes stay best-effort; don't replace active conversation list on error.
+    }
+  }, [setConversationCursor, setConversations]);
+
   const bootstrap = useEvent(async () => {
     try {
       const [chats, starred, configured] = await Promise.all([api.conversations(), api.favoriteConversations(), api.providers()]);
@@ -174,9 +186,7 @@ function Chat() {
       const turn = await runTurn(conversationId, sent, options, search, pendingId, [], controller?.signal);
       removeMessage(conversationId, pendingId);
       upsertMessage(conversationId, { ...turn.answer, tool_events: turn.toolEvents });
-      const chats = await api.conversations();
-      setConversations(chats.items);
-      setConversationCursor(chats.next_cursor);
+      await refreshConversations();
     } catch (cause) {
       if (pendingId) removeMessage(conversationId, pendingId);
       if ((cause as Error)?.name === "AbortError") return;
@@ -242,9 +252,7 @@ function Chat() {
     upsertMessage(activeId, { ...message, content });
     try {
       upsertMessage(activeId, await api.updateMessage(activeId, message.id, content));
-      const chats = await api.conversations();
-      setConversations(chats.items);
-      setConversationCursor(chats.next_cursor);
+      await refreshConversations();
     }
     catch (cause) { setMessages(activeId, before); setError(cause instanceof Error ? cause.message : "Could not edit message."); }
   }
@@ -255,9 +263,7 @@ function Chat() {
     if (message.optimistic || message.id.startsWith("local-") || message.id.startsWith("error-") || message.id.startsWith("assistant-") || message.id.startsWith("retry-")) return;
     try {
       await api.deleteMessage(activeId, message.id);
-      const chats = await api.conversations();
-      setConversations(chats.items);
-      setConversationCursor(chats.next_cursor);
+      await refreshConversations();
     }
     catch (cause) { setMessages(activeId, before); setError(cause instanceof Error ? cause.message : "Could not delete message."); }
   }
@@ -276,9 +282,7 @@ function Chat() {
     try {
       const result = await api.compact(activeId);
       upsertMessage(activeId, result.message);
-      const chats = await api.conversations();
-      setConversations(chats.items);
-      setConversationCursor(chats.next_cursor);
+      await refreshConversations();
     } catch (cause) { setError(cause instanceof Error ? cause.message : "Compaction failed."); } finally { setCompacting(false); }
   }
 
