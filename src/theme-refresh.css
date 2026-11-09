@@ -1,8 +1,10 @@
 /*
  * Model selector refinement:
  * 1. WolfAI-style trigger in the conversation header
- * 2. Cascading flyout menu with primary model family pinned + subcategory flyout
- *    matching ChatGPT/new-api model menu layout
+ * 2. Cascading flyout menu:
+ *    - Main menu position fixed right below the trigger
+ *    - Submenu flyout opens strictly to the LEFT so the main menu never shifts
+ *    - Providers from Preferences are grouped cleanly without extraneous captions
  */
 
 :root {
@@ -38,14 +40,15 @@
   box-shadow: none;
 }
 
-/* Container for cascading popovers */
+/* Container for cascading popovers:
+ * Main menu is pinned at right: 0.
+ * Submenu appears on the left using absolute positioning relative to main menu,
+ * ensuring main menu's position NEVER moves or jumps when hovering submenus.
+ */
 .model-flyout-container {
   position: absolute;
   top: calc(100% + 8px);
   right: 0;
-  display: flex;
-  align-items: flex-start;
-  gap: 6px;
   z-index: 50;
 }
 
@@ -63,23 +66,29 @@
 }
 
 .model-menu-card.main-menu {
-  width: 250px;
+  width: 240px;
   max-height: calc(100vh - 80px);
   overflow-y: auto;
+  position: relative;
 }
 
 .model-menu-card.submenu-flyout {
-  width: 270px;
+  position: absolute;
+  top: 0;
+  right: calc(100% + 6px);
+  width: 240px;
   max-height: calc(100vh - 80px);
   overflow-y: auto;
 }
 
-/* Section header (e.g. GPT-5.6) */
+/* Section header for provider name */
 .model-menu-header {
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12.5px;
+  font-weight: 600;
   color: #8c8c8c;
-  padding: 8px 12px 4px;
+  padding: 8px 12px 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
 }
 
 /* List of model items */
@@ -97,7 +106,7 @@
   text-align: left;
   border: none;
   background: transparent;
-  padding: 8px 12px;
+  padding: 9px 12px;
   border-radius: 10px;
   cursor: pointer;
   transition: background-color 0.12s ease;
@@ -112,20 +121,6 @@
   background: #f4f4f4;
 }
 
-.model-card-info {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 0;
-  flex: 1;
-}
-
-.model-card-title {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-}
-
 .model-card-name {
   font-size: 14px;
   font-weight: 500;
@@ -135,19 +130,11 @@
   white-space: nowrap;
 }
 
-.model-card-tag {
-  font-size: 11px;
+.model-card-empty {
+  font-size: 12.5px;
   color: #8c8c8c;
-  font-weight: 400;
-}
-
-.model-card-desc {
-  font-size: 11.5px;
-  color: #8c8c8c;
-  line-height: 1.35;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  padding: 10px 12px;
+  font-style: italic;
 }
 
 .model-card-check {
@@ -156,7 +143,7 @@
   margin-left: 8px;
 }
 
-/* Category rows with right arrows (e.g. Grok, Claude, Gemini) */
+/* Category rows for other providers */
 .model-menu-categories {
   display: flex;
   flex-direction: column;
@@ -169,10 +156,10 @@
 .model-category-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  gap: 8px;
   border: none;
   background: transparent;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border-radius: 10px;
   cursor: pointer;
   transition: background-color 0.12s ease;
@@ -196,6 +183,7 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  flex: 1;
 }
 
 .category-arrow {
@@ -225,8 +213,7 @@
   color: #eeeeee;
 }
 
-.app-shell.dark .model-card-tag,
-.app-shell.dark .model-card-desc,
+.app-shell.dark .model-card-empty,
 .app-shell.dark .category-arrow {
   color: #999999;
 }
@@ -249,13 +236,12 @@
 @media (max-width: 720px) {
   .model-trigger-name { max-width: 110px; }
   .model-trigger-badge { display: none; }
-  .model-flyout-container {
-    flex-direction: column;
-    right: 0;
-    max-width: calc(100vw - 20px);
-  }
-  .model-menu-card.main-menu,
   .model-menu-card.submenu-flyout {
-    width: min(290px, calc(100vw - 24px));
+    position: static;
+    margin-bottom: 6px;
+    width: min(260px, calc(100vw - 24px));
+  }
+  .model-menu-card.main-menu {
+    width: min(260px, calc(100vw - 24px));
   }
 }
