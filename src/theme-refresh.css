@@ -223,14 +223,20 @@
 }
 
 @media (max-width: 720px) {
-  .model-trigger-name { max-width: 110px; }
+  /* No room in a phone header for the provider tag or the chip glyph; the model name
+   * alone identifies the conversation, and the flyout lists the providers. */
+  .model-trigger-icon { display: none; }
   .model-trigger-badge { display: none; }
+  .model-button { max-width: 132px; gap: 5px; padding: 0 8px; }
+  .model-trigger-name { max-width: 96px; }
   .model-menu-card.submenu-flyout {
     position: static;
-    margin-bottom: 6px;
+    margin-top: 6px;
     width: min(260px, calc(100vw - 24px));
+    max-height: 40vh;
   }
   .model-menu-card.main-menu {
     width: min(260px, calc(100vw - 24px));
+    max-height: 40vh;
   }
 }

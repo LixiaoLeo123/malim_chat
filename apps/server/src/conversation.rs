@@ -73,7 +73,17 @@ pub(crate) async fn create_conversation(    State(state): State<AppState>,
     } else {
         (request.model, 128_000)
     };
+    let generation_settings = request
+        .generation_settings
+        .map(validate_generation_settings)
+        .transpose()?;
     let conversation:Conversation=sqlx::query_as("INSERT INTO conversations (id,user_id,title,model_provider_id,model,context_window) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(Uuid::new_v4()).bind(user_id).bind(request.title.unwrap_or_else(||"New chat".into()).trim()).bind(request.provider_id).bind(model).bind(context_window).fetch_one(&state.db).await?;
+    // A new chat can start from the parameters of the conversation the user left, so the
+    // first turn is generated the same way without another round trip.
+    let conversation = match generation_settings {
+        Some(settings) => sqlx::query_as("UPDATE conversations SET generation_settings=$2 WHERE id=$1 RETURNING id,title,model_provider_id,model,context_window,context_tokens,is_favorite,generation_settings,revision,created_at,updated_at").bind(conversation.id).bind(settings).fetch_one(&state.db).await?,
+        None => conversation,
+    };
     event(
         &state.db,
         user_id,

@@ -94,6 +94,7 @@ pub(crate) struct CreateConversation {
     pub(crate) title: Option<String>,
     pub(crate) provider_id: Option<Uuid>,
     pub(crate) model: Option<String>,
+    pub(crate) generation_settings: Option<GenerationSettings>,
 }
 
 #[derive(Deserialize)]

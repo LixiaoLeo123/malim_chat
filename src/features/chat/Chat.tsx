@@ -129,16 +129,19 @@ function Chat() {
   }
   async function newChat() {
     if (!providers.length) { setProviderOpen(true); setError("Add a provider before creating a chat."); return; }
-    // Start where the user last was: the most recent conversation's model, not the
-    // first provider's first model they probably never chose themselves.
-    const previous = useAppStore.getState().conversations[0];
-    const provider = providers.find((item) => item.id === previous?.model_provider_id) ?? providers[0];
-    const model = previous?.model && previous.model_provider_id === provider.id
-      ? previous.model
+    // A new chat continues where the user is: the open conversation supplies the model and
+    // the parameters. With none open, the most recently updated chat is the best guess —
+    // not conversations[0], which can be an older starred chat merged in for the sidebar.
+    const source = activeConversation ?? [...useAppStore.getState().conversations].sort((left, right) => right.updated_at.localeCompare(left.updated_at))[0];
+    const provider = providers.find((item) => item.id === source?.model_provider_id) ?? providers[0];
+    const model = source?.model && source.model_provider_id === provider.id && provider.models.some((item) => item.model === source.model)
+      ? source.model
       : provider.models[0]?.model ?? provider.default_model;
+    const settings = source?.generation_settings ?? generation;
     try {
-      const conversation = await api.createConversation({ provider_id: provider.id, model });
+      const conversation = await api.createConversation({ provider_id: provider.id, model, generation_settings: settings });
       setConversations([conversation, ...useAppStore.getState().conversations]);
+      setGeneration(settings);
       setMessages(conversation.id, []);
       setActiveId(conversation.id);
       setSidebarCollapsed(false);
