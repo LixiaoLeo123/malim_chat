@@ -138,10 +138,13 @@ function Chat() {
       ? source.model
       : provider.models[0]?.model ?? provider.default_model;
     const settings = source?.generation_settings ?? generation;
+    // Same clamp the loading effect applies: an old row may store 0 rounds, which the
+    // slider cannot show, so a new chat starts at its floor instead.
+    const inherited = settings.context_rounds === 0 ? { ...settings, context_rounds: 1 } : settings;
     try {
-      const conversation = await api.createConversation({ provider_id: provider.id, model, generation_settings: settings });
+      const conversation = await api.createConversation({ provider_id: provider.id, model, generation_settings: inherited });
       setConversations([conversation, ...useAppStore.getState().conversations]);
-      setGeneration(settings);
+      setGeneration(inherited);
       setMessages(conversation.id, []);
       setActiveId(conversation.id);
       setSidebarCollapsed(false);
