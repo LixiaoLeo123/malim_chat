@@ -288,8 +288,10 @@ struct CompactRequest {
 }
 
 fn validate_generation_settings(settings: GenerationSettings) -> Result<Value, ApiError> {
-    if !settings.temperature.is_finite() || !(0.0..=2.0).contains(&settings.temperature) {
-        return Err(ApiError::bad("Temperature must be between 0 and 2."));
+    if settings.temperature.is_some_and(|temperature| {
+        !temperature.is_finite() || !(0.0..=2.0).contains(&temperature)
+    }) {
+        return Err(ApiError::bad("Temperature must be between 0 and 2, or Default."));
     }
     if !matches!(
         settings.reasoning_effort.as_str(),
@@ -728,6 +730,40 @@ mod tests {
         assert!(body.get("top_p").is_none());
         assert!(body.get("top_k").is_none());
         assert!(body.get("temperature").is_none());
+
+        let default_temperature = Sampling {
+            temperature: None,
+            ..Default::default()
+        };
+        let anthropic = &build_request(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            &[],
+            &default_temperature,
+            crate::providers::Tools::None,
+            false,
+            None,
+        )
+        .body;
+        assert!(anthropic.get("temperature").is_none());
+
+        let explicit_temperature = Sampling {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let anthropic = &build_request(
+            "anthropic",
+            "https://api.anthropic.com",
+            "claude-opus-5",
+            &[],
+            &explicit_temperature,
+            crate::providers::Tools::None,
+            false,
+            None,
+        )
+        .body;
+        assert!((anthropic["temperature"].as_f64().unwrap() - 0.7).abs() < 1e-6);
     }
 
     #[test]
@@ -923,7 +959,7 @@ mod tests {
     fn validates_the_new_parameter_ranges() {
         use crate::models::GenerationSettings;
         let base = || GenerationSettings {
-            temperature: 0.7,
+            temperature: Some(0.7),
             reasoning_effort: "medium".into(),
             enable_markdown: true,
             stream: true,
@@ -936,7 +972,7 @@ mod tests {
             web_fetch_uses: None,
         };
         let valid = GenerationSettings {
-            temperature: 1.0,
+            temperature: Some(1.0),
             reasoning_effort: "high".into(),
             top_p: Some(1.0),
             top_k: Some(1),
@@ -978,10 +1014,10 @@ mod tests {
         );
         assert_eq!(
             reject(GenerationSettings {
-                temperature: 2.1,
+                temperature: Some(2.1),
                 ..base()
             }),
-            "Temperature must be between 0 and 2."
+            "Temperature must be between 0 and 2, or Default."
         );
         assert_eq!(
             reject(GenerationSettings {

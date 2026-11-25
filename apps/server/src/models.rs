@@ -109,7 +109,7 @@ pub(crate) struct UpdateConversation {
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct GenerationSettings {
-    pub(crate) temperature: f32,
+    pub(crate) temperature: Option<f32>,
     pub(crate) reasoning_effort: String,
     pub(crate) enable_markdown: bool,
     pub(crate) stream: bool,

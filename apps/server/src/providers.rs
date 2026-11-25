@@ -304,8 +304,8 @@ pub(crate) fn build_request(
     let kind = RequestKind::parse(kind);
     let url = provider_url(kind, base);
     let mut body = json!({ "model": model });
-    // Anthropic's temperature stops at 1; the OpenAI dialects take up to 2. Clamping
-    // instead of rejecting keeps a value carried over from another model harmless.
+    // Anthropic accepts an optional temperature and defaults it server-side; omit it when the
+    // user selected Default. OpenAI-compatible providers retain their own server default too.
     if let Some(value) = sampling.temperature {
         let capped = match kind {
             RequestKind::Anthropic => value.clamp(0.0, 1.0),
