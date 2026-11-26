@@ -207,18 +207,17 @@ pub(crate) async fn create_message(
     let content = request.content.trim();
     let images = request.images.unwrap_or_default();
     if images.len() > 8 {
-        return Err(ApiError::bad("A message may contain at most 8 images."));
+        return Err(ApiError::bad("A message may contain at most 8 attachments."));
     }
     for image in &images {
-        if !image.starts_with("data:image/") || image.len() > 7_000_000 {
-            return Err(ApiError::bad(
-                "Each image must be a data URL of at most 5 MB.",
-            ));
+        let media_type = image.strip_prefix("data:").and_then(|value| value.split(';').next()).unwrap_or("");
+        let is_video = media_type.starts_with("video/");
+        let max_length = if is_video { 13_500_000 } else { 7_000_000 };
+        if (!media_type.starts_with("image/") && !is_video) || image.len() > max_length {
+            return Err(ApiError::bad(if is_video { "Each video must be a data URL of at most 10 MB." } else { "Each image must be a data URL of at most 5 MB." }));
         }
         if parse_data_url(image).is_none() {
-            return Err(ApiError::bad(
-                "Each image must be a valid base64 image data URL.",
-            ));
+            return Err(ApiError::bad("Each attachment must be a valid base64 image or video data URL."));
         }
     }
     if content.is_empty() && images.is_empty() {

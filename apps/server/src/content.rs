@@ -16,7 +16,7 @@ pub(crate) fn estimate_image_tokens(images: &[String]) -> i32 {
 pub(crate) fn parse_data_url(url: &str) -> Option<(String, String)> {
     let rest = url.strip_prefix("data:")?;
     let (meta, data) = rest.split_once(',')?;
-    if !meta.starts_with("image/") || data.is_empty() {
+    if !meta.starts_with("image/") && !meta.starts_with("video/") || data.is_empty() {
         return None;
     }
     Some((meta.split(';').next()?.to_string(), data.to_string()))
@@ -42,7 +42,7 @@ pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, ima
     if images.is_empty() {
         return json!(content);
     }
-    if !supports_images {
+    if !supports_images && kind != "google_gemini" {
         return json!(plain_text_content(content, images));
     }
     let mut parts: Vec<Value> = Vec::new();
@@ -50,18 +50,20 @@ pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, ima
         parts.push(text_part(kind, content));
     }
     for image in images {
-        if let Some((media_type, data)) = parse_data_url(image.as_str().unwrap_or("")) {
-            match kind {
-                "anthropic" => parts.push(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})),
-                // Responses names its parts after the input item, not the Chat shape.
-                "openai_responses" => parts.push(json!({"type": "input_image", "image_url": image})),
-                _ => parts.push(json!({"type": "image_url", "image_url": {"url": image}})),
-            }
-        } else {
-            parts.push(text_part(
-                kind,
-                "[Image attachment omitted: invalid image data.]",
-            ));
+        let Some((media_type, data)) = parse_data_url(image.as_str().unwrap_or("")) else {
+            parts.push(text_part(kind, "[Media attachment omitted: invalid data URL.]"));
+            continue;
+        };
+        let is_video = media_type.starts_with("video/");
+        if is_video && kind != "google_gemini" {
+            parts.push(text_part(kind, "[Video attachment omitted: the selected provider does not support video input.]"));
+            continue;
+        }
+        match kind {
+            "anthropic" => parts.push(json!({"type": "image", "source": {"type": "base64", "media_type": media_type, "data": data}})),
+            "openai_responses" => parts.push(json!({"type": "input_image", "image_url": image})),
+            "google_gemini" => parts.push(json!({"inlineData": {"mimeType": media_type, "data": data}})),
+            _ => parts.push(json!({"type": "image_url", "image_url": {"url": image}})),
         }
     }
     if parts.is_empty() {

@@ -26,7 +26,7 @@ pub(crate) async fn create_provider(
     let kind = request.kind.unwrap_or_else(|| "openai_compatible".into());
     if !matches!(
         kind.as_str(),
-        "openai_compatible" | "openai_responses" | "anthropic"
+        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"
     ) || !request.base_url.starts_with("https://")
         || request.api_key.trim().is_empty()
     {
@@ -70,10 +70,10 @@ pub(crate) async fn update_provider(
     let kind = request.kind.unwrap_or(current.kind);
     if !matches!(
         kind.as_str(),
-        "openai_compatible" | "openai_responses" | "anthropic"
+        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"
     ) {
         return Err(ApiError::bad(
-            "Provider API format must be OpenAI-compatible or Anthropic.",
+            "Provider API format must be OpenAI-compatible, OpenAI Responses, Anthropic, or Google Gemini.",
         ));
     }
     let base_url = request
@@ -229,10 +229,10 @@ pub(crate) async fn create_provider_model(
     }
     if !matches!(
         request.kind.as_str(),
-        "openai_compatible" | "openai_responses" | "anthropic"
+        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"
     ) {
         return Err(ApiError::bad(
-            "Model API format must be OpenAI-compatible or Anthropic.",
+            "Model API format must be OpenAI-compatible, OpenAI Responses, Anthropic, or Google Gemini.",
         ));
     }
     let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools,created_at,updated_at")
@@ -260,10 +260,10 @@ pub(crate) async fn update_provider_model(
     if request
         .kind
         .as_deref()
-        .is_some_and(|v| !matches!(v, "openai_compatible" | "openai_responses" | "anthropic"))
+        .is_some_and(|v| !matches!(v, "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"))
     {
         return Err(ApiError::bad(
-            "Model API format must be OpenAI-compatible or Anthropic.",
+            "Model API format must be OpenAI-compatible, OpenAI Responses, Anthropic, or Google Gemini.",
         ));
     }
     let previous: (String,) =

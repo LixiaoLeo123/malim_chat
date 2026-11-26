@@ -525,7 +525,7 @@ mod tests {
     use crate::content::{content_part, parse_data_url, plain_text_content};
     use crate::thinking::{split_thinking, strip_thinking, ThinkingStream};
     use crate::providers::{
-        provider_error_from_response, provider_stream_delta, provider_url, RequestKind, StreamFragment,
+        build_request, provider_error_from_response, provider_stream_delta, provider_url, RequestKind, Sampling, StreamFragment, Tools,
     };
     use crate::web_tools::{is_safe_public_url, is_valid_search_query, web_tool_definitions};
     use crate::{validate_generation_settings, validate_respond_request};
@@ -1217,24 +1217,47 @@ mod tests {
                 ..Default::default()
             })
         );
+        assert_eq!(
+            provider_stream_delta("google_gemini", "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}"),
+            Some(StreamFragment {
+                reasoning: false,
+                text: "hello".into(),
+                part: None,
+                response_id: None,
+                error: None,
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            provider_stream_delta("google_gemini", "data: {\"usageMetadata\":{\"totalTokenCount\":3}}"),
+            None
+        );
     }
 
     #[test]
     fn accepts_standard_provider_base_urls() {
         assert_eq!(
-            provider_url(RequestKind::OpenAiChat, "https://api.openai.com"),
+            provider_url(RequestKind::GoogleGemini, "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", false),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
+        );
+        assert_eq!(
+            provider_url(RequestKind::GoogleGemini, "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", true),
+            "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+        );
+        assert_eq!(
+            provider_url(RequestKind::OpenAiChat, "https://api.openai.com", "gpt", false),
             "https://api.openai.com/v1/chat/completions"
         );
         assert_eq!(
-            provider_url(RequestKind::OpenAiChat, "https://api.openai.com/v1"),
+            provider_url(RequestKind::OpenAiChat, "https://api.openai.com/v1", "gpt", false),
             "https://api.openai.com/v1/chat/completions"
         );
         assert_eq!(
-            provider_url(RequestKind::Anthropic, "https://api.anthropic.com"),
+            provider_url(RequestKind::Anthropic, "https://api.anthropic.com", "model", false),
             "https://api.anthropic.com/v1/messages"
         );
         assert_eq!(
-            provider_url(RequestKind::Anthropic, "https://api.anthropic.com/v1"),
+            provider_url(RequestKind::Anthropic, "https://api.anthropic.com/v1", "model", false),
             "https://api.anthropic.com/v1/messages"
         );
     }
@@ -1276,10 +1299,8 @@ mod tests {
             parse_data_url("data:image/png;base64,AAAA"),
             Some(("image/png".into(), "AAAA".into()))
         );
-        assert_eq!(
-            parse_data_url("data:image/jpeg;base64,BBBB"),
-            Some(("image/jpeg".into(), "BBBB".into()))
-        );
+        assert_eq!(parse_data_url("data:image/jpeg;base64,BBBB"), Some(("image/jpeg".into(), "BBBB".into())));
+        assert_eq!(parse_data_url("data:video/mp4;base64,CCCC"), Some(("video/mp4".into(), "CCCC".into())));
         assert_eq!(parse_data_url("data:text/plain;base64,AAAA"), None);
         assert_eq!(parse_data_url("data:image/png;base64,"), None);
         assert_eq!(parse_data_url("https://example.com/a.png"), None);
@@ -1298,6 +1319,29 @@ mod tests {
         let text = plain_text_content("describe this", &images);
         assert!(text.contains("does not support image input"));
         assert!(text.starts_with("describe this"));
+    }
+
+    #[test]
+    fn builds_google_video_content_only_for_google_models() {
+        let video = content_part("google_gemini", true, "summarize", &[serde_json::json!("data:video/mp4;base64,AAAA")]);
+        assert_eq!(video[0]["type"], "text");
+        assert_eq!(video[1]["inlineData"]["mimeType"], "video/mp4");
+        assert_eq!(video[1]["inlineData"]["data"], "AAAA");
+        let gemini = crate::providers::gemini_contents(&[serde_json::json!({"role":"user","content":video})]);
+        assert_eq!(gemini[0]["parts"][1]["inlineData"]["mimeType"], "video/mp4");
+        let openai = content_part("openai_compatible", true, "summarize", &[serde_json::json!("data:video/mp4;base64,AAAA")]);
+        assert!(openai[1]["text"].as_str().unwrap().contains("does not support video"));
+        let request = build_request("google_gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", &[serde_json::json!({"role":"user","content":video})], &Sampling::default(), Tools::None, true, None);
+        assert_eq!(request.body["contents"][0]["parts"][1]["inlineData"]["mimeType"], "video/mp4");
+        assert!(request.url.ends_with(":streamGenerateContent?alt=sse"));
+        assert!(request.body.get("model").is_none());
+        assert!(request.body.get("alt").is_none());
+        let instructions = build_request("google_gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", &[serde_json::json!({"role":"system","content":"Be brief"}), serde_json::json!({"role":"assistant","content":"hi"}), serde_json::json!({"role":"user","content":"hello"})], &Sampling { temperature: Some(0.4), ..Default::default() }, Tools::None, false, None);
+        assert_eq!(instructions.body["systemInstruction"]["parts"][0]["text"], "Be brief");
+        assert_eq!(instructions.body["contents"][0]["role"], "model");
+        assert_eq!(instructions.body["contents"][1]["role"], "user");
+        assert!((instructions.body["generationConfig"]["temperature"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert!(instructions.url.ends_with(":generateContent"));
     }
 
     #[test]

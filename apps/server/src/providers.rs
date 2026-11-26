@@ -8,12 +8,14 @@ pub(crate) enum RequestKind {
     OpenAiChat,
     OpenAiResponses,
     Anthropic,
+    GoogleGemini,
 }
 
 impl RequestKind {
     pub(crate) fn parse(kind: &str) -> Self {
         match kind {
             "anthropic" => Self::Anthropic,
+            "google_gemini" => Self::GoogleGemini,
             "openai_responses" => Self::OpenAiResponses,
             _ => Self::OpenAiChat,
         }
@@ -213,6 +215,10 @@ pub(crate) async fn call_provider(
             response_id: body["id"].as_str().map(str::to_string),
             ..Default::default()
         },
+        RequestKind::GoogleGemini => {
+            let text = gemini_content(&body).ok_or_else(invalid_provider_response)?;
+            Reply { text, ..Default::default() }
+        },
         RequestKind::Anthropic => {
             let (text, reasoning) = anthropic_parts(&body);
             if text.is_empty() && reasoning.is_empty() {
@@ -266,6 +272,7 @@ pub(crate) struct Outbound {
     pub(crate) url: String,
     pub(crate) body: Value,
     pub(crate) anthropic: bool,
+    pub(crate) kind: RequestKind,
 }
 
 /// Every sampling knob a provider call can carry, as one value so each path —
@@ -302,7 +309,7 @@ pub(crate) fn build_request(
     chain: Option<&str>,
 ) -> Outbound {
     let kind = RequestKind::parse(kind);
-    let url = provider_url(kind, base);
+    let url = provider_url(kind, base, model, stream);
     let mut body = json!({ "model": model });
     // Anthropic accepts an optional temperature and defaults it server-side; omit it when the
     // user selected Default. OpenAI-compatible providers retain their own server default too.
@@ -342,11 +349,20 @@ pub(crate) fn build_request(
             // Logged per turn: when the same model answers over Chat but fails here, the
             // difference between an accepted and a rejected request is exactly this line.
             info!(model, shape = %responses_shape(&body), "outbound Responses request");
-            Outbound {
-                url,
-                body,
-                anthropic: false,
-            }
+            Outbound { url, body, anthropic: false, kind }
+        }
+        RequestKind::GoogleGemini => {
+            body.as_object_mut().unwrap().remove("model");
+            body.as_object_mut().unwrap().remove("temperature");
+            body.as_object_mut().unwrap().remove("top_p");
+            body["contents"] = json!(gemini_contents(messages));
+            let system = messages.iter().filter(|message| message["role"] == "system").filter_map(|message| message["content"].as_str()).collect::<Vec<_>>().join("\n\n");
+            if !system.is_empty() { body["systemInstruction"] = json!({"parts": [{"text": system}]}); }
+            if let Some(value) = sampling.temperature { body["generationConfig"]["temperature"] = json!(value.clamp(0.0, 2.0)); }
+            if let Some(value) = sampling.top_p { body["generationConfig"]["topP"] = json!(value.clamp(0.0, 1.0)); }
+            if let Some(value) = sampling.top_k { body["generationConfig"]["topK"] = json!(value); }
+            if let Some(value) = sampling.max_tokens { body["generationConfig"]["maxOutputTokens"] = json!(value); }
+            Outbound { url, body, anthropic: false, kind }
         }
         RequestKind::Anthropic => {
             let system = messages
@@ -379,11 +395,7 @@ pub(crate) fn build_request(
             if stream {
                 body["stream"] = json!(true);
             }
-            Outbound {
-                url,
-                body,
-                anthropic: true,
-            }
+            Outbound { url, body, anthropic: true, kind }
         }
         RequestKind::OpenAiChat => {
             body["messages"] = json!(messages);
@@ -397,11 +409,7 @@ pub(crate) fn build_request(
             if let Some(value) = sampling.max_tokens {
                 body["max_tokens"] = json!(value);
             }
-            Outbound {
-                url,
-                body,
-                anthropic: false,
-            }
+            Outbound { url, body, anthropic: false, kind }
         }
     }
 }
@@ -413,19 +421,14 @@ async fn send(
     tool_request: bool,
     chained: bool,
 ) -> Result<reqwest::Response, ApiError> {
-    let response = if request.anthropic {
-        http.post(&request.url)
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01")
-            .json(&request.body)
-            .send()
-            .await?
-    } else {
-        http.post(&request.url)
-            .bearer_auth(key)
-            .json(&request.body)
-            .send()
-            .await?
+    let response = match request.kind {
+        RequestKind::GoogleGemini => {
+            http.post(&request.url).header("x-goog-api-key", key).json(&request.body).send().await?
+        }
+        RequestKind::Anthropic => {
+            http.post(&request.url).header("x-api-key", key).header("anthropic-version", "2023-06-01").json(&request.body).send().await?
+        }
+        _ => http.post(&request.url).bearer_auth(key).json(&request.body).send().await?,
     };
     ensure_provider_success(response, tool_request, chained).await
 }
@@ -549,7 +552,7 @@ fn provider_error_kind(
     ApiError::provider_unavailable()
 }
 
-pub(crate) fn provider_url(kind: RequestKind, base: &str) -> String {
+pub(crate) fn provider_url(kind: RequestKind, base: &str, model: &str, stream: bool) -> String {
     let base = base.trim_end_matches('/');
     match kind {
         RequestKind::Anthropic if base.ends_with("/v1/messages") => base.to_string(),
@@ -558,6 +561,7 @@ pub(crate) fn provider_url(kind: RequestKind, base: &str) -> String {
         RequestKind::OpenAiResponses if base.ends_with("/responses") => base.to_string(),
         RequestKind::OpenAiResponses if base.ends_with("/v1") => format!("{base}/responses"),
         RequestKind::OpenAiResponses => format!("{base}/v1/responses"),
+        RequestKind::GoogleGemini => format!("{base}/models/{model}:{}{}", if stream { "streamGenerateContent" } else { "generateContent" }, if stream { "?alt=sse" } else { "" }),
         RequestKind::OpenAiChat if base.ends_with("/chat/completions") => base.to_string(),
         RequestKind::OpenAiChat if base.ends_with("/v1") => format!("{base}/chat/completions"),
         RequestKind::OpenAiChat => format!("{base}/v1/chat/completions"),
@@ -775,6 +779,34 @@ fn tool_result_detail(block: &Value) -> String {
     String::new()
 }
 
+pub(crate) fn gemini_contents(messages: &[Value]) -> Vec<Value> {
+    let mut contents = Vec::new();
+    for message in messages {
+        let Some(role) = message["role"].as_str() else { continue };
+        // The system prompt rides `systemInstruction`, which the request builder sets once.
+        if role == "system" { continue; }
+        let content = &message["content"];
+        let parts = content.as_array().map(|parts| parts.iter().filter_map(|part| {
+            if part.get("inlineData").is_some() { return Some(part.clone()); }
+            match part["type"].as_str()? {
+                "text" => Some(json!({"text": part["text"]})),
+                "image_url" => {
+                    let url = part["image_url"]["url"].as_str()?;
+                    let (mime_type, data) = crate::content::parse_data_url(url)?;
+                    Some(json!({"inlineData": {"mimeType": mime_type, "data": data}}))
+                }
+                _ => None,
+            }
+        }).collect::<Vec<_>>()).unwrap_or_else(|| vec![json!({"text": content.as_str().unwrap_or_default()})]);
+        contents.push(json!({"role": if role == "assistant" {"model"} else {"user"}, "parts": parts}));
+    }
+    contents
+}
+
+fn gemini_content(body: &Value) -> Option<String> {
+    body["candidates"][0]["content"]["parts"].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<String>()).filter(|text| !text.is_empty())
+}
+
 fn responses_content(body: &Value) -> Option<String> {
     if let Some(text) = body["output_text"].as_str() {
         return Some(text.to_string());
@@ -890,6 +922,13 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
         return Some(fragment(None, Some(reason.to_string())));
     }
     let kind = RequestKind::parse(kind);
+    if kind == RequestKind::GoogleGemini {
+        if let Some(error) = value.get("error") {
+            return Some(fragment(Some(upstream_detail(&error.to_string())), None));
+        }
+        let text = gemini_content(&value).unwrap_or_default();
+        return (!text.is_empty()).then(|| StreamFragment { text, ..Default::default() });
+    }
     if kind == RequestKind::OpenAiResponses {
         let response_id = value["response"]["id"]
             .as_str()

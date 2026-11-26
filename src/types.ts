@@ -1,4 +1,4 @@
-export type ProviderKind = "openai_compatible" | "openai_responses" | "anthropic";
+export type ProviderKind = "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini";
 export type Role = "user" | "assistant" | "system" | "tool" | "summary";
 export interface User { id: string; email: string; display_name: string; created_at: string }
 export interface ProviderModel { id: string; provider_id: string; group_name: string; model: string; kind: ProviderKind; sort_order: number; context_window: number; supports_images: boolean; chain_context: boolean; hosted_tools: boolean; created_at: string; updated_at: string }

@@ -97,7 +97,7 @@ pub(crate) async fn respond(
     let kind = provider_model_kind(&state.db, provider_id, &model)
         .await?
         .unwrap_or_else(|| p.0.clone());
-    let supports_images = provider_model_supports_images(&state.db, provider_id, &model)
+    let supports_images = kind == "google_gemini" || provider_model_supports_images(&state.db, provider_id, &model)
         .await?
         .unwrap_or(false);
     let context_rounds = request.context_rounds.unwrap_or(None);
@@ -109,8 +109,9 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
     // off. Only one applies per turn, and both switches are per model because a gateway
     // implements any subset of a dialect and only the user knows what their channel serves.
     let responses_model = kind == "openai_responses";
-    let hosted_tools = (responses_model || kind == "anthropic")
-        && provider_model_hosted_tools(&state.db, provider_id, &model).await?;
+    let hosted_tools = kind == "google_gemini"
+        || ((responses_model || kind == "anthropic")
+            && provider_model_hosted_tools(&state.db, provider_id, &model).await?);
     // Every dialect can search now: hosted dialects do it on the provider's side when
     // hosted tools are on, and any of them runs the SearXNG ReAct loop when they are off.
     let search_requested = !hosted_tools && (request.search.unwrap_or(false) || explicit_search);
