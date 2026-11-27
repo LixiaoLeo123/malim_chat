@@ -87,6 +87,7 @@ export function ConversationView({ conversation, messages, hasOlder, loadingOlde
   }
   function addFiles(list: FileList | File[] | null) {
     if (!list) return;
+    let queued = 0;
     for (const file of Array.from(list)) {
       const isImage = file.type.startsWith("image/");
       const isGoogleVideo = activeModel?.kind === "google_gemini" && file.type.startsWith("video/");
@@ -95,6 +96,8 @@ export function ConversationView({ conversation, messages, hasOlder, loadingOlde
         if (activeModel?.kind !== "deepseek") { setImageError(activeModel?.kind === "google_gemini" ? "Choose a supported image or video file." : "Only image files can be attached to this model."); continue; }
         if (!conversation?.model_provider_id) { setImageError("Choose a DeepSeek provider before uploading files."); continue; }
         if (file.size > 32 * 1024 * 1024) { setImageError("Each file must be 32 MB or smaller."); continue; }
+        if (images.length + files.length + queued >= 8) { setImageError("A message can hold up to 8 attachments."); continue; }
+        queued += 1;
         uploadFile(file, conversation.model_provider_id);
         continue;
       }
