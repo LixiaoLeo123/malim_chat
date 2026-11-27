@@ -373,11 +373,7 @@ pub(crate) async fn upload_provider_file(
         return Err(ApiError::bad("Files must be 32 MB or smaller."));
     }
     let key = decrypt(&state, &provider.2, &provider.3)?;
-    // The Files API sits at the API root even when the chat base is spelled with /v1.
-    let url = format!(
-        "{}/files",
-        provider.1.trim_end_matches('/').trim_end_matches("/v1")
-    );
+    let url = deepseek_files_url(&provider.1);
     let named_part = || {
         reqwest::multipart::Part::bytes(bytes.clone()).file_name(filename.to_string())
     };
@@ -418,6 +414,14 @@ pub(crate) async fn upload_provider_file(
         "media_type": media_type,
         "size": parsed["bytes"].as_u64().unwrap_or(bytes.len() as u64),
     })))
+}
+
+/// The Files API sits at the API root even when the chat base is spelled with /v1.
+pub(crate) fn deepseek_files_url(base: &str) -> String {
+    format!(
+        "{}/files",
+        base.trim_end_matches('/').trim_end_matches("/v1")
+    )
 }
 
 /// PDF, Word and PowerPoint files need the provider's document parser; everything else

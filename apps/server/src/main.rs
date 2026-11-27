@@ -1485,6 +1485,14 @@ mod tests {
             crate::provider_config::deepseek_file_purpose("image/png", "photo.png"),
             "user_data"
         );
+        assert_eq!(
+            crate::provider_config::deepseek_files_url("https://api.deepseek.com/"),
+            "https://api.deepseek.com/files"
+        );
+        assert_eq!(
+            crate::provider_config::deepseek_files_url("https://api.deepseek.com/v1"),
+            "https://api.deepseek.com/files"
+        );
     }
 
     #[test]
