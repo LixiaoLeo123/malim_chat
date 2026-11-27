@@ -34,9 +34,9 @@ export function GenerationButton({ generation, onChange, kind, hosted }: { gener
   // The parameters follow the dialect: Anthropic's temperature stops at 1, only it takes
   // top_k, and its effort rides the top-level `effort` field instead of the OpenAI keys.
   const isAnthropic = kind === "anthropic";
-  // The Gemini dialect answers without tools here, so neither the hosted-tool budget nor
-  // the ReAct-round bound has anything to act on.
-  const toolCapable = kind !== "google_gemini";
+  // Gemini and DeepSeek answer without client-side tools here, so neither the hosted-tool
+  // budget nor the ReAct-round bound has anything to act on.
+  const toolCapable = kind !== "google_gemini" && kind !== "deepseek";
   const tempMax = isAnthropic ? 1 : 2;
   const temperature = Math.min(generation.temperature ?? 0.7, tempMax);
   const effort = ["low", "medium", "high"] as const;

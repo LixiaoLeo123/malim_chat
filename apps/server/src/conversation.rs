@@ -186,7 +186,7 @@ pub(crate) async fn list_messages(
         .unwrap_or(DEFAULT_PAGE_SIZE)
         .clamp(1, MAX_PAGE_SIZE);
     let cursor = page.cursor.as_deref().and_then(|s| s.parse::<i64>().ok());
-    let mut rows=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR sequence < $2) ORDER BY sequence DESC LIMIT $3").bind(id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
+    let mut rows=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,files,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND deleted_at IS NULL AND ($2::bigint IS NULL OR sequence < $2) ORDER BY sequence DESC LIMIT $3").bind(id).bind(cursor).bind(limit+1).fetch_all(&state.db).await?;
     let next = rows.get(limit as usize).map(|m| m.sequence.to_string());
     rows.truncate(limit as usize);
     rows.reverse();
@@ -206,7 +206,8 @@ pub(crate) async fn create_message(
     let c = own_conversation(&state.db, user_id, id).await?;
     let content = request.content.trim();
     let images = request.images.unwrap_or_default();
-    if images.len() > 8 {
+    let files = request.files.unwrap_or_default();
+    if images.len() + files.len() > 8 {
         return Err(ApiError::bad("A message may contain at most 8 attachments."));
     }
     for image in &images {
@@ -220,7 +221,16 @@ pub(crate) async fn create_message(
             return Err(ApiError::bad("Each attachment must be a valid base64 image or video data URL."));
         }
     }
-    if content.is_empty() && images.is_empty() {
+    // File references are opaque ids minted by the provider's Files API through our own
+    // upload endpoint; the id shape is the only check that needs no extra round trip.
+    for file in &files {
+        let id = file["id"].as_str().unwrap_or_default();
+        let name = file["name"].as_str().unwrap_or_default();
+        if !id.starts_with("file-api-") || id.len() > 128 || name.is_empty() || name.len() > 512 {
+            return Err(ApiError::bad("Each file attachment must be an uploaded file reference."));
+        }
+    }
+    if content.is_empty() && images.is_empty() && files.is_empty() {
         return Err(ApiError::bad(
             "Message must contain text or at least one image.",
         ));
@@ -230,12 +240,12 @@ pub(crate) async fn create_message(
             "Message text must be at most 200,000 characters.",
         ));
     };
-    if let Some(existing)=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND client_mutation_id=$2").bind(id).bind(request.client_mutation_id).fetch_optional(&state.db).await? { return Ok(Json(existing)); }
+    if let Some(existing)=sqlx::query_as::<_,Message>("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,files,edited_at,created_at,updated_at FROM messages WHERE conversation_id=$1 AND client_mutation_id=$2").bind(id).bind(request.client_mutation_id).fetch_optional(&state.db).await? { return Ok(Json(existing)); }
     let mut tx = state.db.begin().await?;
     let is_first_user_message: bool = sqlx::query_scalar("SELECT NOT EXISTS (SELECT 1 FROM messages WHERE conversation_id=$1 AND role='user' AND deleted_at IS NULL)").bind(id).fetch_one(&mut *tx).await?;
     let tokens = estimate_tokens(content) + estimate_image_tokens(&images);
     let (sequence, mut revision): (i64, i64) = sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1, revision").bind(id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
-    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,images,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7,$8) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence).bind(request.client_mutation_id).bind(content).bind(json!(images)).bind(tokens).bind(if request.search.unwrap_or(false){json!([])}else{json!([])}).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,client_mutation_id,role,content,images,files,token_count,search_sources) VALUES ($1,$2,$3,$4,'user',$5,$6,$7,$8,$9) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,files,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(id).bind(sequence).bind(request.client_mutation_id).bind(content).bind(json!(images)).bind(json!(files)).bind(tokens).bind(if request.search.unwrap_or(false){json!([])}else{json!([]) }).fetch_one(&mut *tx).await?;
     let mut title_changed = false;
     if is_first_user_message && c.title == "New chat" {
         let title_source = if content.is_empty() {
@@ -286,7 +296,7 @@ pub(crate) async fn update_message(
     if content.is_empty() {
         return Err(ApiError::bad("Message cannot be empty."));
     }
-    let m:Message=sqlx::query_as("UPDATE messages SET content=$3,token_count=$4,edited_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(message_id).bind(id).bind(content).bind(estimate_tokens(content)).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let m:Message=sqlx::query_as("UPDATE messages SET content=$3,token_count=$4,edited_at=now() WHERE id=$1 AND conversation_id=$2 AND deleted_at IS NULL RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,files,edited_at,created_at,updated_at").bind(message_id).bind(id).bind(content).bind(estimate_tokens(content)).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     let tokens = recompute_context_tokens(&state.db, id).await?;
     let (revision,): (i64,) = sqlx::query_as("UPDATE conversations SET context_tokens=$2,revision=revision+1 WHERE id=$1 AND user_id=$3 RETURNING revision").bind(id).bind(tokens).bind(user_id).fetch_one(&state.db).await?;
     clear_chain(&state.db, id).await?;

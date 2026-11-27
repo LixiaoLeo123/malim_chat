@@ -26,7 +26,7 @@ pub(crate) async fn create_provider(
     let kind = request.kind.unwrap_or_else(|| "openai_compatible".into());
     if !matches!(
         kind.as_str(),
-        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"
+        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini" | "deepseek"
     ) || !request.base_url.starts_with("https://")
         || request.api_key.trim().is_empty()
     {
@@ -70,10 +70,10 @@ pub(crate) async fn update_provider(
     let kind = request.kind.unwrap_or(current.kind);
     if !matches!(
         kind.as_str(),
-        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"
+        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini" | "deepseek"
     ) {
         return Err(ApiError::bad(
-            "Provider API format must be OpenAI-compatible, OpenAI Responses, Anthropic, or Google Gemini.",
+            "Provider API format must be OpenAI-compatible, OpenAI Responses, Anthropic, Google Gemini, or DeepSeek.",
         ));
     }
     let base_url = request
@@ -229,10 +229,10 @@ pub(crate) async fn create_provider_model(
     }
     if !matches!(
         request.kind.as_str(),
-        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"
+        "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini" | "deepseek"
     ) {
         return Err(ApiError::bad(
-            "Model API format must be OpenAI-compatible, OpenAI Responses, Anthropic, or Google Gemini.",
+            "Model API format must be OpenAI-compatible, OpenAI Responses, Anthropic, Google Gemini, or DeepSeek.",
         ));
     }
     let item = sqlx::query_as("INSERT INTO provider_models (id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id,provider_id,group_name,model,kind,sort_order,context_window,supports_images,chain_context,hosted_tools,created_at,updated_at")
@@ -260,10 +260,10 @@ pub(crate) async fn update_provider_model(
     if request
         .kind
         .as_deref()
-        .is_some_and(|v| !matches!(v, "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini"))
+        .is_some_and(|v| !matches!(v, "openai_compatible" | "openai_responses" | "anthropic" | "google_gemini" | "deepseek"))
     {
         return Err(ApiError::bad(
-            "Model API format must be OpenAI-compatible, OpenAI Responses, Anthropic, or Google Gemini.",
+            "Model API format must be OpenAI-compatible, OpenAI Responses, Anthropic, Google Gemini, or DeepSeek.",
         ));
     }
     let previous: (String,) =
@@ -321,4 +321,120 @@ pub(crate) async fn delete_provider(
     };
     event(&state.db, user_id, "provider", id, "deleted", 1).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Uploads a document to the provider's Files API and returns the reference a chat
+/// message stores. The browser hands us base64 because that is what its FileReader
+/// produces; the provider takes multipart, so the server relays a single part. DeepSeek
+/// keeps these files for the account until they are deleted, which is what makes a
+/// sent document still resolvable when the conversation is reopened later.
+pub(crate) async fn upload_provider_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UploadFileRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let user_id = user_from_headers(&state, &headers)?;
+    let provider: (String, String, Vec<u8>, Vec<u8>) = sqlx::query_as(
+        "SELECT kind,base_url,encrypted_api_key,key_nonce FROM providers WHERE id=$1 AND user_id=$2",
+    )
+    .bind(id)
+    .bind(user_id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+    if provider.0 != "deepseek" {
+        return Err(ApiError::bad(
+            "File uploads are only available for DeepSeek providers.",
+        ));
+    }
+    let filename = request.filename.trim();
+    if filename.is_empty() || filename.len() > 512 {
+        return Err(ApiError::bad(
+            "The file name must be between 1 and 512 bytes.",
+        ));
+    }
+    let media_type = request
+        .media_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let bytes = BASE64
+        .decode(request.data.trim())
+        .map_err(|_| ApiError::bad("The file could not be decoded."))?;
+    if bytes.is_empty() {
+        return Err(ApiError::bad("The uploaded file is empty."));
+    }
+    // Documents are capped below the provider's own limits so a single upload cannot
+    // exhaust the server's request body budget (base64 inflates the payload by a third).
+    if bytes.len() > 32 * 1024 * 1024 {
+        return Err(ApiError::bad("Files must be 32 MB or smaller."));
+    }
+    let key = decrypt(&state, &provider.2, &provider.3)?;
+    // The Files API sits at the API root even when the chat base is spelled with /v1.
+    let url = format!(
+        "{}/files",
+        provider.1.trim_end_matches('/').trim_end_matches("/v1")
+    );
+    let named_part = || {
+        reqwest::multipart::Part::bytes(bytes.clone()).file_name(filename.to_string())
+    };
+    let part = named_part()
+        .mime_str(&media_type)
+        .unwrap_or_else(|_| named_part());
+    // Purpose goes before the file: the provider parses documents during the upload and
+    // rejects a PDF sent for `user_data`.
+    let form = reqwest::multipart::Form::new()
+        .text("purpose", deepseek_file_purpose(&media_type, filename))
+        .part("file", part);
+    let response = state
+        .http
+        .post(&url)
+        .bearer_auth(&key)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|error| {
+            warn!(%error, "provider file upload failed");
+            ApiError::provider_unavailable()
+        })?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        return Err(crate::providers::provider_error_from_response(
+            status, &body, false, false,
+        ));
+    }
+    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    let file_id = parsed["id"]
+        .as_str()
+        .ok_or_else(|| ApiError::bad("The provider returned no file id for the upload."))?
+        .to_string();
+    Ok(Json(json!({
+        "id": file_id,
+        "name": parsed["filename"].as_str().unwrap_or(filename),
+        "media_type": media_type,
+        "size": parsed["bytes"].as_u64().unwrap_or(bytes.len() as u64),
+    })))
+}
+
+/// PDF, Word and PowerPoint files need the provider's document parser; everything else
+/// (plain text, spreadsheets, ebooks, images) is taken as `user_data`.
+pub(crate) fn deepseek_file_purpose(media_type: &str, filename: &str) -> &'static str {
+    let extension = filename
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let parsed = matches!(extension.as_str(), "pdf" | "doc" | "docx" | "ppt" | "pptx")
+        || media_type == "application/pdf"
+        || media_type.contains("word")
+        || media_type.contains("powerpoint");
+    if parsed && !media_type.starts_with("image/") {
+        "text_recognition"
+    } else {
+        "user_data"
+    }
 }

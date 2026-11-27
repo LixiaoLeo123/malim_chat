@@ -3,7 +3,7 @@ import { CircleAlert, Menu, PanelLeftOpen, X } from "lucide-react";
 import "../../additions.css";
 import { api, setSession, subscribeSession, type StreamEvent } from "../../api";
 import { useAppStore } from "../../store";
-import type { GenerationSettings, Message, Session, ToolActivity } from "../../types";
+import type { FileAttachment, GenerationSettings, Message, Session, ToolActivity } from "../../types";
 import { androidApp, defaultGeneration, now, suppressLookup, updateToolEvents, uuid } from "../../lib/utils";
 import { useEvent } from "../../hooks/use-event";
 import { clearLookupHighlight } from "../dictionary/selection";
@@ -172,16 +172,16 @@ function Chat() {
     window.clearTimeout(generationTimers.current[conversationId]);
     generationTimers.current[conversationId] = window.setTimeout(() => { void api.updateConversation(conversationId, { generation_settings: next }).catch((cause) => setError(cause instanceof Error ? cause.message : "Unable to save conversation parameters.")); }, 350);
   }
-  async function sendMessage(conversationId: string, content: string, search: boolean, options = generation, images: string[] = []) {
+  async function sendMessage(conversationId: string, content: string, search: boolean, options = generation, images: string[] = [], files: FileAttachment[] = []) {
     const mutationId = uuid();
-    const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, images, reasoning_content: "", content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
+    const optimistic: Message = { id: `local-${mutationId}`, conversation_id: conversationId, sequence: Number.MAX_SAFE_INTEGER - Date.now(), client_mutation_id: mutationId, role: "user", content, images, files, reasoning_content: "", content_format: "markdown", status: "pending", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true };
     let sent: Message | null = null;
     let pendingId: string | null = null;
     const controller = options.stream ? beginStream() : null;
     upsertMessage(conversationId, optimistic);
     setBusy(true);
     try {
-      sent = await api.createMessage(conversationId, content, mutationId, search, images);
+      sent = await api.createMessage(conversationId, content, mutationId, search, images, files);
       upsertMessage(conversationId, sent);
       const list = useAppStore.getState().conversations;
       if (list[0]?.id !== conversationId) {
@@ -197,7 +197,7 @@ function Chat() {
       if (pendingId) removeMessage(conversationId, pendingId);
       if ((cause as Error)?.name === "AbortError") return;
       upsertMessage(conversationId, { ...(sent ?? optimistic), status: "error", optimistic: !sent, updated_at: now() });
-      upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", images: [], reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true, retry_message_id: (sent ?? optimistic).id });
+      upsertMessage(conversationId, { id: `error-${mutationId}`, conversation_id: conversationId, sequence: (sent?.sequence ?? optimistic.sequence) + 0.1, client_mutation_id: null, role: "assistant", content: "The response could not be generated. Use retry to send the message again.", images: [], files: [], reasoning_content: "", content_format: "markdown", status: "error", model: null, token_count: 0, search_sources: [], edited_at: null, created_at: now(), updated_at: now(), optimistic: true, retry_message_id: (sent ?? optimistic).id });
       setError(cause instanceof Error ? cause.message : "Message delivery failed.");
     } finally { setBusy(false); if (controller) endStream(); }
   }
@@ -213,7 +213,7 @@ function Chat() {
     let streamedReasoning = "";
     let toolEvents = seed;
     const sequence = base.sequence + 0.5;
-    const render = () => ({ ...base, id: pendingId, sequence, client_mutation_id: null, role: "assistant" as const, content: streamedContent, images: [] as string[], reasoning_content: streamedReasoning, status: "streaming" as const, model: null, token_count: 0, search_sources: [], tool_events: toolEvents });
+    const render = () => ({ ...base, id: pendingId, sequence, client_mutation_id: null, role: "assistant" as const, content: streamedContent, images: [] as string[], files: [] as FileAttachment[], reasoning_content: streamedReasoning, status: "streaming" as const, model: null, token_count: 0, search_sources: [], tool_events: toolEvents });
     upsertMessage(conversationId, render());
     const onEvent = (event: StreamEvent) => {
       if (event.type === "tool") toolEvents = updateToolEvents(toolEvents, event.tool);
@@ -233,7 +233,7 @@ function Chat() {
     if (!activeId) return;
     const target = message.retry_message_id ? (useAppStore.getState().messages[activeId]?.find((item) => item.id === message.retry_message_id) ?? message) : message;
     if (message.retry_message_id) removeMessage(activeId, message.id);
-    if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled, generation, target.images ?? []); return; }
+    if (target.id.startsWith("local-")) { await sendMessage(activeId, target.content, searchEnabled, generation, target.images ?? [], target.files ?? []); return; }
     const pendingId = `retry-${target.id}`;
     let seed: ToolActivity[] = [];
     try { seed = (await api.agentRun(activeId, target.id)).events ?? []; } catch { /* no previous run */ }
@@ -293,5 +293,5 @@ function Chat() {
   }
 
   const handleLookup = useCallback((word: string, anchor: { x: number; y: number }) => setLookup({ word, ...anchor }), []);
-  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""} ${androidApp ? "no-native-selection" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} hasMore={conversationCursor !== null} loadingMore={loadingConversations} onLoadMore={loadMoreConversations} onToggleFavorite={toggleFavorite} onSettings={() => setProviderOpen(true)} onClose={() => setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} hasOlder={Boolean(activeId && messageCursors[activeId])} loadingOlder={loadingOlder} onLoadOlder={loadOlderMessages} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} lookupActive={lookup !== null} streaming={streaming} onStop={stopStreaming} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content, images) => activeId ? sendMessage(activeId, content, searchEnabled, generation, images ?? []) : Promise.resolve()} onEdit={handleEditMessage} onDelete={handleDeleteMessage} onRetry={handleRetryMessage} onLookup={handleLookup} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); suppressLookup(lookup.word); setLookup(null); }} />}</main>;
+  return <main className={`app-shell ${theme} ${sidebarCollapsed ? "sidebar-is-collapsed" : ""} ${androidApp ? "no-native-selection" : ""}`}><Sidebar conversations={conversations} activeId={activeId} open={sidebarOpen} collapsed={sidebarCollapsed} onNew={() => void newChat()} onSelect={setActiveId} onRename={async (id, title) => { try { const updated = await api.updateConversation(id, { title }); setConversations(useAppStore.getState().conversations.map((item) => item.id === id ? updated : item)); } catch (cause) { setError(cause instanceof Error ? cause.message : "Unable to rename conversation."); } }} hasMore={conversationCursor !== null} loadingMore={loadingConversations} onLoadMore={loadMoreConversations} onToggleFavorite={toggleFavorite} onSettings={() => setProviderOpen(true)} onClose={() => setSidebarOpen(false)} onCollapse={() => setSidebarCollapsed(true)} userName={session?.user.display_name ?? "Account"} onSignOut={signOut} />{sidebarOpen && <div className="sidebar-backdrop" onClick={() => setSidebarOpen(false)} />}<section className="chat-shell"><header className="chat-header"><button className="icon-button desktop-reopen" aria-label="Open navigation" onClick={() => setSidebarCollapsed(false)}><PanelLeftOpen size={19} /></button><button className="icon-button mobile-only" aria-label="Open navigation" onClick={() => setSidebarOpen(true)}><Menu size={20} /></button><div className="header-title"><span>{activeConversation?.title ?? "malim_chat"}</span></div>{activeConversation && <ModelSelector conversation={activeConversation} providers={providers} open={modelMenuOpen} busy={modelChanging} onToggle={() => setModelMenuOpen(!modelMenuOpen)} onChange={changeModel} />}</header>{error && <div className="notice"><CircleAlert size={16} /><span>{error}</span><button className="icon-button" aria-label="Dismiss" onClick={() => setError(null)}><X size={16} /></button></div>}<ConversationView conversation={activeConversation} messages={activeId ? messages[activeId] ?? [] : []} hasOlder={Boolean(activeId && messageCursors[activeId])} loadingOlder={loadingOlder} onLoadOlder={loadOlderMessages} providers={providers} searchEnabled={searchEnabled} busy={busy} compacting={compacting} theme={theme} lookupActive={lookup !== null} streaming={streaming} onStop={stopStreaming} onToggleSearch={() => setSearchEnabled(!searchEnabled)} generation={generation} onGenerationChange={changeGeneration} onSend={(content, images, files) => activeId ? sendMessage(activeId, content, searchEnabled, generation, images ?? [], files ?? []) : Promise.resolve()} onEdit={handleEditMessage} onDelete={handleDeleteMessage} onRetry={handleRetryMessage} onLookup={handleLookup} onCompact={compactConversation} /><RightNavigator messages={activeId ? messages[activeId] ?? [] : []} /></section>{providerOpen && <ProviderDialog providers={providers} onClose={() => setProviderOpen(false)} onChanged={async () => { setProviders(await api.providers()); }} />}{lookup && <DictionaryPopover word={lookup.word} anchor={lookup} onClose={() => { clearLookupHighlight(); suppressLookup(lookup.word); setLookup(null); }} />}</main>;
 }

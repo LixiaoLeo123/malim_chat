@@ -213,6 +213,15 @@
 .image-previews { display: flex; flex-wrap: wrap; gap: 8px; padding: 2px 2px 10px; }
 .image-preview { position: relative; }
 .image-preview img, .image-preview video { width: 62px; height: 62px; border-radius: 8px; object-fit: cover; border: 1px solid #dce5e2; display: block; }
+/* A document preview is a chip, not a thumbnail: its name is the useful part. */
+.image-preview.file-preview { display: inline-flex; align-items: center; gap: 6px; max-width: 210px; height: 34px; padding: 0 26px 0 9px; border: 1px solid #dce5e2; border-radius: 8px; background: #f7faf9; color: #3d4a52; font-size: 12px; }
+.image-preview.file-preview span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-preview.file-preview.uploading { color: #7a8790; padding-left: 9px; }
+.app-shell.dark .image-preview.file-preview { border-color: #3d3d3d; background: #262626; color: #d4d4d4; }
+/* Files already sent, shown above the message text. */
+.message-files { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.message-file { display: inline-flex; align-items: center; gap: 5px; max-width: 260px; padding: 4px 9px; border: 1px solid #dce5e2; border-radius: 7px; background: #f7faf9; color: #3d4a52; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.app-shell.dark .message-file { border-color: #3d3d3d; background: #262626; color: #d4d4d4; }
 .message-images video { max-width: 320px; max-height: 220px; border-radius: 8px; border: 1px solid #dce5e2; display: block; }
 .image-preview button { position: absolute; top: -6px; right: -6px; width: 20px; height: 20px; border: 0; border-radius: 50%; background: #1f2933; color: #fff; display: grid; place-items: center; box-shadow: 0 1px 3px rgba(0,0,0,.3); }
 .image-error { color: #a1382d; font-size: 12px; margin: 0 0 6px; }

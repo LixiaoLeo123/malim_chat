@@ -18,7 +18,7 @@ pub(crate) async fn build_transcript(
     context_rounds: Option<u8>,
     enable_markdown: bool,
 ) -> Result<Vec<Value>, ApiError> {
-    let rows: Vec<(String, String, Value)> = sqlx::query_as("SELECT role,content,images FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80")
+    let rows: Vec<(String, String, Value, Value)> = sqlx::query_as("SELECT role,content,images,files FROM messages WHERE conversation_id=$1 AND sequence > $2 AND deleted_at IS NULL AND status='complete' AND role <> 'summary' ORDER BY sequence DESC LIMIT 80")
         .bind(conversation_id)
         .bind(prior_summary.map(|summary| summary.1).unwrap_or(0))
         .fetch_all(pool)
@@ -26,9 +26,10 @@ pub(crate) async fn build_transcript(
     let mut transcript: Vec<Value> = rows
         .into_iter()
         .rev()
-        .map(|(role, content, images)| {
+        .map(|(role, content, images, files)| {
             let images = images.as_array().map(Vec::as_slice).unwrap_or(&[]);
-            json!({"role":role,"content":content_part(kind, supports_images, &strip_thinking(&content), images)})
+            let files = files.as_array().map(Vec::as_slice).unwrap_or(&[]);
+            json!({"role":role,"content":content_part(kind, supports_images, &strip_thinking(&content), images, files)})
         })
         .collect();
     if let Some(rounds) = context_rounds {
@@ -77,7 +78,7 @@ pub(crate) async fn respond(
     validate_respond_request(&request)?;
     let user_id = user_from_headers(&state, &headers)?;
     let conversation = own_conversation(&state.db, user_id, id).await?;
-    let input:Message=sqlx::query_as("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at FROM messages WHERE id=$1 AND conversation_id=$2 AND role='user' AND deleted_at IS NULL").bind(request.message_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
+    let input:Message=sqlx::query_as("SELECT id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,files,edited_at,created_at,updated_at FROM messages WHERE id=$1 AND conversation_id=$2 AND role='user' AND deleted_at IS NULL").bind(request.message_id).bind(id).fetch_optional(&state.db).await?.ok_or_else(ApiError::not_found)?;
     let provider_id = conversation
         .model_provider_id
         .ok_or_else(|| ApiError::bad("Choose a provider before requesting a response."))?;
@@ -110,6 +111,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
     // implements any subset of a dialect and only the user knows what their channel serves.
     let responses_model = kind == "openai_responses";
     let hosted_tools = kind == "google_gemini"
+        || kind == "deepseek"
         || ((responses_model || kind == "anthropic")
             && provider_model_hosted_tools(&state.db, provider_id, &model).await?);
     // Every dialect can search now: hosted dialects do it on the provider's side when
@@ -136,7 +138,7 @@ let tool_rounds = request.tool_rounds.unwrap_or(None);
     let mut transcript = match &chain_id {
         Some(_) => vec![
             instruction_message(enable_markdown),
-            json!({"role":"user","content":content_part(&kind, supports_images, &input.content, &[])}),
+            json!({"role":"user","content":content_part(&kind, supports_images, &input.content, &[], &[])}),
         ],
         None => {
             build_transcript(
@@ -340,7 +342,7 @@ pub(crate) async fn persist_assistant_message(
     let tokens = estimate_tokens(&answer);
     let mut tx = state.db.begin().await?;
     let seq:(i64,)=sqlx::query_as("UPDATE conversations SET next_sequence=next_sequence+1,context_tokens=context_tokens+$3,revision=revision+1,updated_at=now() WHERE id=$1 AND user_id=$2 RETURNING next_sequence-1").bind(conversation_id).bind(user_id).bind(tokens).fetch_one(&mut *tx).await?;
-    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,reasoning_content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8,$9) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(conversation_id).bind(seq.0).bind(answer).bind(reasoning).bind(if enable_markdown { "markdown" } else { "plain" }).bind(model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
+    let m:Message=sqlx::query_as("INSERT INTO messages (id,conversation_id,sequence,role,content,reasoning_content,content_format,model,token_count,search_sources) VALUES ($1,$2,$3,'assistant',$4,$5,$6,$7,$8,$9) RETURNING id,conversation_id,sequence,client_mutation_id,role,content,reasoning_content,content_format,status,model,token_count,search_sources,images,files,edited_at,created_at,updated_at").bind(Uuid::new_v4()).bind(conversation_id).bind(seq.0).bind(answer).bind(reasoning).bind(if enable_markdown { "markdown" } else { "plain" }).bind(model).bind(tokens).bind(json!(sources)).fetch_one(&mut *tx).await?;
     if let Some(response_id) = chain_response_id {
         sqlx::query("UPDATE conversations SET chain_response_id=$2, chain_sequence=$3 WHERE id=$1")
             .bind(conversation_id)

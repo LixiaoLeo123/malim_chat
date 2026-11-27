@@ -72,6 +72,9 @@ pub(crate) struct Message {
     pub(crate) token_count: i32,
     pub(crate) search_sources: Value,
     pub(crate) images: Value,
+    /// References to documents uploaded to the provider's Files API. Images stay in
+    /// `images`; these are ids, so the request never carries the document body again.
+    pub(crate) files: Value,
     pub(crate) edited_at: Option<DateTime<Utc>>,
     pub(crate) created_at: DateTime<Utc>,
     pub(crate) updated_at: DateTime<Utc>,
@@ -186,6 +189,18 @@ pub(crate) struct CreateMessage {
     pub(crate) client_mutation_id: Uuid,
     pub(crate) search: Option<bool>,
     pub(crate) images: Option<Vec<String>>,
+    /// Uploaded-file references, each `{id,name,media_type,size}` as the upload endpoint
+    /// returned it.
+    pub(crate) files: Option<Vec<Value>>,
+}
+
+/// A document on its way to the provider's Files API. Base64 rather than multipart so
+/// the browser can send a FileReader result directly, and the server relays one part.
+#[derive(Deserialize)]
+pub(crate) struct UploadFileRequest {
+    pub(crate) filename: String,
+    pub(crate) media_type: Option<String>,
+    pub(crate) data: String,
 }
 
 #[derive(Deserialize)]

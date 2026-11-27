@@ -38,18 +38,33 @@ pub(crate) fn plain_text_content(content: &str, images: &[Value]) -> String {
     text
 }
 
-pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, images: &[Value]) -> Value {
-    if images.is_empty() {
+pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, images: &[Value], files: &[Value]) -> Value {
+    if images.is_empty() && files.is_empty() {
         return json!(content);
     }
-    if !supports_images && kind != "google_gemini" {
-        return json!(plain_text_content(content, images));
+    let can_images = supports_images || kind == "google_gemini";
+    // Only DeepSeek takes documents by reference; every other dialect gets a note that
+    // the file is there but unavailable to it.
+    let can_files = kind == "deepseek";
+    if !can_images && !can_files {
+        let mut text = plain_text_content(content, images);
+        for _ in files {
+            if !text.is_empty() {
+                text.push_str("\n\n");
+            }
+            text.push_str("[File attachment omitted: the selected provider does not support file input.]");
+        }
+        return json!(text);
     }
     let mut parts: Vec<Value> = Vec::new();
     if !content.trim().is_empty() {
         parts.push(text_part(kind, content));
     }
     for image in images {
+        if !can_images {
+            parts.push(text_part(kind, "[Image attachment omitted: the selected model does not support image input.]"));
+            continue;
+        }
         let Some((media_type, data)) = parse_data_url(image.as_str().unwrap_or("")) else {
             parts.push(text_part(kind, "[Media attachment omitted: invalid data URL.]"));
             continue;
@@ -64,6 +79,15 @@ pub(crate) fn content_part(kind: &str, supports_images: bool, content: &str, ima
             "openai_responses" => parts.push(json!({"type": "input_image", "image_url": image})),
             "google_gemini" => parts.push(json!({"inlineData": {"mimeType": media_type, "data": data}})),
             _ => parts.push(json!({"type": "image_url", "image_url": {"url": image}})),
+        }
+    }
+    for file in files {
+        if !can_files {
+            parts.push(text_part(kind, "[File attachment omitted: the selected provider does not support file input.]"));
+            continue;
+        }
+        if let Some(id) = file["id"].as_str() {
+            parts.push(json!({"type": "file", "file_id": id}));
         }
     }
     if parts.is_empty() {

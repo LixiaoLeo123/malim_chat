@@ -9,6 +9,9 @@ pub(crate) enum RequestKind {
     OpenAiResponses,
     Anthropic,
     GoogleGemini,
+    /// Chat Completions plus DeepSeek's extensions: hosted server tools, thinking mode,
+    /// and file references.
+    DeepSeek,
 }
 
 impl RequestKind {
@@ -16,6 +19,7 @@ impl RequestKind {
         match kind {
             "anthropic" => Self::Anthropic,
             "google_gemini" => Self::GoogleGemini,
+            "deepseek" => Self::DeepSeek,
             "openai_responses" => Self::OpenAiResponses,
             _ => Self::OpenAiChat,
         }
@@ -218,6 +222,23 @@ pub(crate) async fn call_provider(
         RequestKind::GoogleGemini => {
             let text = gemini_content(&body).ok_or_else(invalid_provider_response)?;
             Reply { text, ..Default::default() }
+        }
+        RequestKind::DeepSeek => {
+            let message = body["choices"]
+                .as_array()
+                .and_then(|choices| choices.first())
+                .map(|choice| &choice["message"])
+                .unwrap_or(&Value::Null);
+            let (text, reasoning) = openai_message_parts(message);
+            if text.is_empty() && reasoning.is_empty() {
+                return Err(invalid_provider_response());
+            }
+            Reply {
+                text,
+                reasoning,
+                sources: deepseek_sources(message),
+                ..Default::default()
+            }
         },
         RequestKind::Anthropic => {
             let (text, reasoning) = anthropic_parts(&body);
@@ -397,6 +418,24 @@ pub(crate) fn build_request(
             }
             Outbound { url, body, anthropic: true, kind }
         }
+        RequestKind::DeepSeek => {
+            body["messages"] = json!(messages);
+            body["stream"] = json!(stream);
+            if let Tools::Hosted { .. } = tools {
+                // DeepSeek's web search and page reading run on its side; declaring the
+                // tools is the whole switch. They accept no use caps, and thinking mode
+                // turns a search into deep thinking search.
+                body["tools"] = json!(deepseek_tools());
+                body["thinking"] = json!({"type": "enabled"});
+            }
+            if let Some(value) = &sampling.reasoning_effort {
+                body["reasoning_effort"] = json!(value);
+            }
+            if let Some(value) = sampling.max_tokens {
+                body["max_tokens"] = json!(value);
+            }
+            Outbound { url, body, anthropic: false, kind }
+        }
         RequestKind::OpenAiChat => {
             body["messages"] = json!(messages);
             body["stream"] = json!(stream);
@@ -562,6 +601,11 @@ pub(crate) fn provider_url(kind: RequestKind, base: &str, model: &str, stream: b
         RequestKind::OpenAiResponses if base.ends_with("/v1") => format!("{base}/responses"),
         RequestKind::OpenAiResponses => format!("{base}/v1/responses"),
         RequestKind::GoogleGemini => format!("{base}/models/{model}:{}{}", if stream { "streamGenerateContent" } else { "generateContent" }, if stream { "?alt=sse" } else { "" }),
+        // DeepSeek's documented base is the API root, not a /v1 base; both spellings are
+        // accepted, so the trailing-segment checks reuse the Chat Completions shapes.
+        RequestKind::DeepSeek if base.ends_with("/chat/completions") => base.to_string(),
+        RequestKind::DeepSeek if base.ends_with("/v1") => format!("{base}/chat/completions"),
+        RequestKind::DeepSeek => format!("{base}/chat/completions"),
         RequestKind::OpenAiChat if base.ends_with("/chat/completions") => base.to_string(),
         RequestKind::OpenAiChat if base.ends_with("/v1") => format!("{base}/chat/completions"),
         RequestKind::OpenAiChat => format!("{base}/v1/chat/completions"),
@@ -807,6 +851,89 @@ fn gemini_content(body: &Value) -> Option<String> {
     body["candidates"][0]["content"]["parts"].as_array().map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<String>()).filter(|text| !text.is_empty())
 }
 
+/// The web tools DeepSeek executes on its own side. `deepseek_web_search` also covers
+/// image search and, with thinking on, opening pages; `deepseek_read_url` reads links the
+/// user put in the message. Neither takes a use cap.
+fn deepseek_tools() -> Vec<Value> {
+    vec![
+        json!({ "type": "deepseek_web_search" }),
+        json!({ "type": "deepseek_read_url" }),
+    ]
+}
+
+/// Every page a finished Chat Completions reply reached, from its extension field. Each
+/// step carries the calls it made, with search results under `sources` and a read page
+/// under `page`; the same shape nests in `delta.server_tool_calls` of the last streamed
+/// chunk.
+pub(crate) fn deepseek_sources(message: &Value) -> Vec<Value> {
+    let mut sources = Vec::new();
+    for step in message["server_tool_calls"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        for call in step["calls"].as_array().into_iter().flatten() {
+            if let Some(items) = call["sources"].as_array() {
+                sources.extend(items.iter().map(|item| {
+                    json!({
+                        "title": item["title"].as_str().unwrap_or_default(),
+                        "url": item["url"].as_str().unwrap_or_default(),
+                        "content": item["snippet"].as_str().unwrap_or_default(),
+                        "engine": "DeepSeek web search",
+                    })
+                }));
+            } else if let Some(url) = call["page"]["url"].as_str() {
+                sources.push(json!({
+                    "title": call["page"]["title"].as_str().unwrap_or(url),
+                    "url": url,
+                    "content": "",
+                    "engine": "DeepSeek read_url",
+                }));
+            }
+        }
+    }
+    sources
+}
+
+/// One `server_tool_event` from a streamed Chat Completions chunk, in the timeline shape
+/// the rest of the app already renders. The event and its result are separate chunks, so
+/// the row is keyed by the call id and updates in place.
+fn deepseek_activity(event: &Value) -> Option<Value> {
+    let call = &event["call"];
+    let name = match call["type"].as_str() {
+        Some("deepseek_read_url") => "web_fetch",
+        Some("deepseek_web_search") => "web_search",
+        _ => return None,
+    };
+    let status = match event["type"].as_str()? {
+        "call_started" => "running",
+        "call_completed" => {
+            if call["status"].as_str() == Some("failed") {
+                "failed"
+            } else {
+                "completed"
+            }
+        }
+        _ => return None,
+    };
+    let mut activity = json!({
+        "id": call["id"],
+        "name": name,
+        "status": status,
+        "input": call["action"],
+    });
+    if let Some(sources) = call["sources"].as_array() {
+        activity["source_count"] = json!(sources.len());
+    }
+    if let Some(url) = call["page"]["url"].as_str() {
+        activity["detail"] = json!(url);
+    }
+    if let Some(code) = call["error"]["code"].as_str() {
+        activity["detail"] = json!(code);
+    }
+    Some(activity)
+}
+
 fn responses_content(body: &Value) -> Option<String> {
     if let Some(text) = body["output_text"].as_str() {
         return Some(text.to_string());
@@ -975,6 +1102,32 @@ pub(crate) fn provider_stream_delta(kind: &str, frame: &str) -> Option<StreamFra
     }
     if kind == RequestKind::Anthropic {
         return crate::anthropic_stream::fragment(&value);
+    }
+    if kind == RequestKind::DeepSeek {
+        let choice = value["choices"].as_array()?.first()?;
+        let delta = &choice["delta"];
+        let mut fragment = StreamFragment {
+            // The complete tool calls and citations arrive once, in the chunk that ends
+            // the turn; the earlier chunks carry only progress events.
+            sources: deepseek_sources(delta),
+            ..Default::default()
+        };
+        if let Some(activity) = choice.get("server_tool_event").and_then(deepseek_activity) {
+            fragment.activity = Some(activity);
+        }
+        if let Some(text) = delta["reasoning_content"].as_str().filter(|text| !text.is_empty()) {
+            fragment.reasoning = true;
+            fragment.text = text.to_string();
+        } else if let Some(text) = delta["content"].as_str().filter(|text| !text.is_empty()) {
+            fragment.text = text.to_string();
+        }
+        if fragment.text.is_empty()
+            && fragment.activity.is_none()
+            && fragment.sources.is_empty()
+        {
+            return None;
+        }
+        return Some(fragment);
     }
     let delta = &value["choices"].as_array()?.first()?["delta"];
     let text = |reasoning: bool, value: &str| StreamFragment {

@@ -69,12 +69,14 @@ use models::{
     Conversation, CreateConversation, CreateMessage, GenerationSettings, Message, Page, PageQuery,
     Provider, ProviderModel, ProviderModelRequest, ProviderRequest, ProviderRow, RespondRequest,
     UpdateConversation, UpdateMessage, UpdateProviderModelRequest, UpdateProviderRequest,
+    UploadFileRequest,
 };
 use provider_config::{
     create_provider, create_provider_model, configured_model, delete_provider,
     delete_provider_model, list_providers, own_provider, provider_first_model,
     provider_model_bool, provider_model_hosted_tools, provider_model_kind,
     provider_model_supports_images, update_provider, update_provider_model,
+    upload_provider_file,
 };
 use respond::{clear_chain, respond};
 use stream::{stream_response, stream_web_agent_response};
@@ -468,6 +470,7 @@ async fn main() -> anyhow::Result<()> {
             patch(update_provider).delete(delete_provider),
         )
         .route("/v1/providers/{id}/models", post(create_provider_model))
+        .route("/v1/providers/{id}/files", post(upload_provider_file))
         .route(
             "/v1/providers/{id}/models/{model_id}",
             patch(update_provider_model).delete(delete_provider_model),
@@ -530,6 +533,7 @@ mod tests {
     use crate::web_tools::{is_safe_public_url, is_valid_search_query, web_tool_definitions};
     use crate::{validate_generation_settings, validate_respond_request};
     use axum::http::StatusCode;
+    use serde_json::json;
 
     #[test]
     fn accepts_generic_planner_queries_without_topic_rules() {
@@ -1260,6 +1264,14 @@ mod tests {
             provider_url(RequestKind::Anthropic, "https://api.anthropic.com/v1", "model", false),
             "https://api.anthropic.com/v1/messages"
         );
+        assert_eq!(
+            provider_url(RequestKind::DeepSeek, "https://api.deepseek.com", "deepseek-flash", true),
+            "https://api.deepseek.com/chat/completions"
+        );
+        assert_eq!(
+            provider_url(RequestKind::DeepSeek, "https://api.deepseek.com/v1", "deepseek-flash", false),
+            "https://api.deepseek.com/v1/chat/completions"
+        );
     }
 
     #[test]
@@ -1309,7 +1321,7 @@ mod tests {
     #[test]
     fn degrades_images_to_placeholder_when_model_has_no_vision() {
         let images = vec![serde_json::json!("data:image/png;base64,AAAA")];
-        let content = content_part("openai_compatible", false, "describe this", &images);
+        let content = content_part("openai_compatible", false, "describe this", &images, &[]);
         assert!(
             content
                 .as_str()
@@ -1323,13 +1335,13 @@ mod tests {
 
     #[test]
     fn builds_google_video_content_only_for_google_models() {
-        let video = content_part("google_gemini", true, "summarize", &[serde_json::json!("data:video/mp4;base64,AAAA")]);
+        let video = content_part("google_gemini", true, "summarize", &[serde_json::json!("data:video/mp4;base64,AAAA")], &[]);
         assert_eq!(video[0]["type"], "text");
         assert_eq!(video[1]["inlineData"]["mimeType"], "video/mp4");
         assert_eq!(video[1]["inlineData"]["data"], "AAAA");
         let gemini = crate::providers::gemini_contents(&[serde_json::json!({"role":"user","content":video})]);
         assert_eq!(gemini[0]["parts"][1]["inlineData"]["mimeType"], "video/mp4");
-        let openai = content_part("openai_compatible", true, "summarize", &[serde_json::json!("data:video/mp4;base64,AAAA")]);
+        let openai = content_part("openai_compatible", true, "summarize", &[serde_json::json!("data:video/mp4;base64,AAAA")], &[]);
         assert!(openai[1]["text"].as_str().unwrap().contains("does not support video"));
         let request = build_request("google_gemini", "https://generativelanguage.googleapis.com/v1beta", "gemini-2.5-flash", &[serde_json::json!({"role":"user","content":video})], &Sampling::default(), Tools::None, true, None);
         assert_eq!(request.body["contents"][0]["parts"][1]["inlineData"]["mimeType"], "video/mp4");
@@ -1345,17 +1357,148 @@ mod tests {
     }
 
     #[test]
+    fn builds_deepseek_web_tool_requests_and_reports_sources() {
+        let request = build_request(
+            "deepseek",
+            "https://api.deepseek.com",
+            "deepseek-flash",
+            &[json!({"role":"user","content":"What is new?"})],
+            &Sampling {
+                reasoning_effort: Some("high".into()),
+                max_tokens: Some(4096),
+                ..Default::default()
+            },
+            Tools::hosted(None, None),
+            true,
+            None,
+        );
+        assert_eq!(request.url, "https://api.deepseek.com/chat/completions");
+        assert_eq!(request.body["tools"][0]["type"], "deepseek_web_search");
+        assert_eq!(request.body["tools"][1]["type"], "deepseek_read_url");
+        assert_eq!(request.body["thinking"]["type"], "enabled");
+        assert_eq!(request.body["reasoning_effort"], "high");
+        assert_eq!(request.body["max_tokens"], 4096);
+        assert_eq!(request.body["stream"], true);
+        // Without hosted tools the request is a plain Chat Completions call.
+        let plain = build_request(
+            "deepseek",
+            "https://api.deepseek.com",
+            "deepseek-flash",
+            &[json!({"role":"user","content":"hi"})],
+            &Sampling::default(),
+            Tools::None,
+            false,
+            None,
+        );
+        assert!(plain.body.get("tools").is_none());
+        assert!(plain.body.get("thinking").is_none());
+
+        let message = json!({
+            "role": "assistant",
+            "content": "It shipped.",
+            "reasoning_content": "thinking...",
+            "server_tool_calls": [{"index": 0, "calls": [
+                {"id": "srvtoolu_1", "type": "deepseek_web_search", "kind": "search",
+                 "action": {"type": "search", "queries": ["x"]}, "status": "completed",
+                 "sources": [{"url": "https://example.com/a", "title": "A", "snippet": "snip"}]},
+                {"id": "srvtoolu_2", "type": "deepseek_read_url", "kind": "read_link",
+                 "action": {"type": "read_link", "url": "https://example.com/b"}, "status": "completed",
+                 "page": {"url": "https://example.com/b", "title": "B"}}
+            ]}]
+        });
+        let sources = crate::providers::deepseek_sources(&message);
+        assert_eq!(sources.len(), 2);
+        assert_eq!(sources[0]["url"], "https://example.com/a");
+        assert_eq!(sources[0]["content"], "snip");
+        assert_eq!(sources[1]["url"], "https://example.com/b");
+    }
+
+    #[test]
+    fn parses_deepseek_stream_progress_and_sources() {
+        let started = provider_stream_delta(
+            "deepseek",
+            r#"data: {"choices":[{"delta":{"role":"assistant","content":""},"server_tool_event":{"type":"call_started","step":0,"call":{"index":0,"id":"srvtoolu_1","type":"deepseek_web_search","kind":"search","action":{"type":"search","queries":["x"]}}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(started.activity.as_ref().unwrap()["name"], "web_search");
+        assert_eq!(started.activity.as_ref().unwrap()["status"], "running");
+
+        let text = provider_stream_delta(
+            "deepseek",
+            r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(text.text, "hello");
+        assert!(!text.reasoning);
+
+        let thinking = provider_stream_delta(
+            "deepseek",
+            r#"data: {"choices":[{"delta":{"reasoning_content":"hmm"}}]}"#,
+        )
+        .unwrap();
+        assert!(thinking.reasoning);
+        assert_eq!(thinking.text, "hmm");
+
+        let finished = provider_stream_delta(
+            "deepseek",
+            r#"data: {"choices":[{"delta":{"content":"","server_tool_calls":[{"index":0,"calls":[{"id":"srvtoolu_1","type":"deepseek_web_search","kind":"search","status":"completed","sources":[{"url":"https://example.com/a","title":"A","snippet":"snip"}]}]}]},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(finished.sources.len(), 1);
+        assert_eq!(finished.sources[0]["url"], "https://example.com/a");
+    }
+
+    #[test]
+    fn references_uploaded_files_only_for_deepseek() {
+        let files = vec![json!({"id":"file-api-abc","name":"report.pdf","media_type":"application/pdf","size":10})];
+        let deepseek = content_part("deepseek", false, "summarize", &[], &files);
+        assert_eq!(deepseek[0]["type"], "text");
+        assert_eq!(deepseek[1]["type"], "file");
+        assert_eq!(deepseek[1]["file_id"], "file-api-abc");
+        let openai = content_part("openai_compatible", false, "summarize", &[], &files);
+        assert!(
+            openai
+                .as_str()
+                .unwrap()
+                .contains("does not support file input")
+        );
+        // Images still reach DeepSeek as data URLs when the model row has Vision on.
+        let image = content_part(
+            "deepseek",
+            true,
+            "what is this",
+            &[json!("data:image/png;base64,AAAA")],
+            &[],
+        );
+        assert_eq!(image[0]["type"], "text");
+        assert_eq!(image[1]["type"], "image_url");
+        assert_eq!(image[1]["image_url"]["url"], "data:image/png;base64,AAAA");
+        assert_eq!(
+            crate::provider_config::deepseek_file_purpose("application/pdf", "a.pdf"),
+            "text_recognition"
+        );
+        assert_eq!(
+            crate::provider_config::deepseek_file_purpose("", "notes.txt"),
+            "user_data"
+        );
+        assert_eq!(
+            crate::provider_config::deepseek_file_purpose("image/png", "photo.png"),
+            "user_data"
+        );
+    }
+
+    #[test]
     fn builds_multimodal_content_for_vision_models() {
         let images = vec![serde_json::json!("data:image/png;base64,AAAA")];
-        let openai = content_part("openai_compatible", true, "describe this", &images);
+        let openai = content_part("openai_compatible", true, "describe this", &images, &[]);
         assert_eq!(openai[0]["type"], "text");
         assert_eq!(openai[1]["type"], "image_url");
         assert_eq!(openai[1]["image_url"]["url"], "data:image/png;base64,AAAA");
-        let anthropic = content_part("anthropic", true, "describe this", &images);
+        let anthropic = content_part("anthropic", true, "describe this", &images, &[]);
         assert_eq!(anthropic[1]["type"], "image");
         assert_eq!(anthropic[1]["source"]["media_type"], "image/png");
         assert_eq!(anthropic[1]["source"]["data"], "AAAA");
-        let responses = content_part("openai_responses", true, "describe this", &images);
+        let responses = content_part("openai_responses", true, "describe this", &images, &[]);
         assert_eq!(responses[0]["type"], "input_text");
         assert_eq!(responses[1]["type"], "input_image");
         assert_eq!(responses[1]["image_url"], "data:image/png;base64,AAAA");
